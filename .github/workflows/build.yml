@@ -35,6 +35,25 @@ jobs:
           args: --release --out dist
           manylinux: "2_28"
 
+      - name: Repair wheel (bundle vendored libgdxcclib64)
+        # maturin only auto-bundles external shared libraries into the wheel on
+        # Linux. On macOS and Windows the vendored GDX library must be copied
+        # in and the references fixed up explicitly.
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          pip install delvewheel
+          $dll = Get-ChildItem -Path target -Recurse -Filter gdxcclib64.dll | Select-Object -First 1
+          delvewheel repair (Get-ChildItem dist/*.whl | Select-Object -ExpandProperty FullName) -v (Split-Path $dll.FullName) -w repaired
+          Move-Item repaired/*.whl dist/ -Force
+
+      - name: Repair wheel (bundle vendored libgdxcclib64)
+        if: endsWith(matrix.target, '-apple-darwin')
+        run: |
+          pip install delocate
+          delocate-wheel dist/*.whl -w repaired
+          rm -f dist/*.whl && mv repaired/*.whl dist/
+
       - name: Build SDist
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         uses: PyO3/maturin-action@v1
