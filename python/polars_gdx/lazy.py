@@ -138,6 +138,7 @@ def scan_gdx(
         del batch_size
         filters = explicit_filters
         pred_expr = None
+        native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
             native, folded = _predicate_key_filter(pred_expr, key_names, reader)
@@ -145,11 +146,18 @@ def scan_gdx(
                 # Some labels only match case-insensitively: Polars' `==` is
                 # case-sensitive, so the native prefilter would admit rows
                 # that the re-applied predicate would then drop silently.
-                # Fall back to a case-folded predicate on the full read.
+                # Fall back to a case-folded predicate on the full read; the
+                # predicate re-apply makes a native row limit unsafe.
                 pred_expr = _case_insensitive_expr(native, key_names)
+                native_limit_safe = False
                 if explicit_filters is None:
                     filters = None
-            elif native is not None:
+            elif native is None:
+                # Predicate not fully translatable: a native row limit could
+                # under-fill head(n), so read unlimited and let Polars-side
+                # filter().head(n) apply.
+                native_limit_safe = False
+            else:
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
                 # the raw read. The predicate is re-applied below for exact
@@ -168,6 +176,7 @@ def scan_gdx(
             key_names=list(key_names),
             value_field=(None if value_name == "value" else value_name),
             key_filter=filters,
+            n_rows=(n_rows if native_limit_safe else None),
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         df = pl.from_arrow(batch)
