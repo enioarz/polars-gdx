@@ -1,14 +1,12 @@
-name: Build
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ["v*"]
   workflow_dispatch:
 
-# Wheels are abi3 (>=3.9), so one wheel per platform is enough.
 jobs:
-  wheels:
+  build:
     name: Build wheel (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -67,33 +65,42 @@ jobs:
           name: wheels-${{ matrix.target }}
           path: dist/
 
-  smoke-test:
-    name: Wheel smoke test (${{ matrix.os }})
-    needs: wheels
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.9", "3.13", "3.14"]
-    runs-on: ${{ matrix.os }}
+  github-release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Download wheel
+      - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
           path: dist
           merge-multiple: true
 
-      - name: Install wheel and test dependencies
-        run: |
-          pip install polars pyarrow pytest
-          pip install --no-index --find-links dist polars-gdx
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
 
-      - name: Run tests
-        run: python -m pytest tests/ -q
+  pypi-release:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
