@@ -30,6 +30,20 @@ x = scan_gdx("trnsport.gdx", symbol="x")
 x.filter(pl.col("dim_0") == "seattle").collect()
 ```
 
+## Benchmark
+
+Against [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (`gams.transfer`, pandas-backed), on a 2M-record 2-dimensional parameter (80 MB GDX). Best of 5 runs; see `benchmarks/bench_vs_gamsapi.py` (also run as a CI job on every push).
+
+| Scenario | polars-gdx | gamsapi (pandas) |
+| --- | ---: | ---: |
+| Full read (2M rows) | 0.126 s | 0.086 s |
+| `filter(dim_0 == label)` — 1000 of 2M rows | **0.081 s** | 0.087 s¹ |
+| Explicit `key_filter` prefilter — 1000 rows | 0.080 s | — |
+
+¹ gamsapi has no lazy loading or pushdown: its only option is materializing the whole symbol into pandas, then filtering. polars-gdx folds `filter()` predicates on key columns into a native index-based prefilter inside the GDX read loop, so the unwanted 1,999,000 records are never materialized at all — while still handing you a lazily composable Polars frame (categorical keys, zero-copy Arrow handoff).
+
+Speedup grows with selectivity: the more records your predicate excludes, the larger the advantage over a full materialization.
+
 ## Build
 
 ```sh
