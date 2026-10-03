@@ -51,7 +51,7 @@ jobs:
         if: endsWith(matrix.target, '-apple-darwin')
         run: |
           pip install delocate
-          LIBDIR=$(find target -name libgdxcclib64.dylib -printf '%h' | head -1)
+          LIBDIR=$(dirname "$(find target -name 'libgdxcclib64.dylib' | head -1)")
           DYLD_LIBRARY_PATH=$LIBDIR delocate-wheel dist/*.whl -w repaired
           rm -f dist/*.whl && mv repaired/*.whl dist/
 
