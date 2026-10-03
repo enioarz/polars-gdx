@@ -66,8 +66,10 @@ pub struct GdxFile {
     name_index: HashMap<String, usize>,
     /// Lazy per-file UEL cache: index → interned label (populated on first raw read).
     uel_cache: RefCell<HashMap<i32, Arc<str>>>,
-    /// Lazy reverse UEL map: label → index (populated on demand for prefilters).
-    uel_index_cache: RefCell<Option<HashMap<String, i32>>>,
+    /// Cached UEL table: entry `i` is the label of UEL number `i + 1`.
+    uel_table_cache: RefCell<Option<Arc<[String]>>>,
+    /// Cached reverse UEL map: label → UEL number.
+    uel_index_cache: RefCell<Option<Arc<HashMap<String, i32>>>>,
 }
 
 impl GdxFile {
@@ -122,6 +124,7 @@ impl GdxFile {
                 symbols,
                 name_index,
                 uel_cache: RefCell::new(HashMap::new()),
+                uel_table_cache: RefCell::new(None),
                 uel_index_cache: RefCell::new(None),
             })
         }
@@ -141,28 +144,18 @@ impl GdxFile {
     ///
     /// Used to translate key-filter labels into raw indices so reads can
     /// prefilter on integers instead of strings.
-    pub fn uel_index(&self) -> Result<HashMap<String, i32>> {
-        let mut cached = self.uel_index_cache.borrow_mut();
-        if let Some(m) = cached.as_ref() {
-            return Ok(m.clone());
+    pub fn uel_index(&self) -> Result<Arc<HashMap<String, i32>>> {
+        if let Some(m) = self.uel_index_cache.borrow().as_ref() {
+            return Ok(Arc::clone(m));
         }
-        let _guard = crate::lock::lock();
-        let (mut uelcnt, mut highmap) = (0i32, 0i32);
-        unsafe {
-            if ffi::c__gdxumuelinfo(self.obj, &mut uelcnt, &mut highmap) == 0 {
-                return Err(op_error(self.obj, "gdxUMUELInfo"));
-            }
-            let mut map = HashMap::with_capacity(uelcnt as usize);
-            for uelnr in 1..=uelcnt {
-                let mut buf = [0 as c_char; ffi::GMS_SSSIZE];
-                let mut uelmap = 0;
-                if ffi::c__gdxumuelget(self.obj, uelnr, buf.as_mut_ptr(), &mut uelmap) == 1 {
-                    map.insert(buf_to_string(&buf), uelnr);
-                }
-            }
-            *cached = Some(map.clone());
-            Ok(map)
+        let table = self.uel_table()?;
+        let mut map = HashMap::with_capacity(table.len());
+        for (i, label) in table.iter().enumerate() {
+            map.insert(label.clone(), (i + 1) as i32);
         }
+        let map = Arc::new(map);
+        *self.uel_index_cache.borrow_mut() = Some(Arc::clone(&map));
+        Ok(map)
     }
 
     /// Read a symbol in fully raw form: per-dimension UEL indices plus one
@@ -184,14 +177,17 @@ impl GdxFile {
 
     /// The file's UEL table: entry `i` is the label of UEL number `i + 1`.
     /// Missing entries yield an empty-string placeholder.
-    pub fn uel_table(&self) -> Result<Vec<String>> {
+    pub fn uel_table(&self) -> Result<Arc<[String]>> {
+        if let Some(t) = self.uel_table_cache.borrow().as_ref() {
+            return Ok(Arc::clone(t));
+        }
         let _guard = crate::lock::lock();
-        unsafe {
+        let table = unsafe {
             let (mut uelcnt, mut highmap) = (0i32, 0i32);
             if ffi::c__gdxumuelinfo(self.obj, &mut uelcnt, &mut highmap) == 0 {
                 return Err(op_error(self.obj, "gdxUMUELInfo"));
             }
-            let mut table = Vec::with_capacity(uelcnt as usize);
+            let mut table: Vec<String> = Vec::with_capacity(uelcnt.max(0) as usize);
             for uelnr in 1..=uelcnt {
                 let mut buf = [0 as c_char; ffi::GMS_SSSIZE];
                 let mut uelmap = 0;
@@ -201,8 +197,11 @@ impl GdxFile {
                     table.push(String::new());
                 }
             }
-            Ok(table)
-        }
+            table
+        };
+        let table: Arc<[String]> = table.into();
+        *self.uel_table_cache.borrow_mut() = Some(Arc::clone(&table));
+        Ok(table)
     }
 
     unsafe fn read_symbol_raw_locked(

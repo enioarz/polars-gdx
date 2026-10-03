@@ -1,7 +1,9 @@
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use arrow::array::{ArrayRef, DictionaryArray, Float64Array, StringArray, UInt32Array};
+use arrow::array::{
+    ArrayRef, DictionaryArray, Float64Array, Int16Array, Int32Array, StringArray, UInt32Array,
+};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_pyarrow::IntoPyArrow;
@@ -29,6 +31,9 @@ unsafe impl Sync for SendGdxFile {}
 #[pyclass]
 struct Reader {
     file: SendGdxFile,
+    /// Cached dictionary values (the UEL table) and its Arrow form, built once per file.
+    uel_strings: Mutex<Option<Arc<[String]>>>,
+    uel_array: Mutex<Option<Arc<StringArray>>>,
 }
 
 /// Symbol metadata: (name, type_str, dim, records, domains, text).
@@ -41,6 +46,8 @@ impl Reader {
         let file = GdxFile::open(path).map_err(to_py_err)?;
         Ok(Self {
             file: SendGdxFile(file),
+            uel_strings: Mutex::new(None),
+            uel_array: Mutex::new(None),
         })
     }
 
@@ -48,7 +55,7 @@ impl Reader {
     /// `i + 1`. Used by the Python layer to translate Polars predicates into
     /// native key filters.
     fn uel_table(&self) -> PyResult<Vec<String>> {
-        self.file.0.uel_table().map_err(to_py_err)
+        Ok(self.uel_strings()?.iter().cloned().collect())
     }
 
     /// List all symbols: (name, type, dim, record_count, domains, text).
@@ -118,6 +125,30 @@ impl Reader {
 }
 
 impl Reader {
+    /// The file's UEL table (cached), as `Arc<[String]>`.
+    fn uel_strings(&self) -> PyResult<Arc<[String]>> {
+        if let Some(t) = self.uel_strings.lock().unwrap().as_ref() {
+            return Ok(Arc::clone(t));
+        }
+        let table = self.file.0.uel_table().map_err(to_py_err)?;
+        *self.uel_strings.lock().unwrap() = Some(Arc::clone(&table));
+        Ok(table)
+    }
+
+    /// The file's UEL table (cached) as an Arrow `StringArray`, shared as the
+    /// dictionary-values array of every key column.
+    fn uel_array(&self) -> PyResult<Arc<StringArray>> {
+        if let Some(a) = self.uel_array.lock().unwrap().as_ref() {
+            return Ok(Arc::clone(a));
+        }
+        let table = self.uel_strings()?;
+        let array = Arc::new(StringArray::from(
+            table.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        ));
+        *self.uel_array.lock().unwrap() = Some(Arc::clone(&array));
+        Ok(array)
+    }
+
     /// Resolve filter labels to their raw UEL indices for the open file.
     ///
     /// Labels not present in the file are simply never matched; they map to
@@ -198,16 +229,33 @@ fn to_record_batch(
     };
     names.push(value_name.clone());
 
-    let uels = reader.file.0.uel_table().map_err(to_py_err)?;
-    let dict_values = Arc::new(StringArray::from(
-        uels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-    ));
+    let uels = reader.uel_strings()?;
+    let dict_values = reader.uel_array()?;
+    let n_uels = uels.len();
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for d in 0..dim {
-        let indices = UInt32Array::from(std::mem::take(&mut data.keys[d]));
-        let dict = DictionaryArray::new(indices, dict_values.clone() as ArrayRef);
-        columns.push(Arc::new(dict) as ArrayRef);
+        let keys = std::mem::take(&mut data.keys[d]);
+        let dict: ArrayRef = if n_uels > 0 && n_uels <= i16::MAX as usize + 1 {
+            let indices = Int16Array::from(keys.into_iter().map(|k| k as i16).collect::<Vec<_>>());
+            Arc::new(DictionaryArray::new(
+                indices,
+                dict_values.clone() as ArrayRef,
+            ))
+        } else if n_uels <= i32::MAX as usize {
+            let indices = Int32Array::from(keys.into_iter().map(|k| k as i32).collect::<Vec<_>>());
+            Arc::new(DictionaryArray::new(
+                indices,
+                dict_values.clone() as ArrayRef,
+            ))
+        } else {
+            let indices = UInt32Array::from(keys);
+            Arc::new(DictionaryArray::new(
+                indices,
+                dict_values.clone() as ArrayRef,
+            ))
+        };
+        columns.push(dict);
     }
     columns.push(Arc::new(Float64Array::from(std::mem::take(&mut data.values))) as ArrayRef);
 

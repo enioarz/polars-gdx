@@ -104,3 +104,13 @@ def test_read_gdx_key_filter():
     filtered = read_gdx(GDX, symbol="x", key_filter={0: ["seattle"]})
     assert filtered.height < full.height
     assert set(filtered["dim_0"].unique()) == {"seattle"}
+
+
+def test_repeated_reads_consistent():
+    """The UEL table/dictionary caches must not corrupt repeated reads."""
+    first = read_gdx(GDX, symbol="x")
+    second = read_gdx(GDX, symbol="x")
+    assert first.equals(second)
+    with_prefilter = read_gdx(GDX, symbol="x", key_filter={0: ["seattle"]})
+    assert with_prefilter.height > 0
+    assert set(with_prefilter["dim_0"]) == {"seattle"}
