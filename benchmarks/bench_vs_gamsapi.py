@@ -50,7 +50,7 @@ def main():
     def pgx_prefilter():
         return scan_gdx(GDX, symbol="bigpar", key_filter={0: [FILTER_LABEL]}).collect()
 
-    # ---- polars-gdx: lazy read + polars predicate (no native prefilter) ----
+    # ---- polars-gdx: lazy read + polars predicate (pushed into prefilter) ----
     def pgx_predicate():
         return scan_gdx(GDX, symbol="bigpar").filter(
             pl.col("dim_0") == FILTER_LABEL).collect()
@@ -72,7 +72,7 @@ def main():
         ("polars-gdx  full read", pgx_full),
         ("gamsapi     full read", gamsapi_full),
         ("polars-gdx  prefiltered (native)", pgx_prefilter),
-        ("polars-gdx  predicate (polars-side)", pgx_predicate),
+        ("polars-gdx  predicate (native prefilter)", pgx_predicate),
         ("gamsapi     full read + pandas filter", gamsapi_filter),
     ]:
         dt, out = timeit(fn)

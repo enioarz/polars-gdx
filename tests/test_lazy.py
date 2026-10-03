@@ -38,3 +38,55 @@ def test_value_field_default_level():
 
 def test_no_early_read():
     scan_gdx(GDX, symbol="x")  # constructing the LazyFrame reads nothing
+
+
+def test_predicate_uses_native_prefilter(monkeypatch):
+    """pl.col(key) == label must fold into the native GDX prefilter."""
+    import polars_gdx.lazy as lazy
+
+    calls = []
+    orig = lazy.Reader.read_arrow
+
+    def spy(self, name, key_names=None, value_field=None, key_filter=None):
+        calls.append(key_filter)
+        return orig(self, name, key_names, value_field, key_filter)
+
+    monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
+    lf = lazy.scan_gdx(GDX, symbol="x")
+    df = lf.filter(pl.col("dim_0") == "seattle").collect()
+    assert df.height == 3
+    assert calls and calls[-1] is not None and calls[-1][0][0] == 0
+    assert "seattle" in calls[-1][0][1]
+
+
+def test_predicate_unknown_label_yields_no_rows():
+    lf = scan_gdx(GDX, symbol="x")
+    df = lf.filter(pl.col("dim_0") == "atlantis").collect()
+    assert df.height == 0
+
+
+def test_predicate_conjunction_prefilter(monkeypatch):
+    import polars_gdx.lazy as lazy
+
+    calls = []
+    orig = lazy.Reader.read_arrow
+
+    def spy(self, name, key_names=None, value_field=None, key_filter=None):
+        calls.append(key_filter)
+        return orig(self, name, key_names, value_field, key_filter)
+
+    monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
+    lf = lazy.scan_gdx(GDX, symbol="x")
+    df = lf.filter((pl.col("dim_0") == "seattle") & (pl.col("dim_1") == "chicago")).collect()
+    assert df.height == 1
+    merged = dict(calls[-1])
+    assert "seattle" in merged[0]
+    assert "chicago" in merged[1]
+
+
+def test_predicate_on_value_column_not_native():
+    """Predicates on the value column must still work (Polars-side)."""
+    lf = scan_gdx(GDX, symbol="x", value_field="level")
+    df = lf.filter(pl.col("level") > 100).collect()
+    assert df.height > 0
+    assert (df["level"] > 100).all()

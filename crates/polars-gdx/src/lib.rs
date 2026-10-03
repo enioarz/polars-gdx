@@ -44,6 +44,13 @@ impl Reader {
         })
     }
 
+    /// The file's UEL table: entry `i` is the label of 1-based UEL number
+    /// `i + 1`. Used by the Python layer to translate Polars predicates into
+    /// native key filters.
+    fn uel_table(&self) -> PyResult<Vec<String>> {
+        self.file.0.uel_table().map_err(to_py_err)
+    }
+
     /// List all symbols: (name, type, dim, record_count, domains, text).
     fn symbols(&self) -> Vec<SymbolTuple> {
         self.file.0.symbols().iter().map(symbol_tuple).collect()
@@ -81,6 +88,9 @@ impl Reader {
 
         // Fast vectorised path: raw UEL indices (no label strings) with an
         // optional index-based prefilter; keys become Arrow dictionary arrays.
+        // Note: a filter whose labels resolve to no UEL indices (label not
+        // in file) stays present with an empty index set, which matches no
+        // records — the correct zero-row semantics.
         let index_filters = if filters.is_empty() {
             Vec::new()
         } else {

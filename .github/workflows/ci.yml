@@ -20,3 +20,29 @@ jobs:
       - run: pip install patchelf polars pyarrow pytest
       - run: pip install -e .
       - run: pytest tests/ -q
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build extension
+        run: |
+          pip install patchelf polars pyarrow pandas gamsapi gamspy
+          pip install -e .
+      - name: Generate large GDX fixture (2M records)
+        run: |
+          cargo run -p gdx --release --example make_bench -- /tmp/bench_big.gdx 2000000
+      - name: Run benchmark vs gamsapi
+        run: |
+          python benchmarks/bench_vs_gamsapi.py /tmp/bench_big.gdx
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: |
+            benchmarks/bench_vs_gamsapi.py
+          if-no-files-found: ignore

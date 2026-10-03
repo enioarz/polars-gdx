@@ -9,6 +9,7 @@ materialised.
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import polars as pl
@@ -91,17 +92,36 @@ def scan_gdx(
     value_name = "value" if type_str in ("Set", "Parameter", "Alias") else (value_field or "level")
     schema = {name: pl.String for name in key_names} | {value_name: pl.Float64}
 
-    filters = None
+    explicit_filters = None
     if key_filter:
-        filters = [(d, list(labels)) for d, labels in key_filter.items()]
+        explicit_filters = [(d, list(labels)) for d, labels in key_filter.items()]
 
     def _read(
         with_columns: list[str] | None,
-        predicate: None,
+        predicate: pl.Expr | None,
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        del predicate, batch_size
+        del batch_size
+        filters = explicit_filters
+        pred_expr = None
+        if predicate is not None:
+            pred_expr = predicate
+            native = _predicate_key_filter(pred_expr, key_names, reader)
+            if native is not None:
+                # The predicate depends only on key columns: fold it into the
+                # native prefilter so non-matching records are skipped during
+                # the raw read. The predicate is re-applied below for exact
+                # semantics (no-op on the already-prefiltered rows).
+                merged = {d: list(labels) for d, labels in explicit_filters or []}
+                for d, labels in native:
+                    if d in merged:
+                        allowed = set(labels)
+                        merged[d] = [l for l in merged[d] if l in allowed]
+                    else:
+                        merged[d] = list(labels)
+                filters = list(merged.items())
+
         batch = reader.read_arrow(
             symbol,
             key_names=list(key_names),
@@ -110,6 +130,8 @@ def scan_gdx(
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         df = pl.from_arrow(batch)
+        if pred_expr is not None:
+            df = df.filter(pred_expr)
         if n_rows is not None:
             df = df.head(n_rows)
         if with_columns is not None:
@@ -117,6 +139,72 @@ def scan_gdx(
         yield df
 
     return register_io_source(_read, schema=schema)
+
+
+def _predicate_key_filter(
+    pred: pl.Expr, key_names: list[str], reader: Reader
+) -> list[tuple[int, list[str]]] | None:
+    """Extract a native key filter from a predicate, if possible.
+
+    Recognises conjunctions of `pl.col(k) == "label"` (either operand order)
+    where `k` is a key column, by inspecting the predicate's serialized plan.
+    Returns a list of (dim_index, allowed_labels), or None when the predicate
+    cannot be translated (caller falls back to Polars-side filtering).
+    """
+    try:
+        plan = json.loads(pred.meta.serialize(format="json"))
+    except Exception:
+        return None
+    filters: list[tuple[int, list[str]]] = []
+    if not _collect_eq_filters(plan, key_names, filters):
+        return None
+    if not filters:
+        return None
+    # Resolve labels against the file's UEL table: labels not present in the
+    # file can never match, so drop them; an empty set means no rows at all.
+    uels = set(reader.uel_table())
+    resolved = []
+    for d, labels in filters:
+        existing = [l for l in labels if l in uels]
+        if not existing:
+            return [(d, [])]
+        resolved.append((d, existing))
+    return resolved
+
+
+def _collect_eq_filters(
+    node: dict, key_names: list[str], out: list[tuple[int, list[str]]]
+) -> bool:
+    """Walk a serialized predicate plan; collect key-column constraints.
+
+    Returns True when the whole node is translatable, False otherwise.
+    """
+    if "BinaryExpr" not in node:
+        return False
+    b = node["BinaryExpr"]
+    if b["op"] == "And":
+        return _collect_eq_filters(b["left"], key_names, out) and _collect_eq_filters(
+            b["right"], key_names, out
+        )
+    if b["op"] != "Eq":
+        return False
+    for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
+        if "Column" in col_side and col_side["Column"] in key_names:
+            label = _string_literal(lit_side)
+            if label is not None:
+                out.append((key_names.index(col_side["Column"]), [label]))
+                return True
+            return False
+    return False
+
+
+def _string_literal(node: dict) -> str | None:
+    """The node's string value if it is a plain string literal, else None."""
+    try:
+        lit = node["Literal"]["Scalar"]["String"]
+        return lit
+    except (KeyError, TypeError):
+        return None
 
 
 def _key_names(symbol: str, domains: list[str], dim: int) -> list[str]:
@@ -131,3 +219,5 @@ def _key_names(symbol: str, domains: list[str], dim: int) -> list[str]:
             candidate = f"{candidate}_{i}"
         names.append(candidate)
     return names
+
+
