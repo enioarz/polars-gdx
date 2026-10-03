@@ -25,6 +25,10 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+      - name: Verify version matches tag
+        run: |
+          VERSION="v$(python -c 'import tomllib;print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          [ "$VERSION" = "${{ github.ref_name }}" ] || { echo "pyproject version $VERSION != tag ${{ github.ref_name }}"; exit 1; }
 
       - uses: PyO3/maturin-action@v1
         with:

@@ -3,5 +3,5 @@
 from polars_gdx._core import Reader  # noqa: F401
 from polars_gdx.lazy import scan_gdx, read_gdx, list_symbols  # noqa: F401
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = ["Reader", "scan_gdx", "read_gdx", "list_symbols"]
