@@ -9,7 +9,26 @@ description = "Polars IO plugin for reading GAMS GDX files lazily with native ke
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
+authors = [{ name = "polars-gdx contributors" }]
+keywords = ["polars", "gams", "gdx", "dataframe", "io"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
 dependencies = ["polars>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/enioarz/polars-gdx"
+Repository = "https://github.com/enioarz/polars-gdx"
+Issues = "https://github.com/enioarz/polars-gdx/issues"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

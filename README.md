@@ -1,6 +1,6 @@
 # polars-gdx
 
-Lazy, prefILTERed Polars access to [GAMS GDX](https://github.com/GAMS-dev/gdx) files — no GAMS installation required.
+Lazy, prefiltered Polars access to [GAMS GDX](https://github.com/GAMS-dev/gdx) files — no GAMS installation required.
 
 - `scan_gdx(path, symbol=...)` returns a `pl.LazyFrame`; reads happen only on `collect()`.
 - Column projection is pushed down via Polars' IO-source interface.
@@ -38,3 +38,10 @@ pytest
 ```
 
 Requires a C++17 compiler and CMake ≥ 3.5 at build time; runtime has no GAMS dependency.
+
+## Documentation & community
+
+- [Documentation](docs/README.md) — quickstart, API reference, architecture
+- [Contributing](CONTRIBUTING.md) — development setup and guidelines
+- [Security](SECURITY.md) — how to report vulnerabilities
+- [Support](SUPPORT.md) — where to ask questions
