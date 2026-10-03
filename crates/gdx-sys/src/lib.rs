@@ -128,6 +128,15 @@ extern "C" {
     /// Begin reading symbol `synr` in raw (integer-key) mode; sets `nrecs`.
     /// Keys arrive as 1-based global UEL indices; use [`c__gdxumuelget`] to resolve them.
     pub fn c__gdxdatareadrawstart(obj: *mut GdxObj, synr: c_int, nrecs: *mut c_int) -> c_int;
+
+    /// Bulk raw read: calls `dp(indx, vals)` once per record from a single
+    /// FFI crossing. Signature: `void (*)(const int*, const double*)`.
+    pub fn c__gdxdatareadrawfast(
+        obj: *mut GdxObj,
+        synr: c_int,
+        dp: extern "C" fn(*const c_int, *const c_double),
+        nrecs: *mut c_int,
+    ) -> c_int;
     /// Read one record in raw mode: fills `keyint` (array of `dim` UEL indices) and `values[5]`.
     /// Returns 1 while records remain, 0 when exhausted.
     pub fn c__gdxdatareadraw(

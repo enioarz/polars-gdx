@@ -9,7 +9,6 @@ materialised.
 
 from __future__ import annotations
 
-import io
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import polars as pl
@@ -103,13 +102,14 @@ def scan_gdx(
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
         del predicate, batch_size
-        data = reader.read_arrow(
+        batch = reader.read_arrow(
             symbol,
             key_names=list(key_names),
             value_field=(None if value_name == "value" else value_name),
             key_filter=filters,
         )
-        df = pl.read_ipc(io.BytesIO(data))
+        # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
+        df = pl.from_arrow(batch)
         if n_rows is not None:
             df = df.head(n_rows)
         if with_columns is not None:

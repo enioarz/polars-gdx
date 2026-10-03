@@ -9,7 +9,10 @@ use std::sync::Arc;
 use gdx_sys as ffi;
 
 use crate::error::{GdxError, Result};
-use crate::types::{Record, SymbolInfo, SymbolType};
+
+/// Record prefilter on raw UEL indices.
+pub type IndexPred<'a> = Option<&'a dyn Fn(&[i32]) -> bool>;
+use crate::types::{Record, SymbolInfo, SymbolType, ValueField};
 
 /// A GDX file opened for reading.
 ///
@@ -19,6 +22,43 @@ use crate::types::{Record, SymbolInfo, SymbolType};
 ///
 /// Not thread-safe: the type is intentionally `!Send`/`!Sync` (it holds a raw
 /// pointer). Read the data you need into owned [`Record`]s, then drop the file.
+/// Raw symbol data: per-dimension UEL indices plus a single value column.
+#[derive(Debug, Default)]
+pub struct RawSymbolData {
+    /// `keys[d]` holds the 0-based UEL dictionary positions of dimension `d`
+    /// for every record (raw UEL number minus one), ready for Arrow
+    /// dictionary encoding.
+    pub keys: Vec<Vec<u32>>,
+    pub values: Vec<f64>,
+}
+
+impl RawSymbolData {
+    fn with_capacity(dim: usize, n: usize) -> Self {
+        Self {
+            keys: vec![Vec::with_capacity(n); dim],
+            values: Vec::with_capacity(n),
+        }
+    }
+
+    /// Number of records.
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Whether the symbol has no records.
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+/// Filter abstraction: either on resolved labels (slow) or on raw UEL
+/// indices (fast prefilter; no string work for rejected records).
+enum Filter<'a> {
+    None,
+    Labels(&'a dyn Fn(&[Arc<str>]) -> bool),
+    Indices(&'a dyn Fn(&[i32]) -> bool),
+}
+
 pub struct GdxFile {
     obj: *mut ffi::GdxObj,
     special: [f64; ffi::GMS_SVIDX_MAX],
@@ -26,6 +66,8 @@ pub struct GdxFile {
     name_index: HashMap<String, usize>,
     /// Lazy per-file UEL cache: index → interned label (populated on first raw read).
     uel_cache: RefCell<HashMap<i32, Arc<str>>>,
+    /// Lazy reverse UEL map: label → index (populated on demand for prefilters).
+    uel_index_cache: RefCell<Option<HashMap<String, i32>>>,
 }
 
 impl GdxFile {
@@ -80,6 +122,7 @@ impl GdxFile {
                 symbols,
                 name_index,
                 uel_cache: RefCell::new(HashMap::new()),
+                uel_index_cache: RefCell::new(None),
             })
         }
     }
@@ -94,6 +137,140 @@ impl GdxFile {
         self.name_index.get(name).map(|&i| &self.symbols[i])
     }
 
+    /// Build (and cache) a reverse map: UEL label → UEL number.
+    ///
+    /// Used to translate key-filter labels into raw indices so reads can
+    /// prefilter on integers instead of strings.
+    pub fn uel_index(&self) -> Result<HashMap<String, i32>> {
+        let mut cached = self.uel_index_cache.borrow_mut();
+        if let Some(m) = cached.as_ref() {
+            return Ok(m.clone());
+        }
+        let _guard = crate::lock::lock();
+        let (mut uelcnt, mut highmap) = (0i32, 0i32);
+        unsafe {
+            if ffi::c__gdxumuelinfo(self.obj, &mut uelcnt, &mut highmap) == 0 {
+                return Err(op_error(self.obj, "gdxUMUELInfo"));
+            }
+            let mut map = HashMap::with_capacity(uelcnt as usize);
+            for uelnr in 1..=uelcnt {
+                let mut buf = [0 as c_char; ffi::GMS_SSSIZE];
+                let mut uelmap = 0;
+                if ffi::c__gdxumuelget(self.obj, uelnr, buf.as_mut_ptr(), &mut uelmap) == 1 {
+                    map.insert(buf_to_string(&buf), uelnr);
+                }
+            }
+            *cached = Some(map.clone());
+            Ok(map)
+        }
+    }
+
+    /// Read a symbol in fully raw form: per-dimension UEL indices plus one
+    /// value field, without materialising any label strings.
+    ///
+    /// This is the fast vectorised path used by the Polars plugin: keys stay
+    /// as `i32` UEL numbers (resolvable via [`GdxFile::uel_table`]) and only
+    /// the requested value field is collected. `pred`, when given, is evaluated
+    /// on the raw indices before the record is appended.
+    pub fn read_symbol_raw(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: IndexPred<'_>,
+    ) -> Result<RawSymbolData> {
+        let _guard = crate::lock::lock();
+        unsafe { self.read_symbol_raw_locked(info, value_field, pred) }
+    }
+
+    /// The file's UEL table: entry `i` is the label of UEL number `i + 1`.
+    /// Missing entries yield an empty-string placeholder.
+    pub fn uel_table(&self) -> Result<Vec<String>> {
+        let _guard = crate::lock::lock();
+        unsafe {
+            let (mut uelcnt, mut highmap) = (0i32, 0i32);
+            if ffi::c__gdxumuelinfo(self.obj, &mut uelcnt, &mut highmap) == 0 {
+                return Err(op_error(self.obj, "gdxUMUELInfo"));
+            }
+            let mut table = Vec::with_capacity(uelcnt as usize);
+            for uelnr in 1..=uelcnt {
+                let mut buf = [0 as c_char; ffi::GMS_SSSIZE];
+                let mut uelmap = 0;
+                if ffi::c__gdxumuelget(self.obj, uelnr, buf.as_mut_ptr(), &mut uelmap) == 1 {
+                    table.push(buf_to_string(&buf));
+                } else {
+                    table.push(String::new());
+                }
+            }
+            Ok(table)
+        }
+    }
+
+    unsafe fn read_symbol_raw_locked(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: IndexPred<'_>,
+    ) -> Result<RawSymbolData> {
+        // First a probe read to learn the record count (and validate the
+        // symbol); the mode is reset with `gdxDataReadDone` afterwards.
+        let mut nrecs = 0;
+        if ffi::c__gdxdatareadrawstart(self.obj, info.number as i32, &mut nrecs) == 0 {
+            return Err(op_error(self.obj, "gdxDataReadRawStart"));
+        }
+        ffi::c__gdxdatareaddone(self.obj);
+
+        let vidx = value_field.index();
+        let mut data = RawSymbolData::with_capacity(info.dim, nrecs.max(0) as usize);
+
+        // Filtered read: per-record loop so the predicate can run on raw
+        // indices before anything is stored.
+        if let Some(f) = pred {
+            if ffi::c__gdxdatareadrawstart(self.obj, info.number as i32, &mut nrecs) == 0 {
+                return Err(op_error(self.obj, "gdxDataReadRawStart"));
+            }
+            let mut key_indices = [0i32; ffi::GMS_MAX_INDEX_DIM];
+            let mut values = [0.0f64; ffi::GMS_VAL_MAX];
+            let mut dimfrst = 0;
+            while ffi::c__gdxdatareadraw(
+                self.obj,
+                key_indices.as_mut_ptr(),
+                values.as_mut_ptr(),
+                &mut dimfrst,
+            ) == 1
+            {
+                if !f(&key_indices[..info.dim]) {
+                    continue;
+                }
+                for (d, k) in key_indices[..info.dim].iter().enumerate() {
+                    data.keys[d].push((*k - 1).max(0) as u32);
+                }
+                data.values.push(map_special(values[vidx], &self.special));
+            }
+            ffi::c__gdxdatareaddone(self.obj);
+            return Ok(data);
+        }
+
+        // Unfiltered read: bulk callback, one FFI crossing for the whole loop.
+        // The sink is routed through a thread-local of raw pointers because the
+        // C callback signature carries no user-data argument; the global GDX
+        // lock plus same-thread callback execution keeps this sound.
+        let sink = RecordSink {
+            data: std::ptr::from_mut(&mut data),
+            special: std::ptr::from_ref(&self.special),
+            vidx,
+            dim: info.dim,
+        };
+        SINK.with(|s| s.set(Some(sink)));
+        let mut cb_nrecs = 0;
+        let ok =
+            ffi::c__gdxdatareadrawfast(self.obj, info.number as i32, store_record, &mut cb_nrecs);
+        SINK.with(|s| s.take());
+        if ok == 0 {
+            return Err(op_error(self.obj, "gdxDataReadRawFast"));
+        }
+        Ok(data)
+    }
+
     /// Read all records of the named symbol.
     pub fn read(&self, name: &str) -> Result<Vec<Record>> {
         let info = self
@@ -105,7 +282,7 @@ impl GdxFile {
     /// Read all records of a symbol described by `info`.
     pub fn read_info(&self, info: &SymbolInfo) -> Result<Vec<Record>> {
         let _guard = crate::lock::lock();
-        unsafe { self.read_records_raw(info.number, info.dim, &|_| true) }
+        unsafe { self.read_records_raw(info.number, info.dim, &Filter::None) }
     }
 
     /// Read records of a symbol, keeping only those whose key labels satisfy
@@ -117,7 +294,22 @@ impl GdxFile {
         pred: &dyn Fn(&[Arc<str>]) -> bool,
     ) -> Result<Vec<Record>> {
         let _guard = crate::lock::lock();
-        unsafe { self.read_records_raw(info.number, info.dim, pred) }
+        unsafe { self.read_records_raw(info.number, info.dim, &Filter::Labels(pred)) }
+    }
+
+    /// Read records of a symbol, keeping only those whose raw UEL indices
+    /// satisfy `pred`. This is the fast prefilter path: the predicate runs on
+    /// plain `i32` indices before any label string is resolved or allocated,
+    /// so filtered-out records cost only the raw C read.
+    ///
+    /// `pred` receives the `dim` raw key indices of the record, in order.
+    pub fn read_filtered_indices(
+        &self,
+        info: &SymbolInfo,
+        pred: &dyn Fn(&[i32]) -> bool,
+    ) -> Result<Vec<Record>> {
+        let _guard = crate::lock::lock();
+        unsafe { self.read_records_raw(info.number, info.dim, &Filter::Indices(pred)) }
     }
 
     /// Read all records in raw mode (integer UEL indices → interned `Arc<str>` labels).
@@ -129,7 +321,7 @@ impl GdxFile {
         &self,
         number: usize,
         dim: usize,
-        pred: &dyn Fn(&[Arc<str>]) -> bool,
+        pred: &Filter<'_>,
     ) -> Result<Vec<Record>> {
         let mut nrecs = 0;
         if ffi::c__gdxdatareadrawstart(self.obj, number as i32, &mut nrecs) == 0 {
@@ -150,6 +342,11 @@ impl GdxFile {
             &mut dimfrst,
         ) == 1
         {
+            if let Filter::Indices(f) = pred {
+                if !f(&key_indices[..dim]) {
+                    continue;
+                }
+            }
             let keys: Vec<Arc<str>> =
                 (0..dim)
                     .map(|d| {
@@ -175,12 +372,14 @@ impl GdxFile {
                     })
                     .collect();
 
+            if let Filter::Labels(f) = pred {
+                if !f(&keys) {
+                    continue;
+                }
+            }
             let mut mapped = [0.0f64; ffi::GMS_VAL_MAX];
             for (i, v) in values.iter().enumerate() {
                 mapped[i] = map_special(*v, &self.special);
-            }
-            if !pred(&keys) {
-                continue;
             }
             records.push(Record {
                 keys,
@@ -370,4 +569,37 @@ mod parity {
         // Both records share the "seattle" UEL — the Arc pointers must be identical.
         assert!(Arc::ptr_eq(&records[0].keys[0], &records[1].keys[0]));
     }
+}
+
+/// Per-read sink state passed to the C bulk-read callback via thread-local.
+struct RecordSink {
+    data: *mut RawSymbolData,
+    special: *const [f64; ffi::GMS_SVIDX_MAX],
+    vidx: usize,
+    dim: usize,
+}
+
+// Sound because the callback runs synchronously on the same thread inside the
+// `c__gdxdatareadrawfast` call bracketed by the SINK set/take below, and all
+// GDX access is serialized by the global FFI lock.
+unsafe impl Send for RecordSink {}
+
+thread_local! {
+    static SINK: std::cell::Cell<Option<RecordSink>> = const { std::cell::Cell::new(None) };
+}
+
+extern "C" fn store_record(indx: *const i32, vals: *const f64) {
+    let Some(sink) = SINK.with(|s| s.take()) else {
+        return;
+    };
+    unsafe {
+        let keys = std::slice::from_raw_parts(indx, sink.dim);
+        let data = &mut *sink.data;
+        for (d, &k) in keys.iter().enumerate() {
+            data.keys[d].push((k - 1).max(0) as u32);
+        }
+        let v = *vals.add(sink.vidx);
+        data.values.push(map_special(v, &*sink.special));
+    }
+    SINK.with(|s| s.set(Some(sink)));
 }

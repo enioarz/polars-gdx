@@ -12,9 +12,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gdx = { path = "../gdx" }
-arrow = { version = "56", default-features = false, features = ["ipc", "csv"] }
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+arrow = { version = "56", default-features = false, features = ["pyarrow", "ipc"] }
+arrow-pyarrow = "56"
+pyo3 = { version = "0.25", features = ["extension-module", "abi3-py39"] }
 thiserror.workspace = true
 
 [build-dependencies]
-pyo3-build-config = "0.23"
+pyo3-build-config = "0.25"

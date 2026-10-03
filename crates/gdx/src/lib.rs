@@ -20,6 +20,6 @@ mod types;
 mod writer;
 
 pub use error::{GdxError, Result};
-pub use reader::GdxFile;
+pub use reader::{GdxFile, IndexPred, RawSymbolData};
 pub use types::{Record, SymbolInfo, SymbolType, ValueField};
 pub use writer::GdxWriter;

@@ -1,14 +1,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Float64Array, StringArray};
+use arrow::array::{ArrayRef, DictionaryArray, Float64Array, StringArray, UInt32Array};
 use arrow::datatypes::{Field, Schema};
-use arrow::ipc::writer::FileWriter;
 use arrow::record_batch::RecordBatch;
+use arrow_pyarrow::IntoPyArrow;
 use gdx::{GdxFile, SymbolInfo, SymbolType, ValueField};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 
 fn to_py_err(e: gdx::GdxError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
@@ -58,6 +57,8 @@ impl Reader {
     ///   Variables/Equations (default `level`).
     /// - `key_filter`: list of `(dim_index, allowed_labels)` pairs; records
     ///   with a key outside the allowed set are skipped before materialising.
+    ///
+    /// Returns an `arrow` RecordBatch (zero-copy into Python via PyCapsule).
     #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None))]
     fn read_arrow(
         &self,
@@ -78,22 +79,53 @@ impl Reader {
             None => None,
         };
 
-        let records = if filters.is_empty() {
-            self.file.0.read_info(info).map_err(to_py_err)?
+        // Fast vectorised path: raw UEL indices (no label strings) with an
+        // optional index-based prefilter; keys become Arrow dictionary arrays.
+        let index_filters = if filters.is_empty() {
+            Vec::new()
         } else {
-            self.file
-                .0
-                .read_filtered(info, &|keys| {
-                    filters
-                        .iter()
-                        .all(|&(d, ref allowed)| allowed.contains(keys[d].as_ref()))
-                })
-                .map_err(to_py_err)?
+            self.resolve_uel_indices(&filters)?
         };
+        let vfield = field.unwrap_or(ValueField::Level);
+        let pred: gdx::IndexPred<'_> = if index_filters.is_empty() {
+            None
+        } else {
+            Some(&|idx: &[i32]| {
+                index_filters
+                    .iter()
+                    .all(|&(d, ref allowed)| allowed.contains(&idx[d]))
+            })
+        };
+        let mut data = self
+            .file
+            .0
+            .read_symbol_raw(info, vfield, pred)
+            .map_err(to_py_err)?;
 
-        let bytes = to_arrow_ipc(info, &records, key_names, field)?;
-        let bytes = PyBytes::new(py, &bytes);
-        Ok(bytes.into_any().unbind())
+        let batch = to_record_batch(self, info, &mut data, key_names, vfield)?;
+        Ok(batch.into_pyarrow(py)?.into_any())
+    }
+}
+
+impl Reader {
+    /// Resolve filter labels to their raw UEL indices for the open file.
+    ///
+    /// Labels not present in the file are simply never matched; they map to
+    /// no index and the filter stays empty for that label (no error).
+    fn resolve_uel_indices(
+        &self,
+        filters: &[(usize, HashSet<String>)],
+    ) -> PyResult<Vec<(usize, HashSet<i32>)>> {
+        let label_to_index = self.file.0.uel_index().map_err(to_py_err)?;
+        let mut out = Vec::with_capacity(filters.len());
+        for (d, labels) in filters {
+            let idxs: HashSet<i32> = labels
+                .iter()
+                .filter_map(|l| label_to_index.get(l.as_str()).copied())
+                .collect();
+            out.push((*d, idxs));
+        }
+        Ok(out)
     }
 }
 
@@ -137,58 +169,46 @@ fn parse_filters(
     Ok(out)
 }
 
-fn to_arrow_ipc(
+fn to_record_batch(
+    reader: &Reader,
     info: &SymbolInfo,
-    records: &[gdx::Record],
+    data: &mut gdx::RawSymbolData,
     key_names: Option<Vec<String>>,
-    field: Option<ValueField>,
-) -> PyResult<Vec<u8>> {
+    field: ValueField,
+) -> PyResult<RecordBatch> {
     let dim = info.dim;
 
     let mut names: Vec<String> = match &key_names {
         Some(names) if names.len() == dim => names.clone(),
         _ => (0..dim).map(|i| format!("dim_{i}")).collect(),
     };
-
     let value_name = match info.kind {
-        SymbolType::Variable | SymbolType::Equation => match field {
-            Some(f) => f.as_str().to_ascii_lowercase(),
-            None => ValueField::Level.as_str().to_ascii_lowercase(),
-        },
+        SymbolType::Variable | SymbolType::Equation => field.as_str().to_ascii_lowercase(),
         _ => "value".to_string(),
     };
-    names.push(value_name);
+    names.push(value_name.clone());
+
+    let uels = reader.file.0.uel_table().map_err(to_py_err)?;
+    let dict_values = Arc::new(StringArray::from(
+        uels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    ));
 
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for d in 0..dim {
-        let values: Vec<&str> = records.iter().map(|r| r.keys[d].as_ref()).collect();
-        columns.push(Arc::new(StringArray::from(values)) as ArrayRef);
+        let indices = UInt32Array::from(std::mem::take(&mut data.keys[d]));
+        let dict = DictionaryArray::new(indices, dict_values.clone() as ArrayRef);
+        columns.push(Arc::new(dict) as ArrayRef);
     }
-    let idx = field
-        .map(|f| f.index())
-        .unwrap_or(ValueField::Level.index());
-    let values: Vec<f64> = records.iter().map(|r| r.values[idx]).collect();
-    columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+    columns.push(Arc::new(Float64Array::from(std::mem::take(&mut data.values))) as ArrayRef);
 
     let fields: Vec<Field> = names
         .iter()
         .zip(&columns)
         .map(|(name, col)| Field::new(name.clone(), col.data_type().clone(), false))
         .collect();
-    let schema = Arc::new(Schema::new(fields));
 
-    let batch = RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| PyRuntimeError::new_err(format!("record batch error: {e}")))?;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut writer = FileWriter::try_new(&mut buf, schema.as_ref())
-        .map_err(|e| PyRuntimeError::new_err(format!("arrow writer error: {e}")))?;
-    writer
-        .write(&batch)
-        .map_err(|e| PyRuntimeError::new_err(format!("arrow write error: {e}")))?;
-    writer
-        .finish()
-        .map_err(|e| PyRuntimeError::new_err(format!("arrow finish error: {e}")))?;
-    Ok(buf)
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| PyRuntimeError::new_err(format!("record batch error: {e}")))
 }
 
 /// Python entry point: `polars_gdx._core`.
