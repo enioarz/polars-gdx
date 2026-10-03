@@ -17,6 +17,6 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: pip install maturin patchelf polars pyarrow pytest
-      - run: pip install -e . --no-build-isolation
+      - run: pip install patchelf polars pyarrow pytest
+      - run: pip install -e .
       - run: pytest tests/ -q
