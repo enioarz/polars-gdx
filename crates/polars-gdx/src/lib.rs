@@ -73,13 +73,17 @@ impl Reader {
     ///   with a key outside the allowed set are skipped before materialising.
     ///
     /// Returns an `arrow` RecordBatch (zero-copy into Python via PyCapsule).
-    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None))]
+    ///
+    /// - `n_rows`: optional row limit; the native read stops early once that
+    ///   many (post-prefilter) records have been stored.
+    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None))]
     fn read_arrow(
         &self,
         name: &str,
         key_names: Option<Vec<String>>,
         value_field: Option<String>,
         key_filter: Option<Vec<(usize, Vec<String>)>>,
+        n_rows: Option<usize>,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let info = self
@@ -104,19 +108,22 @@ impl Reader {
             self.resolve_uel_indices(&filters)?
         };
         let vfield = field.unwrap_or(ValueField::Level);
-        let pred: gdx::IndexPred<'_> = if index_filters.is_empty() {
-            None
-        } else {
-            Some(&|idx: &[i32]| {
-                index_filters
-                    .iter()
-                    .all(|&(d, ref allowed)| allowed.contains(&idx[d]))
-            })
+        let pred: gdx::IndexPred<'_> = match index_filters.as_slice() {
+            [] => None,
+            [(d, allowed)] if allowed.len() == 1 => {
+                let idx = allowed[0];
+                let d = *d;
+                Some(&move |idx_slice: &[i32]| idx_slice[d] == idx)
+            }
+            many => Some(&|idx_slice: &[i32]| {
+                many.iter()
+                    .all(|&(d, ref allowed)| allowed.binary_search(&idx_slice[d]).is_ok())
+            }),
         };
         let mut data = self
             .file
             .0
-            .read_symbol_raw(info, vfield, pred)
+            .read_symbol_raw(info, vfield, pred, n_rows)
             .map_err(to_py_err)?;
 
         let batch = to_record_batch(self, info, &mut data, key_names, vfield)?;
@@ -152,18 +159,22 @@ impl Reader {
     /// Resolve filter labels to their raw UEL indices for the open file.
     ///
     /// Labels not present in the file are simply never matched; they map to
-    /// no index and the filter stays empty for that label (no error).
+    /// no index and the filter stays empty for that label (no error). The
+    /// index vectors are sorted so the hot-path predicate can use binary
+    /// search.
     fn resolve_uel_indices(
         &self,
         filters: &[(usize, HashSet<String>)],
-    ) -> PyResult<Vec<(usize, HashSet<i32>)>> {
+    ) -> PyResult<Vec<(usize, Vec<i32>)>> {
         let label_to_index = self.file.0.uel_index().map_err(to_py_err)?;
         let mut out = Vec::with_capacity(filters.len());
         for (d, labels) in filters {
-            let idxs: HashSet<i32> = labels
+            let mut idxs: Vec<i32> = labels
                 .iter()
                 .filter_map(|l| label_to_index.get(l.as_str()).copied())
                 .collect();
+            idxs.sort_unstable();
+            idxs.dedup();
             out.push((*d, idxs));
         }
         Ok(out)

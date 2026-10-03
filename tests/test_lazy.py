@@ -47,9 +47,9 @@ def test_predicate_uses_native_prefilter(monkeypatch):
     calls = []
     orig = lazy.Reader.read_arrow
 
-    def spy(self, name, key_names=None, value_field=None, key_filter=None):
+    def spy(self, name, key_names=None, value_field=None, key_filter=None, n_rows=None):
         calls.append(key_filter)
-        return orig(self, name, key_names, value_field, key_filter)
+        return orig(self, name, key_names, value_field, key_filter, n_rows)
 
     monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
     lf = lazy.scan_gdx(GDX, symbol="x")
@@ -71,9 +71,9 @@ def test_predicate_conjunction_prefilter(monkeypatch):
     calls = []
     orig = lazy.Reader.read_arrow
 
-    def spy(self, name, key_names=None, value_field=None, key_filter=None):
+    def spy(self, name, key_names=None, value_field=None, key_filter=None, n_rows=None):
         calls.append(key_filter)
-        return orig(self, name, key_names, value_field, key_filter)
+        return orig(self, name, key_names, value_field, key_filter, n_rows)
 
     monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
     lf = lazy.scan_gdx(GDX, symbol="x")
@@ -114,3 +114,28 @@ def test_repeated_reads_consistent():
     with_prefilter = read_gdx(GDX, symbol="x", key_filter={0: ["seattle"]})
     assert with_prefilter.height > 0
     assert set(with_prefilter["dim_0"]) == {"seattle"}
+
+
+def test_head_pushdown_matches_eager():
+    lazy_head = scan_gdx(GDX, symbol="x").head(2).collect()
+    eager_head = read_gdx(GDX, symbol="x").head(2)
+    assert lazy_head.equals(eager_head)
+
+
+def test_head_after_filter():
+    lf = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0") == "seattle").head(1)
+    df = lf.collect()
+    assert df.height == 1
+    assert df["dim_0"][0] == "seattle"
+
+
+def test_head_after_untranslatable_predicate():
+    lf = scan_gdx(GDX, symbol="x").filter(pl.col("level") > 0).head(1)
+    df = lf.collect()
+    assert df.height == 1
+    assert (df["level"] > 0).all()
+
+
+def test_single_label_filter_absent_label_yields_no_rows():
+    df = scan_gdx(GDX, symbol="x", key_filter={0: ["atlantis"]}).collect()
+    assert df.height == 0
