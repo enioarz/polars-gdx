@@ -47,6 +47,24 @@ def list_symbols(path: str | Path) -> pl.DataFrame:
     )
 
 
+def read_gdx(
+    path: str | Path,
+    *,
+    symbol: str,
+    value_field: str | None = None,
+    key_filter: dict[int, Sequence[str]] | None = None,
+) -> pl.DataFrame:
+    """Eagerly read one symbol of a GDX file into a DataFrame.
+
+    Convenience wrapper around :func:`scan_gdx`: same arguments, but collects
+    the frame immediately. The lazy path (and thus the native prefilter and
+    Polars predicate pushdown) is still used under the hood.
+    """
+    return scan_gdx(
+        path, symbol=symbol, value_field=value_field, key_filter=key_filter
+    ).collect()
+
+
 def scan_gdx(
     path: str | Path,
     *,

@@ -1,7 +1,7 @@
 import polars as pl
 import pytest
 
-from polars_gdx import list_symbols, scan_gdx
+from polars_gdx import list_symbols, read_gdx, scan_gdx
 
 GDX = "tests/data/trnsport.gdx"
 
@@ -90,3 +90,17 @@ def test_predicate_on_value_column_not_native():
     df = lf.filter(pl.col("level") > 100).collect()
     assert df.height > 0
     assert (df["level"] > 100).all()
+
+
+def test_read_gdx_eager():
+    df = read_gdx(GDX, symbol="x")
+    assert isinstance(df, pl.DataFrame)
+    assert set(df.columns) == {"dim_0", "dim_1", "level"}
+    assert df.height == scan_gdx(GDX, symbol="x").collect().height
+
+
+def test_read_gdx_key_filter():
+    full = read_gdx(GDX, symbol="x")
+    filtered = read_gdx(GDX, symbol="x", key_filter={0: ["seattle"]})
+    assert filtered.height < full.height
+    assert set(filtered["dim_0"].unique()) == {"seattle"}
