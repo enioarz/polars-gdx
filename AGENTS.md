@@ -11,7 +11,7 @@ crates/gdx-sys            # raw FFI to vendored GDX C library (CMake build, ~8MB
                           #   under third_party/gdx — no GAMS install needed at runtime)
 crates/gdx                # safe RAII wrapper; global FFI lock (lock.rs); lazy UEL interning
 crates/polars-gdx         # PyO3 extension: symbol listing, UEL table, read_arrow()
-python/polars_gdx         # scan_gdx / list_symbols / predicate→prefilter translation
+python/polars_gdx         # scan_gdx / read_gdx / list_symbols / predicate→prefilter translation
 benchmarks/               # bench_vs_gamsapi.py + fixture generators (cargo examples)
 tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
 ```
