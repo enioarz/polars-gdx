@@ -25,6 +25,14 @@ from polars_gdx import read_gdx
 df = read_gdx("trnsport.gdx", symbol="x", key_filter={0: ["seattle"]})
 ```
 
+### Label matching
+
+Key labels (`key_filter` and `filter(pl.col(key) == label)` predicates) are matched **case-insensitively** (ASCII-folded), the way GAMS does — `"SEATTLE"` matches a stored `"seattle"`. The labels in the produced frame always keep the file's original casing. For predicate filters whose label only differs in case from the stored one, the plugin deliberately skips the native prefilter and re-applies a case-folded predicate on the full read, because Polars' `==` is case-sensitive and would otherwise silently drop the rows.
+
+### File handle lifetime
+
+`scan_gdx` keeps the GDX file open until the returned `LazyFrame` is collected and released (Polars may read the source more than once). Use `read_gdx`, or an explicit `Reader` with its `close()` / context-manager support, to release the handle eagerly — relevant on Windows, where an open handle locks the file.
+
 ## Benchmark
 
 vs [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (pandas-backed), on a 2M-record parameter (80 MB GDX); best of 5 runs. See `benchmarks/bench_vs_gamsapi.py` (run as a CI job on every push).

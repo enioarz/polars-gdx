@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, DictionaryArray, Float64Array, StringArray, UInt32Array};
@@ -13,10 +13,16 @@ fn to_py_err(e: gdx::GdxError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+fn closed_err() -> PyErr {
+    PyRuntimeError::new_err("reader is closed")
+}
+
 /// `GdxFile` holds a raw FFI pointer, so it is structurally `!Send`/`!Sync`.
 /// The `gdx` crate serializes every FFI call behind a process-global mutex,
 /// which makes cross-thread access sound; all methods here take `&self` and
-/// are safe under concurrent calls.
+/// are safe under concurrent calls. The `Option` wrapper allows releasing the
+/// file handle early via `close()`; dropping it runs `GdxFile`'s own `Drop`
+/// (close + free under the global lock), so no extra cleanup is needed here.
 struct SendGdxFile(GdxFile);
 unsafe impl Send for SendGdxFile {}
 unsafe impl Sync for SendGdxFile {}
@@ -25,10 +31,12 @@ unsafe impl Sync for SendGdxFile {}
 ///
 /// The symbol table is parsed eagerly; record data is read on demand per
 /// symbol. Reads are serialized by the global GDX lock; nothing is read
-/// beyond what is requested.
+/// beyond what is requested. The underlying GDX object is released when the
+/// reader is dropped, or earlier via [`close`](Reader::close); every method
+/// raises `RuntimeError("reader is closed")` afterwards.
 #[pyclass]
 struct Reader {
-    file: SendGdxFile,
+    file: Option<SendGdxFile>,
 }
 
 /// Symbol metadata: (name, type_str, dim, records, domains, text).
@@ -40,20 +48,46 @@ impl Reader {
     fn new(path: &str) -> PyResult<Self> {
         let file = GdxFile::open(path).map_err(to_py_err)?;
         Ok(Self {
-            file: SendGdxFile(file),
+            file: Some(SendGdxFile(file)),
         })
+    }
+
+    /// Release the underlying GDX file handle immediately (idempotent).
+    /// Any later use of this reader raises `RuntimeError`.
+    fn close(&mut self) {
+        self.file = None;
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        Ok(slf)
+    }
+
+    fn __exit__(
+        &mut self,
+        _exc_type: PyObject,
+        _exc_value: PyObject,
+        _traceback: PyObject,
+    ) -> PyResult<()> {
+        self.close();
+        Ok(())
     }
 
     /// The file's UEL table: entry `i` is the label of 1-based UEL number
     /// `i + 1`. Used by the Python layer to translate Polars predicates into
     /// native key filters.
     fn uel_table(&self) -> PyResult<Vec<String>> {
-        self.file.0.uel_table().map_err(to_py_err)
+        let Some(file) = self.file.as_ref() else {
+            return Err(closed_err());
+        };
+        file.0.uel_table().map_err(to_py_err)
     }
 
     /// List all symbols: (name, type, dim, record_count, domains, text).
-    fn symbols(&self) -> Vec<SymbolTuple> {
-        self.file.0.symbols().iter().map(symbol_tuple).collect()
+    fn symbols(&self) -> PyResult<Vec<SymbolTuple>> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(closed_err());
+        };
+        Ok(file.0.symbols().iter().map(symbol_tuple).collect())
     }
 
     /// Read one symbol as Arrow IPC (Feather V2) bytes, with optional key
@@ -64,6 +98,7 @@ impl Reader {
     ///   Variables/Equations (default `level`).
     /// - `key_filter`: list of `(dim_index, allowed_labels)` pairs; records
     ///   with a key outside the allowed set are skipped before materialising.
+    ///   Labels are matched case-insensitively (GAMS semantics).
     ///
     /// Returns an `arrow` RecordBatch (zero-copy into Python via PyCapsule).
     #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None))]
@@ -75,8 +110,10 @@ impl Reader {
         key_filter: Option<Vec<(usize, Vec<String>)>>,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
-        let info = self
-            .file
+        let Some(file) = self.file.as_ref() else {
+            return Err(closed_err());
+        };
+        let info = file
             .0
             .symbol(name)
             .ok_or_else(|| PyRuntimeError::new_err(format!("symbol {name:?} not found")))?;
@@ -85,7 +122,6 @@ impl Reader {
             Some(s) => Some(parse_field(s)?),
             None => None,
         };
-
         // Fast vectorised path: raw UEL indices (no label strings) with an
         // optional index-based prefilter; keys become Arrow dictionary arrays.
         // Note: a filter whose labels resolve to no UEL indices (label not
@@ -106,32 +142,47 @@ impl Reader {
                     .all(|&(d, ref allowed)| allowed.contains(&idx[d]))
             })
         };
-        let mut data = self
-            .file
+        let mut data = file
             .0
             .read_symbol_raw(info, vfield, pred)
             .map_err(to_py_err)?;
-
         let batch = to_record_batch(self, info, &mut data, key_names, vfield)?;
         Ok(batch.into_pyarrow(py)?.into_any())
     }
 }
 
 impl Reader {
-    /// Resolve filter labels to their raw UEL indices for the open file.
+    /// Resolve filter labels to their raw UEL indices for the open file,
+    /// matching case-insensitively (ASCII-folded) the way GAMS does.
     ///
     /// Labels not present in the file are simply never matched; they map to
-    /// no index and the filter stays empty for that label (no error).
+    /// no index and the filter stays empty for that label (no error). When
+    /// several UELs differ only by case, the lowest UEL number wins.
     fn resolve_uel_indices(
         &self,
         filters: &[(usize, HashSet<String>)],
     ) -> PyResult<Vec<(usize, HashSet<i32>)>> {
-        let label_to_index = self.file.0.uel_index().map_err(to_py_err)?;
+        let Some(file) = self.file.as_ref() else {
+            return Err(closed_err());
+        };
+        let label_to_index = file.0.uel_index().map_err(to_py_err)?;
+        let mut folded: HashMap<String, i32> = HashMap::with_capacity(label_to_index.len());
+        for (label, &idx) in &label_to_index {
+            let entry = folded.entry(label.to_ascii_uppercase()).or_insert(idx);
+            if idx < *entry {
+                *entry = idx;
+            }
+        }
         let mut out = Vec::with_capacity(filters.len());
         for (d, labels) in filters {
             let idxs: HashSet<i32> = labels
                 .iter()
-                .filter_map(|l| label_to_index.get(l.as_str()).copied())
+                .filter_map(|l| {
+                    label_to_index
+                        .get(l.as_str())
+                        .copied()
+                        .or_else(|| folded.get(&l.to_ascii_uppercase()).copied())
+                })
                 .collect();
             out.push((*d, idxs));
         }
@@ -187,7 +238,6 @@ fn to_record_batch(
     field: ValueField,
 ) -> PyResult<RecordBatch> {
     let dim = info.dim;
-
     let mut names: Vec<String> = match &key_names {
         Some(names) if names.len() == dim => names.clone(),
         _ => (0..dim).map(|i| format!("dim_{i}")).collect(),
@@ -196,13 +246,19 @@ fn to_record_batch(
         SymbolType::Variable | SymbolType::Equation => field.as_str().to_ascii_lowercase(),
         _ => "value".to_string(),
     };
+    if names.contains(&value_name) {
+        return Err(PyRuntimeError::new_err(format!(
+            "column name collision: key column {value_name:?} conflicts with the value column"
+        )));
+    }
     names.push(value_name.clone());
-
-    let uels = reader.file.0.uel_table().map_err(to_py_err)?;
+    let Some(file) = reader.file.as_ref() else {
+        return Err(closed_err());
+    };
+    let uels = file.0.uel_table().map_err(to_py_err)?;
     let dict_values = Arc::new(StringArray::from(
         uels.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
     ));
-
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for d in 0..dim {
         let indices = UInt32Array::from(std::mem::take(&mut data.keys[d]));
@@ -210,13 +266,11 @@ fn to_record_batch(
         columns.push(Arc::new(dict) as ArrayRef);
     }
     columns.push(Arc::new(Float64Array::from(std::mem::take(&mut data.values))) as ArrayRef);
-
     let fields: Vec<Field> = names
         .iter()
         .zip(&columns)
         .map(|(name, col)| Field::new(name.clone(), col.data_type().clone(), false))
         .collect();
-
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| PyRuntimeError::new_err(format!("record batch error: {e}")))
 }

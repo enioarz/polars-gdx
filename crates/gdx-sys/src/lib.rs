@@ -87,6 +87,18 @@ extern "C" {
         domainids: *mut *mut c_char,
     ) -> c_int;
 
+    /// Relaxed domain definition for symbol `synr`: `domainids` holds `dim`
+    /// identifiers (not checked against known sets, no domain checking).
+    pub fn c__gdxsymbolsetdomainx(
+        obj: *mut GdxObj,
+        synr: c_int,
+        domainids: *const *const c_char,
+    ) -> c_int;
+
+    /// Case-insensitive symbol lookup by name; sets `synr` (0 universe,
+    /// -1 not found). Returns non-zero when found.
+    pub fn c__gdxfindsymbol(obj: *mut GdxObj, syid: *const c_char, synr: *mut c_int) -> c_int;
+
     /// Begin reading symbol `synr` in string mode; sets `nrecs`.
     pub fn c__gdxdatareadstrstart(obj: *mut GdxObj, synr: c_int, nrecs: *mut c_int) -> c_int;
     /// Read one record: fills `keystr` (array of `dim` C strings) and `values[5]`.
