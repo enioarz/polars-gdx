@@ -1,0 +1,29 @@
+# C++
+/stubwarnings.txt
+/gdx.vcxproj.user
+/out/**
+/build/**
+/x64/**
+/gdx/x64/**
+/cmake-build-*/**
+/slowdown.txt
+/class_benchmarks.txt
+/gdxbench_collected.txt
+/gdxtest.xcodeproj/project.xcworkspace/xcuserdata/**
+/gdxtest.xcodeproj/xcuserdata/**
+/src/gclgms.h
+/src/gdxcc.c
+/src/gdxcc.h
+
+# Python
+**/venv/**
+**/.venv/**
+**/__pycache__/**
+
+# IDEs
+/.idea/**
+/.vs/**
+/.vscode/**
+
+# Docs
+/docs/html/**

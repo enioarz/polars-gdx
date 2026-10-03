@@ -1,0 +1,86 @@
+---
+- 7.11.21:
+    - Updated doctest header to release 2.5.2.
+    - Fixed some type coercion warnings.
+    - Various small fixes for GAMS infrastructure code.
+- 7.11.20:
+    - Use zlib library from system if found (instead of fetching its sources as submodule from GitHub and baking them into GDX).
+    - Minor changes to make it compile well when cross-compiling on Linux with MinGW (header names must match case-sensitive).
+    - Stream classes get interface needed by GAMS compiler and execution system library.
+- 7.11.19:
+    - Extended and updated internal runtime library for use in other GAMS products.
+    - Added unit test for trim functions and raw uel insertion.
+    - Cleanup and minor touchups in GDX object module.
+    - GDX tools
+      - Fully migrated to uv for all scripts, CI pipelines, and dependency caching.
+      - Fixed missing C++ namespaces/includes and consolidated shared Python test logic into common.py files.
+      - Added new pre-commit hooks and enforced strict validation for all Bash and Python code.
+- 7.11.18:
+    - Fixed duplicated text piece in description of gdxAddSetText.
+    - Many updates to shared internal infrastructure code (driven by static analysis).
+    - Restructure CMake project for GDX tools (diff, dump, merge) and adapt header paths.
+    - Added zlib as submodule.
+    - Increased performance of case-insensitive text comparison on Linux and macOS.
+- 7.11.17:
+    - Include path to file that cannot be opened in error message after gdxOpenRead* failed due to missing file.
+- 7.11.16:
+    - Drastically improve performance of `gdxOpenRead` for GDX files with many UELs by reducing the memory allocation count.
+    - Drop many GAMS infrastructure source files not actively used by GDX library.
+- 7.11.15:
+    - Fixed an issue where `gdxmerge` would fail with a "Symbol is too large" error when merging GDX files containing large symbols.
+- 7.11.14:
+    - Correctly deal with GDX files that have long absolute paths (>260 characters) in GDX library and all tools (`gdxdump`, `gdxdiff`, `gdxmerge`).
+- 7.11.13:
+    - Fixed the processing of commands via a text file (`@filename`) in `gdxmerge`.
+    - Corrected documentation of `SyNr` argument of `gdxSymbolGetDomain(X)`.
+    - Updated copyright notices in source file headers.
+    - Miscellaneous changes in shared infrastructure code triggered by other GAMS projects.
+- 7.11.12:
+    - Added internal codes for arm64 architecture on Linux (previously only available for macOS)
+- 7.11.11:
+    - Changed extension for C++ header files from *.h to *.hpp to fix potentially incorrect classification as C headers from tooling.
+- 7.11.10:
+    - Multiple small fixes to infrastructure code, shared modules, and hardening compiler flags.
+- 7.11.9:
+    - Made gdxOpenRead not lock the file (from being deleted) on Windows.
+    - Removed unnecessary dependency on "dladdr" as requested in GitHub issue.
+- 7.11.8:
+    - Added C++ port of GDX utilities gdxdiff, gdxdump, and gdxmerge.
+- 7.11.7:
+    - Fix building GDX on arm64 with GCC (char is unsigned by default there).
+    - Multiple cosmetic changes.
+    - Another batch of changes to infrastructure code and CI pipeline that is not directly affecting GDX.
+- 7.11.6:
+    - Make building (so far) unused infrastructure classes in CMake project optional.
+    - Added toggles to disable building tests and examples as part of CMake project (use -DNO_TESTS=ON or -DNO_EXAMPLES=ON).
+    - Extended README with short recipe for quickly building a minimal GDX library with CMake.
+- 7.11.5:
+    - Fixed gdxOpenAppend not indicating a problem (in the return code) when trying to append to a GDX file with format version before 7 (incompatible for appending).
+    - Fixed gdxDataReadMap crashing when record (user-mapped) UEL indices are out of bounds (index exceeds number of UELs).
+- 7.11.4:
+    - Multiple small fixes to infrastructure code and shared modules.
+- 7.11.3:
+    - Reworked internally used file IO streams to utilize low-level WinAPI/POSIX functions instead of the more heavyweight std::fstream.
+    - Use more efficient integer to string conversion procedure for tracing outputs.
+    - Reduced width of trace level and file mode enum values from 4 byte to 1 byte.
+    - Adjusted compiler flags for new clang-based Intel C++ compiler in CMake project.
+    - Many performance improvements in auxiliary classes to be used by future GDX utilities.
+- 7.11.2:
+    - Added multiple auxiliary classes as preparation for soon to be released GDX related utilities.
+    - Fixed memory alignment in custom memory allocator.
+    - Prevent signed integer overflow in internally used hashmap class.
+- 7.11.1:
+    - gdxUMUelGet was modified to accept a NULL pointer for the user UEL index mapping "UelMap".
+    - Added two new example programs xp_associative(_vec) and xp_dataWrite.
+    - macOS libraries deployed with GitHub release are now universal (also support Intel) instead of only arm64.
+    - Also release libraries for static linking on all platforms.
+    - Added gdxDataWriteRawStartKeyBounds that allows supplying UEL index lower and upper bounds per symbol dimension.
+- 7.10.1:
+    - First open source release of GDX eXPert-level API. Compatible with GAMS 45.
+    - Added gdxAllowBogusDomains to get flag to ignore using 1-dim sets as domain when their elements are not tracked (see gdxStoreDomainSets).
+    - Added script to automatically generate C-wrapper from API definition YAML file.
+    - Added boolean property gdxMapAcronymsToNaN (disabled by default) that maps all acronym values to special value "Not a Number" (NaN).
+    - Removed XCode project file for unit test suite as it is not maintained anymore.
+    - >
+      Entries for property setters and getters in main header and wrappers are now automatically generated from API
+      definition YAML via Jinja2 templates and not handwritten.

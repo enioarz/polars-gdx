@@ -1,0 +1,262 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="tests">
+      <UniqueIdentifier>{52cae6ab-922c-4873-b7dd-d49a95b9e287}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="zlib">
+      <UniqueIdentifier>{aeb1de90-6de1-4e63-95c1-ec1592083fff}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="gdlib">
+      <UniqueIdentifier>{f2074df4-2e23-411b-8082-fe52e15d0066}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tests\gdlib">
+      <UniqueIdentifier>{dd109c05-7a55-44f4-9efa-8aeafdadf349}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="tests\rtl">
+      <UniqueIdentifier>{3d996aed-e690-4dd3-aa3b-adde852b670b}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="rtl">
+      <UniqueIdentifier>{69ceda76-8107-4655-a825-d6a736709e23}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="global">
+      <UniqueIdentifier>{8a5c2307-2b09-4796-b6b7-dce893bd9bee}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\gxfile.cpp">
+    </ClCompile>
+    <ClCompile Include="src\tests\doctestmain.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gxfiletests.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdxtests.cpp">
+      <Filter>tests</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\gmsstrm.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\utils.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\datastoragetests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\gmsdatatests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\gmsobjtests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\gmsstrmtests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\strhashtests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\strutilxtests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\gdlib\utilstests.cpp">
+      <Filter>tests\gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\rtl\p3iotests.cpp">
+      <Filter>tests\rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\rtl\p3utilstests.cpp">
+      <Filter>tests\rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\tests\rtl\sysutilsp3tests.cpp">
+      <Filter>tests\rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\datastorage.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\dblutil.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\gmsdata.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\gmsobj.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\strhash.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\gdlib\strutilx.cpp">
+      <Filter>gdlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\dtoaLoc.c">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\math_p3.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\p3io.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\p3platform.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\p3process.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\p3utils.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\sysutils_p3.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\adler32.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\compress.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\crc32.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\deflate.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\gzclose.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\gzlib.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\gzread.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\gzwrite.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\infback.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\inffast.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\inflate.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\inftrees.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\trees.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\uncompr.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="zlib\zutil.c">
+      <Filter>zlib</Filter>
+    </ClCompile>
+    <ClCompile Include="src\rtl\system_p3.cpp">
+      <Filter>rtl</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\gxfile.hpp">
+    </ClInclude>
+    <ClInclude Include="src\tests\gdxtests.hpp">
+      <Filter>tests</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdx.hpp" />
+    <ClInclude Include="src\gdlib\gmsstrm.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\utils.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\batchalloc.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\datastorage.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\dblutil.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\gmsdata.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\gmsobj.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\strhash.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\gdlib\strutilx.hpp">
+      <Filter>gdlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\dtoaLoc.h">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\math_p3.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\p3io.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\p3platform.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\p3process.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\p3utils.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\sysutils_p3.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+    <ClInclude Include="src\global\delphitypes.hpp">
+      <Filter>global</Filter>
+    </ClInclude>
+    <ClInclude Include="src\global\unit.h">
+      <Filter>global</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\crc32.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\deflate.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\gzguts.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\inffast.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\inffixed.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\inflate.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\inftrees.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\trees.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\zconf.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\zlib.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="zlib\zutil.h">
+      <Filter>zlib</Filter>
+    </ClInclude>
+    <ClInclude Include="src\rtl\idglobal_p3.hpp" />
+    <ClInclude Include="src\tests\doctest.hpp" />
+    <ClInclude Include="src\rtl\system_p3.hpp">
+      <Filter>rtl</Filter>
+    </ClInclude>
+  </ItemGroup>
+</Project>

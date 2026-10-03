@@ -1,0 +1,4 @@
+**/*.gdx
+**/*.gsp
+
+/results/*.md

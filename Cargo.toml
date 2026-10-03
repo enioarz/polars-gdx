@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gdx-sys",
+    "crates/gdx",
+    "crates/polars-gdx",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.dependencies]
+thiserror = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"

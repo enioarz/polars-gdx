@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin.build"
+
+[project]
+name = "polars-gdx"
+version = "0.1.0"
+description = "Polars IO plugin for reading GAMS GDX files lazily with native key prefiltering"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = ["polars>=1.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "polars_gdx._core"
+manifest-path = "crates/polars-gdx/Cargo.toml"
+features = ["pyo3/extension-module"]

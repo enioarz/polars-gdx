@@ -1,0 +1,20 @@
+[package]
+name = "polars-gdx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Polars IO plugin for reading GAMS GDX files (lazy scan with pushdown prefiltering)."
+publish = false
+
+[lib]
+name = "polars_gdx"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gdx = { path = "../gdx" }
+arrow = { version = "56", default-features = false, features = ["ipc", "csv"] }
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+thiserror.workspace = true
+
+[build-dependencies]
+pyo3-build-config = "0.23"
