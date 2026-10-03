@@ -7,14 +7,7 @@ on:
 
 jobs:
   test:
-    if: |
-      !startsWith(github.head_ref || github.ref_name, 'docs/') &&
-      github.event_name == 'push'
-        ? true
-        : !(
-            github.event.pull_request.title matches '(?i)^docs(\\([a-z]+\\))?:' ||
-            github.event.pull_request.title matches '(?i)^chore(\\([a-z]+\\))?:'
-          )
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'docs/') && !startsWith(github.head_ref || github.ref_name, 'chore/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,14 +23,7 @@ jobs:
       - run: pytest tests/ -q
 
   benchmark:
-    if: |
-      !startsWith(github.head_ref || github.ref_name, 'docs/') &&
-      github.event_name == 'push'
-        ? true
-        : !(
-            github.event.pull_request.title matches '(?i)^docs(\\([a-z]+\\))?:' ||
-            github.event.pull_request.title matches '(?i)^chore(\\([a-z]+\\))?:'
-          )
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'docs/') && !startsWith(github.head_ref || github.ref_name, 'chore/') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
