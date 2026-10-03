@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "polars-gdx"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lazy, prefiltered Polars reader for GAMS GDX files"
 readme = "README.md"
 license = "MIT AND Zlib"
@@ -32,7 +32,7 @@ classifiers = [
   "Programming Language :: Rust",
   "Topic :: Scientific/Engineering",
 ]
-dependencies = ["polars>=1.0"]
+dependencies = ["polars>=1.0", "pyarrow>=11"]
 
 [project.urls]
 Homepage = "https://github.com/enioarz/polars-gdx"
