@@ -44,14 +44,15 @@ jobs:
         run: |
           pip install delvewheel
           $dll = Get-ChildItem -Path target -Recurse -Filter gdxcclib64.dll | Select-Object -First 1
-          delvewheel repair (Get-ChildItem dist/*.whl | Select-Object -ExpandProperty FullName) -v (Split-Path $dll.FullName) -w repaired
+          delvewheel repair (Get-ChildItem dist/*.whl | Select-Object -ExpandProperty FullName) --add-path (Split-Path $dll.FullName) -w repaired
           Move-Item repaired/*.whl dist/ -Force
 
       - name: Repair wheel (bundle vendored libgdxcclib64)
         if: endsWith(matrix.target, '-apple-darwin')
         run: |
           pip install delocate
-          delocate-wheel dist/*.whl -w repaired
+          LIBDIR=$(find target -name libgdxcclib64.dylib -printf '%h' | head -1)
+          DYLD_LIBRARY_PATH=$LIBDIR delocate-wheel dist/*.whl -w repaired
           rm -f dist/*.whl && mv repaired/*.whl dist/
 
       - name: Build SDist
