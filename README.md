@@ -2,7 +2,7 @@
 
 Lazy, prefiltered Polars access to [GAMS GDX](https://github.com/GAMS-dev/gdx) files — no GAMS installation required.
 
-- `scan_gdx(path, symbol=...)` returns a `pl.LazyFrame`; nothing is read until `collect()`, and column projection is pushed down via Polars' IO-source interface.
+- `scan_gdx(path, symbol=...)` returns a `pl.LazyFrame`; nothing is read until `collect()`, and column projection is pushed down via Polars' IO-source interface. `read_gdx(...)` is the eager convenience wrapper (`scan_gdx(...).collect()`, same arguments).
 - Predicates on key columns (`key_filter={dim_index: allowed_labels}` or `filter()`) are folded into a **native, index-based prefilter inside the Rust read loop**, so unwanted records are never materialized — unlike the official `gamsapi` reader, which must load everything into pandas first.
 - Under the hood: hand-written FFI to the vendored MIT-licensed GDX C library, extracted from [lolow/gdxcomp](https://github.com/lolow/gdxcomp), building on [GAMS-dev/gdx](https://github.com/GAMS-dev/gdx).
 
@@ -19,6 +19,10 @@ x = scan_gdx("trnsport.gdx", symbol="x")
 
 # read only the seattle rows, skipping all others natively
 x.filter(pl.col("dim_0") == "seattle").collect()
+
+# eager convenience: read_gdx = scan_gdx(...).collect()
+from polars_gdx import read_gdx
+df = read_gdx("trnsport.gdx", symbol="x", key_filter={0: ["seattle"]})
 ```
 
 ## Benchmark
