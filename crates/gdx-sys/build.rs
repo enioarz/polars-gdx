@@ -21,6 +21,16 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
 
+    // On platforms without a system zlib (e.g. the GitHub Actions Windows
+    // runners), gdx's CMakeLists falls back to compiling the vendored zlib
+    // sources. Those sources expect a generated zconf.h (normally produced by
+    // zlib's `configure`, which gdx never runs). zconf.h.in has no template
+    // substitutions, so a plain copy is a valid zconf.h.
+    let zconf = src.join("zlib/zconf.h");
+    if !zconf.exists() {
+        std::fs::copy(src.join("zlib/zconf.h.in"), &zconf).expect("copy zconf.h.in to zconf.h");
+    }
+
     // Build only the C-API shared library target; skip tests/examples/tools.
     // CMAKE_POLICY_VERSION_MINIMUM is needed so CMake 4.x accepts the bundled
     // zlib's very old `cmake_minimum_required`.
