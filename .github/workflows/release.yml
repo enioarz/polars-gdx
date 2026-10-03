@@ -100,7 +100,10 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # Trusted Publishing (OIDC): no token needed. The publisher must be
+      # registered on PyPI (owner: enioarz, repo: polars-gdx, workflow:
+      # release.yml, environment: pypi).
       - name: Publish
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          attestations: true
