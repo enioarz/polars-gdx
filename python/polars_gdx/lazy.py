@@ -123,10 +123,16 @@ def scan_gdx(
         del batch_size
         filters = explicit_filters
         pred_expr = None
+        native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
             native = _predicate_key_filter(pred_expr, key_names, reader)
-            if native is not None:
+            if native is None:
+                # Predicate not fully translatable: a native row limit could
+                # under-fill head(n), so read unlimited and let Polars-side
+                # filter().head(n) apply.
+                native_limit_safe = False
+            else:
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
                 # the raw read. The predicate is re-applied below for exact
@@ -145,6 +151,7 @@ def scan_gdx(
             key_names=list(key_names),
             value_field=(None if value_name == "value" else value_name),
             key_filter=filters,
+            n_rows=(n_rows if native_limit_safe else None),
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         df = pl.from_arrow(batch)
