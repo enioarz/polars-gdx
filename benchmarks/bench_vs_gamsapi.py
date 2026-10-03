@@ -17,8 +17,37 @@ from polars_gdx import scan_gdx  # noqa: E402
 
 import gams.transfer as gt  # noqa: E402
 
-SYSDIR = next(Path(__file__).resolve().parent.parent.glob(
-    ".venv/lib/python*/site-packages/gamspy_base"))
+
+def _find_gams_sysdir() -> str:
+    """Locate a GAMS system directory with all native libraries.
+
+    The `gamspy` wheel ships one (gamspy_base); a full GAMS install also
+    works. Exits with guidance when neither is found.
+    """
+    import glob
+
+    candidates = []
+    try:
+        import gamspy_base
+
+        candidates.append(Path(gamspy_base.__file__).resolve().parent)
+    except ImportError:
+        pass
+    candidates.extend(
+        Path(p) for p in glob.glob("/opt/gams*/sysdir") if Path(p).is_dir()
+    )
+    for cand in candidates:
+        if (cand / "libgmdcclib64.so").exists() or (cand / "libgmdcclib64.dll").exists():
+            return str(cand)
+    if candidates:
+        return str(candidates[0])
+    sys.exit(
+        "No GAMS system directory found. Install `gamspy` (pip install gamspy) "
+        "or a GAMS distribution so gamsapi can load its native libraries."
+    )
+
+
+SYSDIR = _find_gams_sysdir()
 
 GDX = sys.argv[1] if len(sys.argv) > 1 else "/tmp/bench_big.gdx"
 FILTER_LABEL = "i00042"   # one of 2000 first-dim labels
