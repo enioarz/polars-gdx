@@ -211,20 +211,13 @@ impl GdxFile {
         value_field: ValueField,
         pred: IndexPred<'_>,
     ) -> Result<RawSymbolData> {
-        // First a probe read to learn the record count (and validate the
-        // symbol); the mode is reset with `gdxDataReadDone` afterwards.
-        let mut nrecs = 0;
-        if ffi::c__gdxdatareadrawstart(self.obj, info.number as i32, &mut nrecs) == 0 {
-            return Err(op_error(self.obj, "gdxDataReadRawStart"));
-        }
-        ffi::c__gdxdatareaddone(self.obj);
-
         let vidx = value_field.index();
-        let mut data = RawSymbolData::with_capacity(info.dim, nrecs.max(0) as usize);
+        let mut data = RawSymbolData::with_capacity(info.dim, info.records);
 
         // Filtered read: per-record loop so the predicate can run on raw
         // indices before anything is stored.
         if let Some(f) = pred {
+            let mut nrecs = 0;
             if ffi::c__gdxdatareadrawstart(self.obj, info.number as i32, &mut nrecs) == 0 {
                 return Err(op_error(self.obj, "gdxDataReadRawStart"));
             }
