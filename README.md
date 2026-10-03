@@ -39,10 +39,10 @@ vs [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (pandas-backed), on a 2
 
 | Scenario | polars-gdx | gamsapi (pandas) |
 | --- | ---: | ---: |
-| Full read (2M rows) | 0.126 s | 0.086 s |
-| `filter(dim_0 == label)` — 1000 of 2M rows | **0.063 s** | 0.087 s¹ |
-| Explicit `key_filter` — 1000 rows | 0.080 s | — |
-| `head(100)` of 2M rows | **0.001 s** | 0.086 s¹ |
+| Full read (2M rows) | 0.128 s | 0.086 s |
+| `filter(dim_0 == label)` — 1000 of 2M rows | **0.059 s** | 0.096 s¹ |
+| Explicit `key_filter` — 1000 rows | **0.058 s** | — |
+| `head(1000)` of 2M rows | **0.001 s** | 0.101 s¹ |
 
 ¹ gamsapi has no lazy loading or pushdown: it must materialize the whole symbol, then filter. The advantage of polars-gdx grows with predicate selectivity; `head(n)`/`n_rows` terminates the native read after n records.
 
