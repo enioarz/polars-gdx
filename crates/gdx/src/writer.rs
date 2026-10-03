@@ -52,6 +52,46 @@ impl GdxWriter {
 
     /// Write one symbol with all of its records.
     ///
+    /// Write one symbol with all of its records, recording relaxed domain
+    /// names (one per dimension, no domain checking) via
+    /// `gdxSymbolSetDomainX`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_symbol_with_domains(
+        &mut self,
+        name: &str,
+        text: &str,
+        dim: usize,
+        kind: SymbolType,
+        subtype: i32,
+        records: &[Record],
+        domains: &[&str],
+    ) -> Result<()> {
+        self.write_symbol(name, text, dim, kind, subtype, records)?;
+        if domains.is_empty() {
+            return Ok(());
+        }
+        debug_assert_eq!(domains.len(), dim, "one domain name per dimension");
+        let cname = CString::new(name).map_err(|_| GdxError::InvalidPath(name.into()))?;
+        let cdomains: Vec<CString> = domains
+            .iter()
+            .map(|d| CString::new(*d).unwrap_or_default())
+            .collect();
+        let ptrs: Vec<*const c_char> = cdomains.iter().map(|d| d.as_ptr()).collect();
+        let _guard = crate::lock::lock();
+        unsafe {
+            let mut synr = -1;
+            if ffi::c__gdxfindsymbol(self.obj, cname.as_ptr(), &mut synr) == 0 || synr <= 0 {
+                return Err(self.op_error("gdxFindSymbol"));
+            }
+            if ffi::c__gdxsymbolsetdomainx(self.obj, synr, ptrs.as_ptr()) == 0 {
+                return Err(self.op_error("gdxSymbolSetDomainX"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Write one symbol with all of its records.
+    ///
     /// `dim` is the index dimension; every record's `keys` must have this length.
     pub fn write_symbol(
         &mut self,

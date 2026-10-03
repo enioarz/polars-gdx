@@ -91,6 +91,19 @@ def scan_gdx(
         materialisation. This runs in the Rust read loop, in addition to any
         predicate pushdown Polars performs on the produced frame.
 
+    Notes
+    -----
+    **Label matching**: key labels are matched case-insensitively
+    (ASCII-folded), the way GAMS does, for both ``key_filter`` and
+    ``filter(pl.col(key) == label)`` predicates. The labels stored in the
+    produced frame keep the file's original casing.
+
+    **File handle lifetime**: the underlying GDX file stays open until the
+    returned LazyFrame is collected and released, because Polars may read the
+    source more than once. Use :func:`read_gdx` (or an explicit
+    ``Reader`` plus its ``close()``/context-manager support) if you need the
+    handle released eagerly.
+
     Example
     -------
     >>> lf = scan_gdx("trnsport.gdx", symbol="x")  # doctest: +SKIP
@@ -103,11 +116,13 @@ def scan_gdx(
             f"symbol {symbol!r} not found in {path!r}; available: {sorted(info)}"
         )
     _, type_str, dim, _n, domains, _text = info[symbol]
-
-    key_names = _key_names(symbol, domains, dim)
     if value_field is not None and value_field not in _VALUE_FIELDS:
         raise ValueError(f"value_field must be one of {_VALUE_FIELDS}, got {value_field!r}")
     value_name = "value" if type_str in ("Set", "Parameter", "Alias") else (value_field or "level")
+    # Key column names must never collide with the value column (a domain
+    # set literally named ``value`` would otherwise overwrite it in the
+    # schema dict and break the Arrow record batch).
+    key_names = _key_names(domains, dim, reserved={value_name})
     schema = {name: pl.String for name in key_names} | {value_name: pl.Float64}
 
     explicit_filters = None
@@ -126,8 +141,18 @@ def scan_gdx(
         native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
-            native = _predicate_key_filter(pred_expr, key_names, reader)
-            if native is None:
+            native, folded = _predicate_key_filter(pred_expr, key_names, reader)
+            if folded:
+                # Some labels only match case-insensitively: Polars' `==` is
+                # case-sensitive, so the native prefilter would admit rows
+                # that the re-applied predicate would then drop silently.
+                # Fall back to a case-folded predicate on the full read; the
+                # predicate re-apply makes a native row limit unsafe.
+                pred_expr = _case_insensitive_expr(native, key_names)
+                native_limit_safe = False
+                if explicit_filters is None:
+                    filters = None
+            elif native is None:
                 # Predicate not fully translatable: a native row limit could
                 # under-fill head(n), so read unlimited and let Polars-side
                 # filter().head(n) apply.
@@ -168,33 +193,67 @@ def scan_gdx(
 
 def _predicate_key_filter(
     pred: pl.Expr, key_names: list[str], reader: Reader
-) -> list[tuple[int, list[str]]] | None:
+) -> tuple[list[tuple[int, list[str]]] | None, bool]:
     """Extract a native key filter from a predicate, if possible.
 
     Recognises conjunctions of `pl.col(k) == "label"` (either operand order)
     where `k` is a key column, by inspecting the predicate's serialized plan.
-    Returns a list of (dim_index, allowed_labels), or None when the predicate
-    cannot be translated (caller falls back to Polars-side filtering).
+    Returns ``(filters, folded)``:
+
+    - ``filters``: list of ``(dim_index, allowed_labels)``, or None when the
+      predicate cannot be translated (caller falls back to Polars-side
+      filtering).
+    - ``folded``: True when some labels exist in the file only under a
+      different letter case (matched via ASCII case folding, GAMS-style).
+      The caller must then re-apply a case-insensitive predicate itself
+      instead of folding the constraint into the native prefilter, because
+      the re-applied Polars ``==`` would otherwise silently drop those rows.
+      When ``folded`` is True, ``filters`` carries the full extracted
+      constraint set (with the user-supplied labels) for that rebuild.
     """
     try:
         plan = json.loads(pred.meta.serialize(format="json"))
     except Exception:
-        return None
+        return None, False
     filters: list[tuple[int, list[str]]] = []
     if not _collect_eq_filters(plan, key_names, filters):
-        return None
+        return None, False
     if not filters:
-        return None
+        return None, False
     # Resolve labels against the file's UEL table: labels not present in the
     # file can never match, so drop them; an empty set means no rows at all.
+    # Matching is case-insensitive (ASCII-folded) like GAMS: a label that only
+    # exists in the file under different casing still matches, but is flagged
+    # so the caller can keep Polars-side semantics correct.
     uels = set(reader.uel_table())
+    folded_uels = {l.upper(): l for l in uels}
     resolved = []
+    folded = False
     for d, labels in filters:
-        existing = [l for l in labels if l in uels]
+        existing = []
+        for l in labels:
+            if l in uels:
+                existing.append(l)
+            elif l.upper() in folded_uels:
+                existing.append(l)
+                folded = True
         if not existing:
-            return [(d, [])]
+            if folded:
+                return filters, True
+            return [(d, [])], False
         resolved.append((d, existing))
-    return resolved
+    return resolved, folded
+
+
+def _case_insensitive_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
+    """Rebuild an eq-conjunction predicate with case-insensitive equality."""
+    expr: pl.Expr | None = None
+    for d, labels in filters:
+        for l in labels:
+            eq = pl.col(key_names[d]).cast(pl.String).str.to_uppercase() == l.upper()
+            expr = eq if expr is None else expr & eq
+    assert expr is not None
+    return expr
 
 
 def _collect_eq_filters(
@@ -232,15 +291,17 @@ def _string_literal(node: dict) -> str | None:
         return None
 
 
-def _key_names(symbol: str, domains: list[str], dim: int) -> list[str]:
+def _key_names(domains: list[str], dim: int, reserved: set[str]) -> list[str]:
+    """Unique key-column names, also avoiding the (reserved) value column."""
     names = []
     for i, d in enumerate(domains[:dim]):
         if d and d != "*":
             candidate = d
         else:
             candidate = f"dim_{i}"
-        # Column names must be unique; de-duplicate with a positional suffix.
-        if candidate in names:
+        # Column names must be unique and must never collide with the value
+        # column; de-duplicate with a positional suffix.
+        if candidate in names or candidate in reserved:
             candidate = f"{candidate}_{i}"
         names.append(candidate)
     return names
