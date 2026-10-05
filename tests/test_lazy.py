@@ -219,6 +219,21 @@ def test_parallel_single_thread_falls_back_to_serial():
     assert read_gdx(GDX, symbol="x", threads=1).equals(read_gdx(GDX, symbol="x"))
 
 
+def test_parallel_dim0_filter_span_seek_parity():
+    # With a warm restart index (built by the unfiltered parallel read
+    # above), a dim-0 filtered parallel read takes the span-seek path:
+    # workers seek straight into the filter's byte window instead of
+    # decoding the prefix. The result must equal the serial filtered read.
+    read_gdx(GDX, symbol="x", threads=4)  # warm the restart index
+    serial = read_gdx(GDX, symbol="x", key_filter={0: ["san-diego"]})
+    parallel = read_gdx(GDX, symbol="x", key_filter={0: ["san-diego"]}, threads=4)
+    assert serial.equals(parallel)
+    assert set(parallel["dim_0"]) == {"san-diego"}
+    # A predicate-filtered lazy read must match too (same native prefilter).
+    pred = scan_gdx(GDX, symbol="x", threads=4).filter(pl.col("dim_0") == "san-diego").collect()
+    assert serial.equals(pred)
+
+
 def test_is_in_uses_native_prefilter(monkeypatch):
     """pl.col(key).is_in([...]) must fold into the native GDX prefilter."""
     import polars_gdx.lazy as lazy

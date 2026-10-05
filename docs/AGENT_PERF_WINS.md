@@ -55,10 +55,14 @@ prefiltered reads that never materialize unwanted records.
 4. Buffers are wrapped into Arrow: keys as `DictionaryArray` over a shared UEL
    string-values array, values as `Float64Array`, handed to Polars zero-copy.
 
-Parallel paths: dim-0 filter → UEL-range split (whole ranges skipped without I/O);
-no dim-0 filter → positional split at exact restart-record boundaries (byte offsets
-from a per-(file, symbol) cached index; workers seek and decode only their range;
-record-count contract falls back to serial on mismatch).
+Parallel paths: dim-0 filter → span-seek (the restart index records each dim-0
+group's start position AND key; filtered reads seek directly into the filter's
+byte window — a single time-step on a 300M-record symbol drops from ~5-10s to
+~0.01s warm). Cold cache: late spans (max UEL/uelcnt > 0.75) pay the one-time
+planning pass; early/mid spans use the UEL-range split until the cache warms.
+No dim-0 filter → positional split at exact restart-record boundaries (byte offsets
+from the same per-(file, symbol) cached index; workers seek and decode only their
+range; record-count contract falls back to serial on mismatch).
 
 Known hard constraint: **block-compressed symbol data** cannot use the positional or
 range paths (logical vs physical positions diverge); those reads fall back to serial

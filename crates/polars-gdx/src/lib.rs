@@ -276,20 +276,58 @@ impl Reader {
                 });
                 if let Some((min, max)) = span {
                     // A first-dimension filter constrains records to a
-                    // contiguous key range, so split the work by dim-0 UEL
-                    // ranges: a worker whose range contains no allowed UEL
-                    // returns empty without touching the file.
-                    let range_skip = move |lo: i32, hi: i32| hi < min || lo > max;
-                    gdx::GdxFile::read_symbol_raw_parallel(
-                        &self.path,
-                        info,
-                        vfield,
-                        &builder,
-                        None,
-                        threads.unwrap(),
-                        &range_skip,
-                    )
-                    .map_err(to_py_err)?
+                    // contiguous key range. Prefer the span-seek path: the
+                    // cached restart index knows the exact byte window of
+                    // the key span, so workers decode only the relevant
+                    // bytes instead of the whole prefix before the span.
+                    // Building the index costs one sequential pass, so on a
+                    // cold cache only do it for late spans (where the
+                    // range path decodes nearly the whole file anyway);
+                    // once cached (any parallel read of the symbol) the
+                    // span path is never slower.
+                    // UEL numbers are assigned sequentially at write time
+                    // and records are sorted by dim-0 key, so the filter's
+                    // highest UEL over the UEL count approximates how far
+                    // into the file the range path would have to decode.
+                    let late_span = match file.0.uel_counts() {
+                        Ok((uelcnt, _)) => uelcnt > 0 && f64::from(max) / f64::from(uelcnt) > 0.75,
+                        Err(_) => false,
+                    };
+                    if late_span || gdx::restart_positions_cached(&self.path, info) {
+                        if let Ok(data) = gdx::read_symbol_raw_span_parallel(
+                            &self.path,
+                            info,
+                            vfield,
+                            &builder,
+                            threads.unwrap(),
+                            min,
+                            max,
+                        ) {
+                            data
+                        } else {
+                            uel_range_parallel(
+                                &self.path,
+                                info,
+                                vfield,
+                                &builder,
+                                threads.unwrap(),
+                                min,
+                                max,
+                            )
+                            .map_err(to_py_err)?
+                        }
+                    } else {
+                        uel_range_parallel(
+                            &self.path,
+                            info,
+                            vfield,
+                            &builder,
+                            threads.unwrap(),
+                            min,
+                            max,
+                        )
+                        .map_err(to_py_err)?
+                    }
                 } else {
                     // No dim-0 filter: split by file position instead. A
                     // cached restart-position index (one cheap sequential
@@ -324,6 +362,24 @@ impl Reader {
         let batch = to_record_batch(self, info, &mut data, key_names, vfield)?;
         Ok(batch.into_pyarrow(py)?.into_any())
     }
+}
+
+/// Dim-0 UEL-range parallel read (the original range-split path): each
+/// worker scans from the symbol start and stops past its range's highest
+/// UEL, so a worker whose range contains no allowed UEL returns empty
+/// without touching the file.
+#[allow(clippy::type_complexity)]
+fn uel_range_parallel(
+    path: &str,
+    info: &gdx::SymbolInfo,
+    vfield: gdx::ValueField,
+    builder: &(dyn Fn() -> Box<dyn Fn(&[i32]) -> gdx::RecordAction + Send> + Sync),
+    threads: usize,
+    min: i32,
+    max: i32,
+) -> gdx::Result<gdx::RawSymbolData> {
+    let range_skip = move |lo: i32, hi: i32| hi < min || lo > max;
+    gdx::GdxFile::read_symbol_raw_parallel(path, info, vfield, builder, None, threads, &range_skip)
 }
 
 impl Reader {

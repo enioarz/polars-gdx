@@ -3889,7 +3889,10 @@ bool TGXFileObj::gdxSymbolDataSpan( int SyNr, int64_t &StartPos, int64_t &EndPos
 //   Indx[0] = low  32 bits of the physical position (int32)
 //   Indx[1] = high 32 bits of the physical position (int32, always 0 for
 //             files < 2 GiB)
-//   Indx[2] = 0-based record number of the restart record
+//   Indx[2] = dim-0 UEL number of the restart record (raw, 1-based), so
+//             callers can seek straight to the byte range covered by a
+//             first-dimension key span (polars-gdx extension: was the
+//             0-based record number, which no caller consumed)
 // Vals is unused (nullptr). Positions are strictly increasing and the first
 // delivered position equals the symbol's data start. Uncompressed data only.
 bool TGXFileObj::gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, void *Uptr )
@@ -3905,7 +3908,6 @@ bool TGXFileObj::gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, vo
    std::array<double, valscale + 1> AVals {};
    int AFDim {};
    int64_t recStart { FFile->GetPosition() };
-   int recNr { 0 };
    while( DoRead( AVals.data(), AFDim ) )
    {
       if( LastReadWasRestart )
@@ -3913,10 +3915,9 @@ bool TGXFileObj::gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, vo
          const auto pos { static_cast<uint64_t>( recStart ) };
          std::array<int, 3> packed { static_cast<int>( pos & 0xFFFFFFFFULL ),
                                      static_cast<int>( pos >> 32U ),
-                                     recNr };
+                                     LastElem[0] };
          if( !DP( packed.data(), nullptr, AFDim, Uptr ) ) break;
       }
-      recNr++;
       recStart = FFile->GetPosition();
    }
    gdxDataReadDone();

@@ -415,20 +415,25 @@ impl GdxFile {
     }
     /// (parallel extension) Exact physical start positions of every
     /// restart record (first-changed dimension 1) of symbol `info.number`,
-    /// in file order. One sequential decode pass; used to plan byte-range
-    /// splits so parallel workers start exactly on record boundaries.
-    pub fn collect_restart_positions(&self, info: &SymbolInfo) -> Result<Vec<i64>> {
+    /// in file order, each paired with the restart record's dim-0 UEL
+    /// number. One sequential decode pass; used to plan byte-range
+    /// splits so parallel workers start exactly on record boundaries, and
+    /// to seek straight to the byte window of a first-dimension key span.
+    pub fn collect_restart_positions(&self, info: &SymbolInfo) -> Result<Vec<RestartPoint>> {
         extern "C" fn collect_dp(
             indx: *const i32,
             _vals: *const f64,
             _afdim: i32,
             uptr: *mut std::ffi::c_void,
         ) -> i32 {
-            let out = unsafe { &mut *(uptr as *mut Vec<i64>) };
+            let out = unsafe { &mut *(uptr as *mut Vec<RestartPoint>) };
             let packed = unsafe { std::slice::from_raw_parts(indx, 3) };
             let lo = packed[0] as u32 as u64;
             let hi = packed[1] as u32 as u64;
-            out.push(((hi << 32) | lo) as i64);
+            out.push(RestartPoint {
+                pos: ((hi << 32) | lo) as i64,
+                key0: packed[2],
+            });
             1
         }
         let _guard = crate::lock::lock();
@@ -438,7 +443,7 @@ impl GdxFile {
                 self.obj,
                 info.number as i32,
                 collect_dp,
-                &mut out as *mut Vec<i64> as *mut std::ffi::c_void,
+                &mut out as *mut Vec<RestartPoint> as *mut std::ffi::c_void,
             ) == 0
             {
                 return Err(op_error(self.obj, "gdxCollectRestartPositions"));
@@ -809,14 +814,35 @@ impl Drop for GdxFile {
 /// Entries are never invalidated in-process; files are treated as
 /// immutable, matching the plugin's read-only use.
 type RestartCacheKey = (PathBuf, usize);
-type RestartCache = Mutex<HashMap<RestartCacheKey, Arc<Vec<i64>>>>;
+
+/// One restart record of a symbol's data section: its exact physical start
+/// position and its dim-0 UEL number. Records are stored sorted by dim-0
+/// key and every dim-0 group starts with a restart record, so this is the
+/// start of that key's record group.
+#[derive(Debug, Clone, Copy)]
+pub struct RestartPoint {
+    pub pos: i64,
+    pub key0: i32,
+}
+
+type RestartCache = Mutex<HashMap<RestartCacheKey, Arc<Vec<RestartPoint>>>>;
 
 fn restart_cache() -> &'static RestartCache {
     static CACHE: OnceLock<RestartCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached_restart_positions(path: &Path, info: &SymbolInfo) -> Result<Arc<Vec<i64>>> {
+/// Whether the restart-position index for (file, symbol) is already built
+/// and cached in this process, i.e. a span/positional read would not need
+/// to pay the one-pass planning cost first.
+pub fn restart_positions_cached(path: impl AsRef<Path>, info: &SymbolInfo) -> bool {
+    restart_cache()
+        .lock()
+        .unwrap()
+        .contains_key(&(path.as_ref().to_path_buf(), info.number))
+}
+
+fn cached_restart_positions(path: &Path, info: &SymbolInfo) -> Result<Arc<Vec<RestartPoint>>> {
     let key = (path.to_path_buf(), info.number);
     if let Some(v) = restart_cache().lock().unwrap().get(&key) {
         return Ok(Arc::clone(v));
@@ -902,17 +928,17 @@ pub fn read_symbol_raw_parallel_pos(
     let mut starts: Vec<i64> = Vec::with_capacity(threads);
     starts.push(0);
     let mut target = per;
-    let mut it = restarts.iter().skip(1).peekable();
+    let mut it = restarts.iter().skip(1).map(|r| r.pos).peekable();
     while starts.len() < threads {
         // advance the restart cursor to the position nearest `target`
-        while let Some(&&pos) = it.peek() {
+        while let Some(&pos) = it.peek() {
             if pos < target {
                 it.next();
             } else {
                 break;
             }
         }
-        let Some(&&pos) = it.peek() else { break };
+        let Some(&pos) = it.peek() else { break };
         starts.push(pos);
         target += per;
         it.next();
@@ -952,6 +978,152 @@ pub fn read_symbol_raw_parallel_pos(
     if !all_ok || total != info.records {
         // Positional checkpointing missed or duplicated records: fall back
         // to a verified serial read rather than return wrong data.
+        let file = GdxFile::open(&path)?;
+        let pred = pred_builder();
+        let pred_ref: ActionPred<'_> = Some(&*pred);
+        return file.read_symbol_raw(info, value_field, pred_ref, None);
+    }
+    let mut keys: Vec<Vec<u32>> = vec![Vec::new(); info.dim];
+    let mut values: Vec<f64> = Vec::new();
+    for (_, res) in parts {
+        let (part, _, _) = res?;
+        for (k, pk) in keys.iter_mut().zip(part.keys.iter()) {
+            k.extend_from_slice(pk);
+        }
+        values.extend_from_slice(&part.values);
+    }
+    Ok(RawSymbolData { keys, values })
+}
+
+/// Span-seek parallel read for first-dimension key filters (uncompressed
+/// data only).
+///
+/// `key_lo`/`key_hi` delimit the inclusive range of dim-0 UEL numbers the
+/// caller's filter may accept. Records are stored sorted by dim-0 key and
+/// every dim-0 group starts with a restart record, so all matching records
+/// live in one contiguous byte window whose exact boundaries come from the
+/// cached restart index (which also records each group's dim-0 key).
+/// Workers seek straight into that window and decode only its bytes,
+/// split at restart positions across `threads` independent handles.
+/// Unlike the UEL-range split, no worker decodes the prefix before the
+/// filter's span, so late spans cost the same as early ones.
+///
+/// Correctness contract: each worker must stop exactly at the next
+/// worker's start position (and the last at the window end), proving the
+/// ranges met at restart boundaries and every record in the window was
+/// delivered by exactly one worker; on mismatch the function falls back
+/// to a serial read. Returns Err when the restart index cannot be built
+/// (block-compressed data, scalars) so the caller can fall back to the
+/// UEL-range path.
+#[allow(clippy::type_complexity)]
+pub fn read_symbol_raw_span_parallel(
+    path: impl AsRef<Path>,
+    info: &SymbolInfo,
+    value_field: ValueField,
+    pred_builder: &(dyn Fn() -> Box<dyn Fn(&[i32]) -> RecordAction + Send> + Sync),
+    threads: usize,
+    key_lo: i32,
+    key_hi: i32,
+) -> Result<RawSymbolData> {
+    let path = path.as_ref().to_path_buf();
+    let empty = || RawSymbolData::with_capacity(info.dim, 0);
+    if key_lo > key_hi || info.records == 0 {
+        return Ok(empty());
+    }
+    let restarts = cached_restart_positions(&path, info)?;
+    let (_, data_end) = {
+        let probe = GdxFile::open(&path)?;
+        probe.symbol_data_span(info)?
+    };
+    // Byte window covering every record with dim-0 key in [key_lo, key_hi]:
+    // from the first restart whose key reaches key_lo up to (exclusive)
+    // the first restart whose key exceeds key_hi, or the end of the data.
+    // When key_lo falls between two group keys the window starts at the
+    // later group; the predicate discards nothing needed either way.
+    let Some(start_idx) = restarts.iter().position(|r| r.key0 >= key_lo) else {
+        // No dim-0 group reaches the filter's lowest key: no rows.
+        return Ok(empty());
+    };
+    let window_start = restarts[start_idx].pos;
+    let window_end = restarts[start_idx..]
+        .iter()
+        .position(|r| r.key0 > key_hi)
+        .map(|i| restarts[start_idx + i].pos)
+        .unwrap_or(data_end);
+    if window_end <= window_start {
+        return Ok(empty());
+    }
+    // Plan up to `threads` split points at restart positions strictly inside
+    // the window, weighted by byte distance (same policy as the positional
+    // path, restricted to the window).
+    let threads = threads.max(1).min(info.records);
+    let span = window_end - window_start;
+    let per = span / threads as i64;
+    let mut starts: Vec<i64> = Vec::with_capacity(threads);
+    starts.push(window_start);
+    if per > 0 {
+        let mut target = window_start + per;
+        let mut it = restarts[start_idx + 1..]
+            .iter()
+            .map(|r| r.pos)
+            .take_while(|&pos| pos < window_end)
+            .peekable();
+        while starts.len() < threads {
+            while let Some(&pos) = it.peek() {
+                if pos < target {
+                    it.next();
+                } else {
+                    break;
+                }
+            }
+            let Some(&pos) = it.peek() else { break };
+            starts.push(pos);
+            target += per;
+            it.next();
+        }
+    }
+    let ends: Vec<i64> = starts.iter().skip(1).copied().chain([window_end]).collect();
+    type PartResult = Result<(RawSymbolData, i64, usize)>;
+    let results: std::sync::Mutex<Vec<(usize, PartResult)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for (t, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+            let results = &results;
+            let path = path.clone();
+            scope.spawn(move || {
+                let res = GdxFile::open(&path).and_then(|file| {
+                    let pred = pred_builder();
+                    let pred_ref: ActionPred<'_> = Some(&*pred);
+                    file.read_symbol_raw_pos_unlocked(info, value_field, pred_ref, None, start, end)
+                });
+                if let Ok(mut guard) = results.lock() {
+                    guard.push((t, res));
+                }
+            });
+        }
+    });
+    let mut parts = results.into_inner().unwrap();
+    parts.sort_by_key(|(t, _)| *t);
+    // Validate the plan: each worker must report that it stopped exactly at
+    // the next worker's start (the last at the window end, or 0 when the
+    // window runs to the end of the data). Any mismatch means the restart
+    // index cannot be trusted for this file; fall back to a serial read.
+    let mut all_ok = true;
+    for (i, (_, res)) in parts.iter().enumerate() {
+        match res {
+            Ok((_, next_pos, _)) => {
+                let expected = ends[i];
+                if *next_pos != expected && !(*next_pos == 0 && expected == data_end) {
+                    all_ok = false;
+                    break;
+                }
+            }
+            Err(_) => {
+                all_ok = false;
+                break;
+            }
+        }
+    }
+    if !all_ok {
         let file = GdxFile::open(&path)?;
         let pred = pred_builder();
         let pred_ref: ActionPred<'_> = Some(&*pred);
