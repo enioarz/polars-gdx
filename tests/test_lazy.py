@@ -163,3 +163,25 @@ def test_filter_label_unused_in_dimension_yields_no_rows():
     # scanning the data.
     df = scan_gdx(GDX, symbol="x", key_filter={1: ["seattle"]}).collect()
     assert df.height == 0
+
+
+def test_filter_first_dim_early_stop_correct():
+    # Records are sorted by first-dimension key: an early-label filter must
+    # still produce exactly the matching rows (the scan stops early).
+    df = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0") == "seattle").collect()
+    assert set(df["dim_0"]) == {"seattle"}
+
+
+def test_filter_multi_dim_conjunction_bitmap():
+    df = (
+        scan_gdx(GDX, symbol="x")
+        .filter((pl.col("dim_0") == "seattle") & (pl.col("dim_1") == "topeka"))
+        .collect()
+    )
+    assert df.height == 1
+    assert df["dim_0"][0] == "seattle" and df["dim_1"][0] == "topeka"
+
+
+def test_key_filter_multiple_labels_dim0():
+    df = read_gdx(GDX, symbol="x", key_filter={0: ["seattle", "san-diego"]})
+    assert set(df["dim_0"]) == {"seattle", "san-diego"}

@@ -203,17 +203,53 @@ impl Reader {
             self.resolve_uel_indices(&filters)?
         };
         let vfield = field.unwrap_or(ValueField::Level);
-        let pred: gdx::IndexPred<'_> = match index_filters.as_slice() {
-            [] => None,
-            [(d, allowed)] if allowed.len() == 1 => {
-                let idx = allowed[0];
-                let d = *d;
-                Some(&move |idx_slice: &[i32]| idx_slice[d] == idx)
-            }
-            many => Some(&|idx_slice: &[i32]| {
-                many.iter()
-                    .all(|&(d, ref allowed)| allowed.binary_search(&idx_slice[d]).is_ok())
-            }),
+        // Membership bitmaps per filtered dimension: one bit per UEL number,
+        // so the hot-path check per record is a single load instead of a
+        // binary search. Records are stored sorted by key indices, so when
+        // dimension 0 is filtered the scan can stop outright once it moves
+        // past that dimension's highest allowed UEL.
+        let n_uels = self.uel_strings()?.len();
+        let bitmaps = index_filters
+            .iter()
+            .map(|(d, allowed)| {
+                let mut bm = vec![0u64; n_uels / 64 + 1];
+                for &i in allowed {
+                    if i > 0 {
+                        bm[(i - 1) as usize / 64] |= 1u64 << ((i - 1) % 64);
+                    }
+                }
+                (*d, bm)
+            })
+            .collect::<Vec<_>>();
+        // Highest allowed UEL in dimension 0 (0 = no dim-0 filter): the scan
+        // terminates once it passes this key, because records are sorted.
+        let stop_limit = index_filters
+            .iter()
+            .find(|(d, _)| *d == 0)
+            .and_then(|(_, allowed)| allowed.last().copied())
+            .unwrap_or(0);
+        let pred: gdx::ActionPred<'_> = if bitmaps.is_empty() {
+            None
+        } else {
+            Some(&move |idx_slice: &[i32]| -> gdx::RecordAction {
+                for &(d, ref bm) in bitmaps.iter() {
+                    let k = idx_slice[d];
+                    if k <= 0 {
+                        return gdx::RecordAction::Skip;
+                    }
+                    let u = (k - 1) as usize;
+                    if !bm.get(u / 64).is_some_and(|w| w & (1u64 << (u % 64)) != 0) {
+                        // First-dimension key beyond the filter's highest
+                        // allowed UEL: records are stored sorted by key, so
+                        // every remaining record is also beyond the filter.
+                        if d == 0 && k > stop_limit {
+                            return gdx::RecordAction::Stop;
+                        }
+                        return gdx::RecordAction::Skip;
+                    }
+                }
+                gdx::RecordAction::Accept
+            })
         };
         let mut data = file
             .0
