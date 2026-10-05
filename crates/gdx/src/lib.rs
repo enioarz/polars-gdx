@@ -20,6 +20,8 @@ mod types;
 mod writer;
 
 pub use error::{GdxError, Result};
-pub use reader::{ActionPred, GdxFile, IndexPred, RawSymbolData, RecordAction};
+pub use reader::{
+    read_symbol_raw_parallel_pos, ActionPred, GdxFile, IndexPred, RawSymbolData, RecordAction,
+};
 pub use types::{Record, SymbolInfo, SymbolType, ValueField};
 pub use writer::GdxWriter;

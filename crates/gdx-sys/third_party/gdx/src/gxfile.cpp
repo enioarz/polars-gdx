@@ -39,6 +39,7 @@
 #endif
 #include <map>      // for map, operator==, _Rb_tree_const_iterator
 #include <utility>  // for pair
+#include <filesystem>// for file_size
 
 #if defined( _WIN32 )
 #include <windows.h>
@@ -1411,12 +1412,19 @@ bool TGXFileObj::DoRead( double *AVals, int &AFDim )
    {// relative change in last dimension
       if( B == 255 ) return false;
       AFDim = FCurrentDim;
+      LastReadWasRestart = false;
       if( FCurrentDim > 0 ) LastElem[FCurrentDim - 1] += B - DeltaForRead;
    }
    else
    {
       AFDim = B;
-      assert( AFDim >= 1 && AFDim <= GLOBAL_MAX_INDEX_DIM );
+      // (polars-gdx extension) a mid-record sync scan can read a value byte
+      // as a changed-dimension code; 0 is never a valid code (codes start
+      // at 1), so treat it as end-of-data. The range coordinator validates
+      // record counts and falls back to a serial read on any mismatch.
+      if( AFDim < 1 ) return false;
+      assert( AFDim <= GLOBAL_MAX_INDEX_DIM );
+      LastReadWasRestart = AFDim == 1;
       for( int D { AFDim - 1 }; D < FCurrentDim; D++ )
       {
          assert( D >= 0 && D < GLOBAL_MAX_INDEX_DIM );
@@ -3705,6 +3713,209 @@ int TGXFileObj::gdxDataReadRawFastEx( int SyNr, TDataStoreExProc_t DP, int &NrRe
    }
    gdxDataReadDone();
    return NrRecs >= 0;
+}
+
+// (polars-gdx extension)
+// Prepare a raw-mode read of symbol SyNr, optionally resuming at the
+// physical file position StartPos (0 = start of the symbol data). The
+// per-symbol header (marker, dim, MinElem/MaxElem/ElemType) is always
+// consumed first because the key decoder needs it; with StartPos > 0 the
+// stream is then repositioned, so the caller must guarantee that the
+// record at StartPos decodes without prior state, i.e. it is a restart
+// point (first-changed dimension 0). Valid only for uncompressed symbol
+// data: for compressed data the logical and physical byte positions
+// diverge (block compression), so checkpointed resume is not offered.
+bool TGXFileObj::PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t StartPos,
+                                      int64_t /*StartRec*/, int &NrRecs )
+{
+   if( in( fmode, fr_str_data, fr_map_data, fr_mapr_data, fr_raw_data ) )
+      gdxDataReadDone();
+   NrMappedAdded = 0;
+   ErrorList = nullptr;
+   CurSyPtr = nullptr;
+   SortList = nullptr;
+   if( !MajorCheckMode( Caller, fr_init ) )
+   {
+      fmode = fr_init;
+      return false;
+   }
+   if( SyNr == 0 || CurSyPtr && false )
+      return false;
+   ReadUniverse = !SyNr;
+   if( ReadUniverse )
+      return false;
+   if( ErrorCondition( SyNr >= 1 && SyNr <= NameList->size(), ERR_BADSYMBOLINDEX ) ) return false;
+   CurSyPtr = *NameList->GetObject( SyNr );
+   if( CurSyPtr->SDataType == dt_alias )
+   {
+      do {
+         SyNr = CurSyPtr->SUserInfo;
+         if( !SyNr )
+            return false;
+         CurSyPtr = *NameList->GetObject( SyNr );
+      } while( CurSyPtr->SDataType == dt_alias );
+      assert( CurSyPtr->SDataType == dt_set && "Bad aliased set-1" );
+   }
+   if( CurSyPtr->SIsCompressed )
+      return false;// checkpointed resume unsupported for compressed data
+   FCurrentDim = CurSyPtr->SDim;
+   FFile->SetCompression( false );
+   DataSize = DataTypSize[CurSyPtr->SDataType];
+   if( DataSize > 0 ) LastDataField = static_cast<tvarvaltype>( DataSize - 1 );
+   NrRecs = CurSyPtr->SDataCount;
+   DeltaForRead = VersionRead <= 6 ? MaxDimV148 : FCurrentDim;
+   FFile->SetPosition( CurSyPtr->SPosition );
+   if( ErrorCondition( FFile->ReadString() == MARK_DATA, ERR_BADDATAMARKER_DATA ) ||
+        ErrorCondition( FFile->ReadByte() == FCurrentDim, ERR_BADDATAMARKER_DIM ) ) return false;
+   FFile->ReadInteger();//skip record counter
+   if( !FCurrentDim && !NrRecs )
+   {
+      CurSyPtr->SScalarFrst = true;
+      fmode = fr_raw_data;
+      return true;
+   }
+   CurSyPtr->SScalarFrst = false;
+   for( int D {}; D < FCurrentDim; D++ )
+   {
+      MinElem[D] = FFile->ReadInteger();
+      MaxElem[D] = FFile->ReadInteger();
+      ElemType[D] = GetIntegerSize( static_cast<int64_t>(MaxElem[D]) - MinElem[D] + 1 );
+   }
+   std::fill_n( LastElem.begin(), FCurrentDim, INDEX_INITIAL );
+   std::fill_n( PrevElem.begin(), FCurrentDim, -1 );
+   LastReadWasRestart = false;
+   if( StartPos > 0 )
+      FFile->SetPosition( StartPos );
+   fmode = fr_raw_data;
+   return true;
+}
+
+// (polars-gdx extension)
+// Checkpointed positional range read (uncompressed data only).
+//
+// StartPos = 0: read from the start of the symbol data.
+// StartPos > 0: an exact restart-record start position collected by
+// gdxCollectRestartPositions (a record with first-changed dimension 1
+// stored with absolute keys, needing no delta state). The stream is
+// positioned there directly; no resynchronisation scan is needed or
+// performed. The coordinator validates the result (total record count)
+// and falls back to a serial read when anything is off.
+//
+// Delivery: every record from StartPos (or the symbol start) until
+// (exclusive) the first restart record that starts at or past EndPos, or
+// end of data. Restart records at or past EndPos are not delivered; their
+// start position is reported in *NextPos (0 at end of data) so the next
+// range can resume exactly there. Records between EndPos and that next
+// restart belong to the still-open dim-0 group and ARE delivered here,
+// because they cannot be decoded without the previous record's state.
+int TGXFileObj::gdxDataReadRawRange( int SyNr, int64_t StartPos, int64_t EndPos,
+                                     TDataStoreExProc_t DP, int &NrRecs, void *Uptr, int64_t *NextPos )
+{
+   *NextPos = 0;
+   int NrAvail {};
+   if( !PrepareSymbolReadAt( "gdxDataReadRawRange"s, SyNr, StartPos, 0, NrAvail ) )
+   {
+      NrRecs = -1;
+      return false;
+   }
+   NrRecs = NrAvail;
+   if( CurSyPtr->SScalarFrst )
+   {
+      std::array<double, valscale + 1> AVals {};
+      int AFDim {};
+      if( StartPos == 0 && EndPos > 0 && DoRead( AVals.data(), AFDim ) )
+         DP( LastElem.data(), AVals.data(), AFDim, Uptr );
+      gdxDataReadDone();
+      return true;
+   }
+   std::array<double, valscale + 1> AVals {};
+   int AFDim {};
+   // StartPos == 0 reads from the symbol start; StartPos > 0 is an exact
+   // restart-record position collected by gdxCollectRestartPositions, so
+   // decoding begins in-frame with full state and no resync is needed.
+   int64_t recStart { FFile->GetPosition() };// start of the next record
+   int64_t boundary { 0 };
+   bool stopped { false };
+   while( DoRead( AVals.data(), AFDim ) )
+   {
+      // recStart is where the just-decoded record began (captured before
+      // the DoRead consumed its bytes).
+      if( LastReadWasRestart && recStart >= EndPos )
+      {
+         boundary = recStart;// next range starts exactly here
+         break;
+      }
+      if( !DP( LastElem.data(), AVals.data(), AFDim, Uptr ) )
+      {
+         stopped = true;
+         break;
+      }
+      recStart = FFile->GetPosition();
+   }
+   *NextPos = stopped ? 0 : boundary;
+   gdxDataReadDone();
+   return true;
+}
+
+// (polars-gdx extension)
+// Byte span of a symbol's data section: [StartPos, EndPos). StartPos is
+// the symbol's data position as stored in the symbol table; EndPos is the
+// data position of the next symbol in the table, or the UEL section
+// position for the last symbol. Returns false for the universe (SyNr 0)
+// or a bad symbol number. Positions are physical (uncompressed).
+bool TGXFileObj::gdxSymbolDataSpan( int SyNr, int64_t &StartPos, int64_t &EndPos )
+{
+   if( SyNr < 1 || SyNr > NameList->size() ) return false;
+   StartPos = (*NameList->GetObject( SyNr ))->SPosition;
+   int64_t end { std::filesystem::file_size( FFile->GetFileName() ) };
+   for( int N { 1 }; N <= NameList->size(); N++ )
+   {
+      const auto *obj { *NameList->GetObject( N ) };
+      if( obj->SPosition > StartPos && obj->SPosition < end ) end = obj->SPosition;
+   }
+   EndPos = end;
+   return EndPos > StartPos;
+}
+
+// (polars-gdx extension)
+// One sequential decode pass over symbol SyNr's data, delivering the exact
+// physical start position of every restart record (first-changed dimension
+// 1: an absolute dim-0 key) to DP. Delivery format in Indx:
+//   Indx[0] = low  32 bits of the physical position (int32)
+//   Indx[1] = high 32 bits of the physical position (int32, always 0 for
+//             files < 2 GiB)
+//   Indx[2] = 0-based record number of the restart record
+// Vals is unused (nullptr). Positions are strictly increasing and the first
+// delivered position equals the symbol's data start. Uncompressed data only.
+bool TGXFileObj::gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, void *Uptr )
+{
+   int NrAvail {};
+   if( !PrepareSymbolReadAt( "gdxCollectRestartPositions"s, SyNr, 0, 0, NrAvail ) )
+      return false;
+   if( CurSyPtr->SScalarFrst )
+   {
+      gdxDataReadDone();
+      return false;// scalars have no restart structure
+   }
+   std::array<double, valscale + 1> AVals {};
+   int AFDim {};
+   int64_t recStart { FFile->GetPosition() };
+   int recNr { 0 };
+   while( DoRead( AVals.data(), AFDim ) )
+   {
+      if( LastReadWasRestart )
+      {
+         const auto pos { static_cast<uint64_t>( recStart ) };
+         std::array<int, 3> packed { static_cast<int>( pos & 0xFFFFFFFFULL ),
+                                     static_cast<int>( pos >> 32U ),
+                                     recNr };
+         if( !DP( packed.data(), nullptr, AFDim, Uptr ) ) break;
+      }
+      recNr++;
+      recStart = FFile->GetPosition();
+   }
+   gdxDataReadDone();
+   return true;
 }
 
 void TGXFileObj::gdxGetDomainElements_DP_FC( int RawIndex, int MappedIndex, void *Uptr )

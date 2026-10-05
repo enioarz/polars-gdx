@@ -264,12 +264,6 @@ impl Reader {
         };
         let mut data = match (threads.unwrap_or(0) > 1, n_rows) {
             (true, None) => {
-                // Parallel: one independent GdxFile per worker thread, each
-                // scanning a contiguous first-dimension UEL range; parts are
-                // concatenated in range order, preserving record order.
-                // A first-dimension filter additionally lets whole ranges be
-                // skipped: a worker whose range contains no allowed UEL
-                // returns empty without touching the file.
                 let builder = move || {
                     Box::new(make_pred()) as Box<dyn Fn(&[i32]) -> gdx::RecordAction + Send>
                 };
@@ -280,20 +274,40 @@ impl Reader {
                         a.last().copied().unwrap_or(0),
                     )
                 });
-                let range_skip = move |lo: i32, hi: i32| match span {
-                    None => false,
-                    Some((min, max)) => hi < min || lo > max,
-                };
-                gdx::GdxFile::read_symbol_raw_parallel(
-                    &self.path,
-                    info,
-                    vfield,
-                    &builder,
-                    None,
-                    threads.unwrap(),
-                    &range_skip,
-                )
-                .map_err(to_py_err)?
+                if let Some((min, max)) = span {
+                    // A first-dimension filter constrains records to a
+                    // contiguous key range, so split the work by dim-0 UEL
+                    // ranges: a worker whose range contains no allowed UEL
+                    // returns empty without touching the file.
+                    let range_skip = move |lo: i32, hi: i32| hi < min || lo > max;
+                    gdx::GdxFile::read_symbol_raw_parallel(
+                        &self.path,
+                        info,
+                        vfield,
+                        &builder,
+                        None,
+                        threads.unwrap(),
+                        &range_skip,
+                    )
+                    .map_err(to_py_err)?
+                } else {
+                    // No dim-0 filter: split by file position instead. A
+                    // cached restart-position index (one cheap sequential
+                    // pass, built once per file+symbol) provides exact
+                    // record boundaries, so each worker decodes only its
+                    // own byte range and non-leading-dimension filters no
+                    // longer pay the sequential-decode wall-time floor.
+                    // Falls back to a verified serial read when the
+                    // per-range record counts do not sum up exactly.
+                    gdx::read_symbol_raw_parallel_pos(
+                        &self.path,
+                        info,
+                        vfield,
+                        &builder,
+                        threads.unwrap(),
+                    )
+                    .map_err(to_py_err)?
+                }
             }
             _ => {
                 let pred_obj = make_pred();

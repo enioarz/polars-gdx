@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gdx_sys as ffi;
 
@@ -344,6 +344,108 @@ impl GdxFile {
         Ok(RawSymbolData { keys, values })
     }
 
+    /// (parallel extension) Checkpointed positional read on a
+    /// worker-private handle: reads records starting at the physical file
+    /// position `start_pos` (0 = start of the symbol's data) until the
+    /// stream position reaches `end_pos` (exclusive; `i64::MAX` = end of
+    /// data), delivering them through `pred`/`limit` as usual. Skips the
+    /// process-global GDX lock; the caller guarantees single-threaded use
+    /// of this handle. A nonzero `start_pos` must be a restart point (a
+    /// record boundary whose next record has first-changed dimension 0);
+    /// the coordinator guarantees this by construction.
+    ///
+    /// Returns the data read, the position just past the last record
+    /// consumed (0 at end of data) and the number of records the C layer
+    /// offered to the sink (pre-predicate; used by the coordinator to
+    /// validate the positional plan).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn read_symbol_raw_pos_unlocked(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: ActionPred<'_>,
+        limit: Option<usize>,
+        start_pos: i64,
+        end_pos: i64,
+    ) -> Result<(RawSymbolData, i64, usize)> {
+        let vidx = value_field.index();
+        let mut data = RawSymbolData::with_capacity(info.dim, 0);
+        let sink = RecordSink {
+            data: std::ptr::from_mut(&mut data),
+            special: std::ptr::from_ref(&self.special),
+            vidx,
+            dim: info.dim,
+            pred,
+            remaining: std::cell::Cell::new(limit),
+            seen: std::cell::Cell::new(0),
+        };
+        let mut cb_nrecs = 0;
+        let mut next_pos = 0i64;
+        let ok = unsafe {
+            ffi::c__gdxdatareadrawrange(
+                self.obj,
+                info.number as i32,
+                start_pos,
+                end_pos,
+                store_record_ex,
+                &mut cb_nrecs,
+                &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
+                &mut next_pos,
+            )
+        };
+        if ok == 0 {
+            return Err(unsafe { op_error(self.obj, "gdxDataReadRawRange") });
+        }
+        Ok((data, next_pos, sink.seen.get()))
+    }
+
+    /// (parallel extension) Physical byte span [start, end) of symbol
+    /// `info.number`'s data section. `end` is the smallest data position of
+    /// any other symbol, or the file size. Only meaningful for symbols
+    /// whose data is not block-compressed.
+    pub fn symbol_data_span(&self, info: &SymbolInfo) -> Result<(i64, i64)> {
+        let _guard = crate::lock::lock();
+        unsafe {
+            let (mut start, mut end) = (0i64, 0i64);
+            if ffi::c__gdxsymboldataspan(self.obj, info.number as i32, &mut start, &mut end) == 0 {
+                return Err(op_error(self.obj, "gdxSymbolDataSpan"));
+            }
+            Ok((start, end))
+        }
+    }
+    /// (parallel extension) Exact physical start positions of every
+    /// restart record (first-changed dimension 1) of symbol `info.number`,
+    /// in file order. One sequential decode pass; used to plan byte-range
+    /// splits so parallel workers start exactly on record boundaries.
+    pub fn collect_restart_positions(&self, info: &SymbolInfo) -> Result<Vec<i64>> {
+        extern "C" fn collect_dp(
+            indx: *const i32,
+            _vals: *const f64,
+            _afdim: i32,
+            uptr: *mut std::ffi::c_void,
+        ) -> i32 {
+            let out = unsafe { &mut *(uptr as *mut Vec<i64>) };
+            let packed = unsafe { std::slice::from_raw_parts(indx, 3) };
+            let lo = packed[0] as u32 as u64;
+            let hi = packed[1] as u32 as u64;
+            out.push(((hi << 32) | lo) as i64);
+            1
+        }
+        let _guard = crate::lock::lock();
+        let mut out = Vec::new();
+        unsafe {
+            if ffi::c__gdxcollectrestartpositions(
+                self.obj,
+                info.number as i32,
+                collect_dp,
+                &mut out as *mut Vec<i64> as *mut std::ffi::c_void,
+            ) == 0
+            {
+                return Err(op_error(self.obj, "gdxCollectRestartPositions"));
+            }
+        }
+        Ok(out)
+    }
     /// Number of UELs and highest mapped UEL for the open file.
     pub fn uel_counts(&self) -> Result<(i32, i32)> {
         let _guard = crate::lock::lock();
@@ -425,6 +527,7 @@ impl GdxFile {
             dim: info.dim,
             pred: Some(&combined),
             remaining: std::cell::Cell::new(limit),
+            seen: std::cell::Cell::new(0),
         };
         let mut cb_nrecs = 0;
         let ok = ffi::c__gdxdatareadrawfastex(
@@ -494,6 +597,7 @@ impl GdxFile {
                 dim: info.dim,
                 pred: Some(f),
                 remaining: std::cell::Cell::new(limit),
+                seen: std::cell::Cell::new(0),
             };
             let mut cb_nrecs = 0;
             let ok = ffi::c__gdxdatareadrawfastex(
@@ -517,6 +621,7 @@ impl GdxFile {
                 dim: info.dim,
                 pred: None,
                 remaining: std::cell::Cell::new(Some(limit)),
+                seen: std::cell::Cell::new(0),
             };
             let mut cb_nrecs = 0;
             let ok = ffi::c__gdxdatareadrawfastex(
@@ -541,6 +646,7 @@ impl GdxFile {
             dim: info.dim,
             pred: None,
             remaining: std::cell::Cell::new(None),
+            seen: std::cell::Cell::new(0),
         };
         let mut cb_nrecs = 0;
         let ok = ffi::c__gdxdatareadrawfastex(
@@ -696,6 +802,161 @@ impl Drop for GdxFile {
     }
 }
 
+/// Process-wide cache of restart-position indexes, keyed by
+/// (file path, symbol number). Building an index costs one sequential
+/// decode pass over the symbol; caching makes repeated parallel reads of
+/// the same symbol (e.g. exploratory filters) pay that cost once.
+/// Entries are never invalidated in-process; files are treated as
+/// immutable, matching the plugin's read-only use.
+type RestartCacheKey = (PathBuf, usize);
+type RestartCache = Mutex<HashMap<RestartCacheKey, Arc<Vec<i64>>>>;
+
+fn restart_cache() -> &'static RestartCache {
+    static CACHE: OnceLock<RestartCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_restart_positions(path: &Path, info: &SymbolInfo) -> Result<Arc<Vec<i64>>> {
+    let key = (path.to_path_buf(), info.number);
+    if let Some(v) = restart_cache().lock().unwrap().get(&key) {
+        return Ok(Arc::clone(v));
+    }
+    let probe = GdxFile::open(path)?;
+    let positions = Arc::new(probe.collect_restart_positions(info)?);
+    restart_cache()
+        .lock()
+        .unwrap()
+        .insert(key, Arc::clone(&positions));
+    Ok(positions)
+}
+
+/// Positional parallel read of a symbol across `threads` independent file
+/// handles (uncompressed data only).
+///
+/// Unlike [`GdxFile::read_symbol_raw_parallel`], which splits by
+/// first-dimension UEL ranges (so the last worker still decodes the whole
+/// stream up to its range), this splits by *file position*: a cached
+/// restart-position index (one cheap sequential pass, built once per
+/// file+symbol) provides exact record boundaries, and each worker decodes
+/// only its own byte range starting in-frame. This removes the serial
+/// wall-time floor for filters on non-leading dimensions, where every
+/// record must be decoded.
+///
+/// Correctness contract: the sum of delivered records must equal
+/// `info.records` exactly; on any mismatch the function falls back to a
+/// serial read. Adjacent ranges meet exactly at restart-record boundaries
+/// (each range reports the boundary; the next range starts there), so
+/// every record is delivered by exactly one worker.
+#[allow(clippy::type_complexity)]
+pub fn read_symbol_raw_parallel_pos(
+    path: impl AsRef<Path>,
+    info: &SymbolInfo,
+    value_field: ValueField,
+    pred_builder: &(dyn Fn() -> Box<dyn Fn(&[i32]) -> RecordAction + Send> + Sync),
+    threads: usize,
+) -> Result<RawSymbolData> {
+    let path = path.as_ref().to_path_buf();
+    // Probe: symbol data byte span [data_start, data_end).
+    let (data_start, data_end) = {
+        let probe = GdxFile::open(&path)?;
+        probe.symbol_data_span(info)?
+    };
+    let span = data_end - data_start;
+    if span <= 0 || threads <= 1 || info.records < 1 {
+        let file = GdxFile::open(&path)?;
+        let pred = pred_builder();
+        let pred_ref: ActionPred<'_> = Some(&*pred);
+        return file.read_symbol_raw(info, value_field, pred_ref, None);
+    }
+    let threads = threads.min(info.records);
+    // Plan contiguous byte ranges over the data span; workers sync to the
+    // first restart record at/after their planned start, so actual work is
+    // roughly balanced for many-group symbols.
+    // Exact plan: one cheap sequential decode pass collects the physical
+    // position of every restart record (a record whose decode needs no
+    // delta state from the previous one). Ranges are split at those
+    // positions — plus the data span itself, which bounds the tail — so
+    // every worker starts in-frame and no misframed resync can occur.
+    let restarts = cached_restart_positions(&path, info)?;
+    if restarts.is_empty() {
+        let file = GdxFile::open(&path)?;
+        let pred = pred_builder();
+        let pred_ref: ActionPred<'_> = Some(&*pred);
+        return file.read_symbol_raw(info, value_field, pred_ref, None);
+    }
+    // Choose up to `threads` split points evenly over the restart index,
+    // weighting by byte position so work is balanced by decode volume.
+    let per = span / threads as i64;
+    let mut starts: Vec<i64> = Vec::with_capacity(threads);
+    starts.push(0);
+    let mut target = per;
+    let mut it = restarts.iter().skip(1).peekable();
+    while starts.len() < threads {
+        // advance the restart cursor to the position nearest `target`
+        while let Some(&&pos) = it.peek() {
+            if pos < target {
+                it.next();
+            } else {
+                break;
+            }
+        }
+        let Some(&&pos) = it.peek() else { break };
+        starts.push(pos);
+        target += per;
+        it.next();
+    }
+    let ends: Vec<i64> = starts.iter().skip(1).copied().chain([data_end]).collect();
+    type PartResult = Result<(RawSymbolData, i64, usize)>;
+    let results: std::sync::Mutex<Vec<(usize, PartResult)>> = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for (t, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
+            let results = &results;
+            let path = path.clone();
+            scope.spawn(move || {
+                let res = GdxFile::open(&path).and_then(|file| {
+                    let pred = pred_builder();
+                    let pred_ref: ActionPred<'_> = Some(&*pred);
+                    file.read_symbol_raw_pos_unlocked(info, value_field, pred_ref, None, start, end)
+                });
+                if let Ok(mut guard) = results.lock() {
+                    guard.push((t, res));
+                }
+            });
+        }
+    });
+    let mut parts = results.into_inner().unwrap();
+    parts.sort_by_key(|(t, _)| *t);
+    let mut total = 0usize;
+    let mut all_ok = true;
+    for (_, res) in &parts {
+        match res {
+            Ok((_, _, seen)) => total += seen,
+            Err(_) => {
+                all_ok = false;
+                break;
+            }
+        }
+    }
+    if !all_ok || total != info.records {
+        // Positional checkpointing missed or duplicated records: fall back
+        // to a verified serial read rather than return wrong data.
+        let file = GdxFile::open(&path)?;
+        let pred = pred_builder();
+        let pred_ref: ActionPred<'_> = Some(&*pred);
+        return file.read_symbol_raw(info, value_field, pred_ref, None);
+    }
+    let mut keys: Vec<Vec<u32>> = vec![Vec::new(); info.dim];
+    let mut values: Vec<f64> = Vec::new();
+    for (_, res) in parts {
+        let (part, _, _) = res?;
+        for (k, pk) in keys.iter_mut().zip(part.keys.iter()) {
+            k.extend_from_slice(pk);
+        }
+        values.extend_from_slice(&part.values);
+    }
+    Ok(RawSymbolData { keys, values })
+}
+
 /// Split `n` items into `t` contiguous, roughly equal ranges (1-based,
 /// inclusive; empty ranges omitted).
 fn split_ranges(n: usize, t: usize) -> Vec<(i32, i32)> {
@@ -813,6 +1074,7 @@ struct RecordSink<'a> {
     dim: usize,
     pred: ActionPred<'a>,
     remaining: std::cell::Cell<Option<usize>>,
+    seen: std::cell::Cell<usize>,
 }
 
 impl Clone for RecordSink<'_> {
@@ -824,6 +1086,7 @@ impl Clone for RecordSink<'_> {
             dim: self.dim,
             pred: self.pred,
             remaining: std::cell::Cell::new(self.remaining.get()),
+            seen: std::cell::Cell::new(self.seen.get()),
         }
     }
 }
@@ -844,6 +1107,7 @@ extern "C" fn store_record_ex(
     uptr: *mut std::ffi::c_void,
 ) -> i32 {
     let sink = unsafe { &*(uptr as *const RecordSink<'_>) };
+    sink.seen.set(sink.seen.get() + 1);
     unsafe {
         let keys = std::slice::from_raw_parts(indx, sink.dim);
         if let Some(pred) = sink.pred {
