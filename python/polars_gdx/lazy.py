@@ -157,9 +157,11 @@ def scan_gdx(
         predicate pushdown Polars performs on the produced frame.
     threads
         Number of worker threads for the raw read. When > 1 and no row
-        limit applies, the file is opened once per worker and each scans a
-        contiguous range of the first key dimension, so record order matches
-        the serial read exactly. ``"auto"`` (recommended for large symbols)
+        limit applies, the read is split across that many independent file
+        handles: first-dimension filters seek straight into the matching
+        byte range (via a cached restart index), other reads split by file
+        position. Record order always matches the serial read exactly.
+        ``"auto"`` (recommended for large symbols)
         parallelises reads of symbols with at least
         ``_AUTO_THREADS_MIN_RECORDS`` records using all available cores;
         smaller symbols stay serial. ``None``/0/1 means serial.
