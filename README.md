@@ -4,7 +4,7 @@ Lazy, prefiltered Polars access to [GAMS GDX](https://github.com/GAMS-dev/gdx) f
 
 - `scan_gdx(path, symbol=...)` returns a `pl.LazyFrame`; nothing is read until `collect()`, and column projection is pushed down via Polars' IO-source interface. `read_gdx(...)` is the eager convenience wrapper (`scan_gdx(...).collect()`, same arguments).
 - Predicates on key columns (`key_filter={dim_index: allowed_labels}`, `filter(pl.col(key) == label)` or `filter(pl.col(key).is_in(labels))`) are folded into a **native, index-based prefilter inside the Rust read loop**, so unwanted records are never materialized — unlike the official `gamsapi` reader, which must load everything into pandas first. The prefilter runs inside a bulk C callback (`gdxDataReadRawFastEx`): one FFI crossing for the whole symbol, with early termination for `head(n)`.
-- `threads=n` (on `scan_gdx`/`read_gdx`) parallelises the raw read across n independent file handles: each worker scans a contiguous range of the first key dimension, results are concatenated in range order so record order matches the serial read exactly, and a first-dimension filter lets whole non-matching ranges be skipped without touching the file. Parallel scanning requires rebuilding the vendored GDX C library with its internal mutexes enabled (the default in this repo).
+- `threads=` (on `scan_gdx`/`read_gdx`) parallelises the raw read across independent file handles: each worker scans a contiguous range of the first key dimension, results are concatenated in range order so record order matches the serial read exactly, and a first-dimension filter lets whole non-matching ranges be skipped without touching the file. `threads="auto"` (recommended) uses all cores for symbols of 5M+ records and stays serial for smaller ones. Note: GDX record data is stored sequentially and delta-encoded, so a filter on a *non-leading* dimension must still decode every record (~40M records/s/core); parallelism then reduces total CPU per worker range but the wall-time floor for the last range remains — combine such filters with a first-dimension constraint (`is_in`/`==` on dim 0) whenever the query allows it, which enables early-stop and range-skip.
 - `read_domains(path, symbol=...)` lists the unique labels actually used per index dimension in a single bulk C scan (`gdxGetDomainElements`) — the cost of `unique()` over a key column without reading or materialising any records, valuable on very large symbols.
 - Under the hood: hand-written FFI to the vendored MIT-licensed GDX C library, extracted from [lolow/gdxcomp](https://github.com/lolow/gdxcomp), building on [GAMS-dev/gdx](https://github.com/GAMS-dev/gdx).
 
@@ -25,6 +25,9 @@ x.filter(pl.col("dim_0") == "seattle").collect()
 # eager convenience: read_gdx = scan_gdx(...).collect()
 from polars_gdx import read_gdx
 df = read_gdx("trnsport.gdx", symbol="x", key_filter={0: ["seattle"]})
+
+# large symbols: parallel raw read across all cores
+big = scan_gdx("huge.gdx", symbol="x", threads="auto")
 
 # unique labels per index dimension without reading the records:
 from polars_gdx import read_domains

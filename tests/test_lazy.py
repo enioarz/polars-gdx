@@ -260,3 +260,31 @@ def test_is_in_absent_label_yields_no_rows():
 def test_is_in_partial_match():
     df = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0").is_in(["seattle", "nowhere"])).collect()
     assert set(df["dim_0"]) == {"seattle"}
+
+
+def test_threads_auto_serial_for_small_symbols():
+    # trnsport symbols are far below the auto threshold: same result as serial.
+    serial = read_gdx(GDX, symbol="x")
+    auto = read_gdx(GDX, symbol="x", threads="auto")
+    assert serial.equals(auto)
+
+
+def test_threads_auto_resolves_to_cpu_count_for_large_symbols(monkeypatch):
+    import polars_gdx.lazy as lazy
+
+    class FakeInfo:
+        pass
+
+    # large symbol: resolves to (mocked) cpu count
+    monkeypatch.setattr(lazy, "_AUTO_THREADS_MIN_RECORDS", 1_000_000)
+    import os
+
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - non-Linux
+        cpus = os.cpu_count()
+    assert lazy._resolve_threads("auto", 2_000_000) == cpus
+    assert lazy._resolve_threads("auto", 500_000) is None
+    assert lazy._resolve_threads(4, 2_000_000) == 4
+    assert lazy._resolve_threads(None, 2_000_000) is None
+    assert lazy._resolve_threads(0, 2_000_000) is None
