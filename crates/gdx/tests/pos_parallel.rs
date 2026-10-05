@@ -48,3 +48,27 @@ fn pos_parallel_repeats_are_deterministic() {
         assert_eq!(a.keys[d], b.keys[d]);
     }
 }
+
+const COMPRESSED_FIXTURE: &str = "/tmp/big_compressed.gdx";
+
+/// Block-compressed symbols cannot use positional checkpointing (logical and
+/// physical positions diverge); the coordinator must silently fall back to
+/// a serial read instead of erroring (gdxCollectRestartPositions returns
+/// failure without an error code for them).
+#[test]
+fn pos_parallel_falls_back_for_compressed_data() {
+    if !std::path::Path::new(COMPRESSED_FIXTURE).exists() {
+        eprintln!("skipping: {COMPRESSED_FIXTURE} not found (generate with COMPRESS=1 OUT={COMPRESSED_FIXTURE} cargo run --release -p gdx --example gen_fixture)");
+        return;
+    }
+    let file = GdxFile::open(COMPRESSED_FIXTURE).unwrap();
+    let info = file.symbol("big").expect("symbol big");
+    let vf = ValueField::Level;
+    let serial = file.read_symbol_raw(info, vf, None, None).unwrap();
+    let builder = || accept_all_builder();
+    let par = read_symbol_raw_parallel_pos(COMPRESSED_FIXTURE, info, vf, &builder, 8).unwrap();
+    assert_eq!(par.values.len(), serial.values.len());
+    for d in 0..info.dim {
+        assert_eq!(par.keys[d], serial.keys[d]);
+    }
+}

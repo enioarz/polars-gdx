@@ -877,7 +877,19 @@ pub fn read_symbol_raw_parallel_pos(
     // delta state from the previous one). Ranges are split at those
     // positions — plus the data span itself, which bounds the tail — so
     // every worker starts in-frame and no misframed resync can occur.
-    let restarts = cached_restart_positions(&path, info)?;
+    // Planning can legitimately fail for symbols the positional path does
+    // not support (scalars, block-compressed data): the C layer reports
+    // those as a failed gdxCollectRestartPositions without an error code.
+    // Such symbols read fine serially, so fall back instead of erroring.
+    let restarts = match cached_restart_positions(&path, info) {
+        Ok(r) => r,
+        Err(_) => {
+            let file = GdxFile::open(&path)?;
+            let pred = pred_builder();
+            let pred_ref: ActionPred<'_> = Some(&*pred);
+            return file.read_symbol_raw(info, value_field, pred_ref, None);
+        }
+    };
     if restarts.is_empty() {
         let file = GdxFile::open(&path)?;
         let pred = pred_builder();
