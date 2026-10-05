@@ -39,6 +39,8 @@ unsafe impl Sync for SendGdxFile {}
 #[pyclass]
 struct Reader {
     file: Option<SendGdxFile>,
+    /// Original path; parallel reads open independent handles from it.
+    path: String,
     /// Cached dictionary values (the UEL table) and its Arrow form, built once per file.
     uel_strings: Mutex<Option<Arc<[String]>>>,
     uel_array: Mutex<Option<Arc<StringArray>>>,
@@ -54,6 +56,7 @@ impl Reader {
         let file = GdxFile::open(path).map_err(to_py_err)?;
         Ok(Self {
             file: Some(SendGdxFile(file)),
+            path: path.to_string(),
             uel_strings: Mutex::new(None),
             uel_array: Mutex::new(None),
         })
@@ -170,7 +173,13 @@ impl Reader {
     ///
     /// - `n_rows`: optional row limit; the native read stops early once that
     ///   many (post-prefilter) records have been stored.
-    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None))]
+    /// - `threads`: when > 1 and no row limit is set, the symbol is read by
+    ///   that many independent file handles in parallel, each scanning a
+    ///   contiguous range of the first-dimension UEL space. Results are
+    ///   concatenated in range order, so record order matches the serial
+    ///   read exactly. None/0/1 means serial.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None))]
     fn read_arrow(
         &self,
         name: &str,
@@ -178,6 +187,7 @@ impl Reader {
         value_field: Option<String>,
         key_filter: Option<Vec<(usize, Vec<String>)>>,
         n_rows: Option<usize>,
+        threads: Option<usize>,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let Some(file) = self.file.as_ref() else {
@@ -228,10 +238,11 @@ impl Reader {
             .find(|(d, _)| *d == 0)
             .and_then(|(_, allowed)| allowed.last().copied())
             .unwrap_or(0);
-        let pred: gdx::ActionPred<'_> = if bitmaps.is_empty() {
-            None
-        } else {
-            Some(&move |idx_slice: &[i32]| -> gdx::RecordAction {
+        let n_filters = bitmaps.len();
+        let bitmaps = std::sync::Arc::new(bitmaps);
+        let make_pred = move || {
+            let bitmaps = std::sync::Arc::clone(&bitmaps);
+            move |idx_slice: &[i32]| -> gdx::RecordAction {
                 for &(d, ref bm) in bitmaps.iter() {
                     let k = idx_slice[d];
                     if k <= 0 {
@@ -249,12 +260,53 @@ impl Reader {
                     }
                 }
                 gdx::RecordAction::Accept
-            })
+            }
         };
-        let mut data = file
-            .0
-            .read_symbol_raw(info, vfield, pred, n_rows)
-            .map_err(to_py_err)?;
+        let mut data = match (threads.unwrap_or(0) > 1, n_rows) {
+            (true, None) => {
+                // Parallel: one independent GdxFile per worker thread, each
+                // scanning a contiguous first-dimension UEL range; parts are
+                // concatenated in range order, preserving record order.
+                // A first-dimension filter additionally lets whole ranges be
+                // skipped: a worker whose range contains no allowed UEL
+                // returns empty without touching the file.
+                let builder = move || {
+                    Box::new(make_pred()) as Box<dyn Fn(&[i32]) -> gdx::RecordAction + Send>
+                };
+                // Dim-0 filter span: [min, max] of allowed UEL numbers.
+                let span = index_filters.iter().find(|(d, _)| *d == 0).map(|(_, a)| {
+                    (
+                        a.first().copied().unwrap_or(0),
+                        a.last().copied().unwrap_or(0),
+                    )
+                });
+                let range_skip = move |lo: i32, hi: i32| match span {
+                    None => false,
+                    Some((min, max)) => hi < min || lo > max,
+                };
+                gdx::GdxFile::read_symbol_raw_parallel(
+                    &self.path,
+                    info,
+                    vfield,
+                    &builder,
+                    None,
+                    threads.unwrap(),
+                    &range_skip,
+                )
+                .map_err(to_py_err)?
+            }
+            _ => {
+                let pred_obj = make_pred();
+                let pred: gdx::ActionPred<'_> = if n_filters == 0 {
+                    None
+                } else {
+                    Some(&pred_obj)
+                };
+                file.0
+                    .read_symbol_raw(info, vfield, pred, n_rows)
+                    .map_err(to_py_err)?
+            }
+        };
         let batch = to_record_batch(self, info, &mut data, key_names, vfield)?;
         Ok(batch.into_pyarrow(py)?.into_any())
     }

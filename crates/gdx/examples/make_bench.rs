@@ -50,16 +50,12 @@ fn main() {
     )
     .unwrap();
 
+    let par_only = std::env::args().any(|a| a == "par-only");
     let mut par: Vec<Record> = Vec::with_capacity(d1 * d2);
-    let mut var: Vec<Record> = Vec::with_capacity(d1 * d2);
     for (a, i) in i_keys.iter().enumerate() {
         for (b, j) in j_keys.iter().enumerate() {
             let v = (a as f64) * 0.5 + (b as f64) * 0.25;
             par.push(rec(&[i, j], v));
-            var.push(Record {
-                keys: par.last().unwrap().keys.clone(),
-                values: [v, v * 0.1, 0.0, 1e5, 1.0],
-            });
         }
     }
     w.write_symbol(
@@ -71,8 +67,17 @@ fn main() {
         &par,
     )
     .unwrap();
-    w.write_symbol("bigvar", "large variable", 2, SymbolType::Variable, 0, &var)
-        .unwrap();
+    if !par_only {
+        let var: Vec<Record> = par
+            .iter()
+            .map(|r| Record {
+                keys: r.keys.clone(),
+                values: [r.values[0], r.values[0] * 0.1, 0.0, 1e5, 1.0],
+            })
+            .collect();
+        w.write_symbol("bigvar", "large variable", 2, SymbolType::Variable, 0, &var)
+            .unwrap();
+    }
     w.finish().unwrap();
     println!("wrote {out}");
 }

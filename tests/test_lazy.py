@@ -47,9 +47,11 @@ def test_predicate_uses_native_prefilter(monkeypatch):
     calls = []
     orig = lazy.Reader.read_arrow
 
-    def spy(self, name, key_names=None, value_field=None, key_filter=None, n_rows=None):
+    def spy(
+        self, name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None
+    ):
         calls.append(key_filter)
-        return orig(self, name, key_names, value_field, key_filter, n_rows)
+        return orig(self, name, key_names, value_field, key_filter, n_rows, threads)
 
     monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
     lf = lazy.scan_gdx(GDX, symbol="x")
@@ -71,9 +73,11 @@ def test_predicate_conjunction_prefilter(monkeypatch):
     calls = []
     orig = lazy.Reader.read_arrow
 
-    def spy(self, name, key_names=None, value_field=None, key_filter=None, n_rows=None):
+    def spy(
+        self, name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None
+    ):
         calls.append(key_filter)
-        return orig(self, name, key_names, value_field, key_filter, n_rows)
+        return orig(self, name, key_names, value_field, key_filter, n_rows, threads)
 
     monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
     lf = lazy.scan_gdx(GDX, symbol="x")
@@ -185,3 +189,74 @@ def test_filter_multi_dim_conjunction_bitmap():
 def test_key_filter_multiple_labels_dim0():
     df = read_gdx(GDX, symbol="x", key_filter={0: ["seattle", "san-diego"]})
     assert set(df["dim_0"]) == {"seattle", "san-diego"}
+
+
+def test_parallel_read_parity():
+    # threads>1 partitions dim-0 UEL space across workers; concatenated in
+    # range order the result must equal the serial read exactly.
+    serial = read_gdx(GDX, symbol="x")
+    parallel = read_gdx(GDX, symbol="x", threads=4)
+    assert serial.equals(parallel)
+
+
+def test_parallel_read_all_symbols_parity():
+    for sym in ("x", "d", "i", "j", "a", "b", "cost", "supply", "demand"):
+        serial = read_gdx(GDX, symbol=sym)
+        parallel = read_gdx(GDX, symbol=sym, threads=3)
+        assert serial.equals(parallel), sym
+
+
+def test_parallel_filtered_read_parity():
+    serial = read_gdx(GDX, symbol="x", key_filter={0: ["seattle", "san-diego"]})
+    parallel = read_gdx(
+        GDX, symbol="x", key_filter={0: ["seattle", "san-diego"]}, threads=4
+    )
+    assert serial.equals(parallel)
+    assert set(parallel["dim_0"]) == {"seattle", "san-diego"}
+
+
+def test_parallel_single_thread_falls_back_to_serial():
+    assert read_gdx(GDX, symbol="x", threads=1).equals(read_gdx(GDX, symbol="x"))
+
+
+def test_is_in_uses_native_prefilter(monkeypatch):
+    """pl.col(key).is_in([...]) must fold into the native GDX prefilter."""
+    import polars_gdx.lazy as lazy
+
+    calls = []
+    orig = lazy.Reader.read_arrow
+
+    def spy(
+        self, name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None
+    ):
+        calls.append(key_filter)
+        return orig(self, name, key_names, value_field, key_filter, n_rows, threads)
+
+    monkeypatch.setattr(lazy.Reader, "read_arrow", spy)
+    lf = lazy.scan_gdx(GDX, symbol="x")
+    df = lf.filter(pl.col("dim_0").is_in(["seattle", "san-diego"])).collect()
+    assert set(df["dim_0"]) == {"seattle", "san-diego"}
+    assert calls and calls[-1] is not None
+    merged = dict(calls[-1])
+    assert set(merged[0]) == {"seattle", "san-diego"}
+
+
+def test_is_in_and_eq_conjunction_prefilter():
+    df = (
+        scan_gdx(GDX, symbol="x")
+        .filter(pl.col("dim_0").is_in(["seattle", "san-diego"]) & (pl.col("dim_1") == "topeka"))
+        .collect()
+    )
+    assert df.height == 2
+    assert set(df["dim_0"]) == {"seattle", "san-diego"}
+    assert set(df["dim_1"]) == {"topeka"}
+
+
+def test_is_in_absent_label_yields_no_rows():
+    df = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0").is_in(["nowhere"])).collect()
+    assert df.height == 0
+
+
+def test_is_in_partial_match():
+    df = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0").is_in(["seattle", "nowhere"])).collect()
+    assert set(df["dim_0"]) == {"seattle"}
