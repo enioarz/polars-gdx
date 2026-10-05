@@ -7,5 +7,5 @@ from polars_gdx.lazy import (  # noqa: F401
     list_symbols,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 __all__ = ["Reader", "scan_gdx", "read_gdx", "read_domains", "list_symbols"]
