@@ -94,6 +94,10 @@ int gdxDataReadMapStart( TGXFileRec_t *pgdx, int SyNr, int *NrRecs );
 int gdxDataReadRaw( TGXFileRec_t *pgdx, int *KeyInt, double *Values, int *DimFrst );
 int gdxDataReadRawFast( TGXFileRec_t *pgdx, int SyNr, TDataStoreProc_t DP, int *NrRecs );
 int gdxDataReadRawFastEx( TGXFileRec_t *pgdx, int SyNr, TDataStoreExProc_t DP, int *NrRecs, void *Uptr );
+/* (polars-gdx extension) checkpointed record-range raw read */
+int gdxDataReadRawRange( TGXFileRec_t *pgdx, int SyNr, INT64 StartPos, INT64 EndPos, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos );
+/* (polars-gdx extension) */
+int gdxSymbolDataSpan( TGXFileRec_t *pgdx, int SyNr, INT64 *StartPos, INT64 *EndPos );
 int gdxDataReadRawFastFilt( TGXFileRec_t *pgdx, int SyNr, const char **UelFilterStr, TDataStoreFiltProc_t DP );
 int gdxDataReadRawStart( TGXFileRec_t *pgdx, int SyNr, int *NrRecs );
 int gdxDataReadSlice( TGXFileRec_t *pgdx, const char **UelFilterStr, int *Dimen, TDataStoreProc_t DP );
@@ -325,6 +329,31 @@ GDX_INLINE int gdxDataReadRawFastEx( TGXFileRec_t *pgx, int SyNr, ::TDataStoreEx
 {
    return reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawFastEx(SyNr, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr );
 }
+/* (polars-gdx extension) */
+GDX_INLINE int gdxDataReadRawRange( TGXFileRec_t *pgx, int SyNr, INT64 StartPos, INT64 EndPos, ::TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos )
+{
+   int64_t np64 {};
+   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, StartPos, EndPos, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, &np64 ) };
+   *NextPos = np64;
+   return res;
+}
+/* (polars-gdx extension) */
+GDX_INLINE int gdxSymbolDataSpan( TGXFileRec_t *pgx, int SyNr, INT64 *StartPos, INT64 *EndPos )
+{
+   int64_t s64 {}, e64 {};
+   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxSymbolDataSpan(SyNr, s64, e64 ) };
+   *StartPos = s64;
+   *EndPos = e64;
+   return res;
+
+}
+/* (polars-gdx extension) */
+GDX_INLINE int gdxCollectRestartPositions( TGXFileRec_t *pgx, int SyNr, ::TDataStoreExProc_t DP, void *Uptr )
+{
+   return reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxCollectRestartPositions(SyNr, (gdx::TDataStoreExProc_t) DP, Uptr );
+
+}
+
 
 GDX_INLINE int gdxDataReadRawFastFilt( TGXFileRec_t *pgx, int SyNr, const char **UelFilterStr, ::TDataStoreFiltProc_t DP )
 {

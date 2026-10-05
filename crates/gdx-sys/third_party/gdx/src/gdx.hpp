@@ -889,6 +889,31 @@ public:
    int gdxDataReadRawFastEx( int SyNr, TDataStoreExProc_t DP, int &NrRecs, void *Uptr );
 
    /**
+    * @brief (polars-gdx extension) Checkpointed record-range read in Raw mode.
+    * @details Reads records [StartRec, EndRec) of symbol SyNr in raw mode.
+    * StartPos is the physical file position returned by a previous range
+    * read's NextPos (0 for the start of the symbol data). The record at
+    * StartRec must be a restart point (first-changed dimension 0) or the
+    * first record of the symbol. On return *NextPos holds the physical
+    * position just past the last record read (0 at end of data). Returns
+    * non-zero on success.
+    */
+   bool gdxSymbolDataSpan( int SyNr, int64_t &StartPos, int64_t &EndPos );
+
+   int gdxDataReadRawRange( int SyNr, int64_t StartPos, int64_t EndPos,
+                            TDataStoreExProc_t DP, int &NrRecs, void *Uptr, int64_t *NextPos );
+   /**
+    * @brief (polars-gdx extension) Collect the exact physical start positions
+    * of every restart record (first-changed dimension 1 / absolute dim-0 key)
+    * of symbol SyNr.
+    * @details One sequential decode pass with a null sink; positions are
+    * delivered to the caller-provided callback as (position, 0) pairs in the
+    * Indx argument. Used to plan exact byte-range splits for positional
+    * parallel reads, so workers never resync mid-record. Uncompressed data only.
+    */
+   bool gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, void *Uptr );
+
+   /**
     * @brief Read a symbol in Raw mode while applying a filter using a callback procedure. Returns zero if the
     *   operation is not possible.
     * @details Read a slice of data, by fixing zero or more index positions in the data. When a data element is
@@ -1792,6 +1817,10 @@ bool DoUncompress {},  // when reading
         CompressOut {};// when writing
 int DeltaForWrite {};  // delta for last dimension or first changed dimension
 int DeltaForRead {};   // first position indicating change
+// (polars-gdx extension) set by DoRead when the last decoded record was
+// stored with absolute keys from dimension 0 on (the else-branch of the
+// changed-dimension test, i.e. no inherited delta state): a restart record.
+bool LastReadWasRestart {};
 double Zvalacr {};     // tricky
 std::unique_ptr<TAcronymList> AcronymList;
 std::array<TSetBitMap *, GLOBAL_MAX_INDEX_DIM> WrBitMaps {};
@@ -1846,6 +1875,10 @@ void gdxGetDomainElements_DP_FC( int RawIndex, int MappedIndex, void *Uptr );
 int gdxDataReadRawFastFilt_DP_FC( const int *Indx, const double *Vals, void *Uptr );
 
 void mapDefaultRecordValues(double *AVals) const;
+
+// (polars-gdx extension) raw read state resuming at a byte-position checkpoint
+bool PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t StartPos, int64_t StartRec,
+                          int &NrRecs );
 
 public:
 bool gdxGetDomainElements_DP_CallByRef {},

@@ -171,6 +171,41 @@ extern "C" {
         nrecs: *mut c_int,
         uptr: *mut c_void,
     ) -> c_int;
+
+    /// (polars-gdx extension) Checkpointed positional raw read. Delivers
+    /// records of symbol `synr` to `dp`, starting at the physical file
+    /// position `start_pos` (0 = start of the symbol data) and stopping once
+    /// the stream position reaches `end_pos` (exclusive; `i64::MAX` = to
+    /// the end of the data). On return `*next_pos` holds the position just
+    /// past the last record consumed (0 at end of data).
+    pub fn c__gdxdatareadrawrange(
+        obj: *mut GdxObj,
+        synr: c_int,
+        start_pos: i64,
+        end_pos: i64,
+        dp: extern "C" fn(*const c_int, *const c_double, c_int, *mut c_void) -> c_int,
+        nrecs: *mut c_int,
+        uptr: *mut c_void,
+        next_pos: *mut i64,
+    ) -> c_int;
+    /// (polars-gdx extension) Byte span [start, end) of symbol `synr`'s
+    /// data section (physical, uncompressed). Returns 0 on failure.
+    pub fn c__gdxsymboldataspan(
+        obj: *mut GdxObj,
+        synr: c_int,
+        start_pos: *mut i64,
+        end_pos: *mut i64,
+    ) -> c_int;
+    /// (polars-gdx extension) Collect the exact physical start positions of
+    /// every restart record (first-changed dimension 1) of symbol `synr`.
+    /// `dp` receives `(lo32(pos), hi32(pos), rec_nr)` in its index argument;
+    /// the values argument is null. Returns 0 on failure.
+    pub fn c__gdxcollectrestartpositions(
+        obj: *mut GdxObj,
+        synr: c_int,
+        dp: extern "C" fn(*const c_int, *const c_double, c_int, *mut c_void) -> c_int,
+        uptr: *mut c_void,
+    ) -> c_int;
     /// List the unique elements actually used by one dimension of a symbol:
     /// calls `dp(rawindex, mappedindex, uptr)` once per unique element
     /// (in UEL order). `filternr` must be `DOMC_EXPAND` (-1, no filter).

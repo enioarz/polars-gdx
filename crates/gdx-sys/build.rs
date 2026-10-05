@@ -96,4 +96,16 @@ fn main() {
         "cargo:rerun-if-changed={}",
         src.join("generated/gdxcclib.cpp").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("src/gxfile.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("src/gdx.hpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("generated/gdxcwrap.h").display()
+    );
 }

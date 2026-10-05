@@ -86,6 +86,9 @@
 #define C__gdxDataReadRaw c__gdxdatareadraw
 #define C__gdxDataReadRawFast c__gdxdatareadrawfast
 #define C__gdxDataReadRawFastEx c__gdxdatareadrawfastex
+#define C__gdxDataReadRawRange c__gdxdatareadrawrange
+#define C__gdxSymbolDataSpan c__gdxsymboldataspan
+#define C__gdxCollectRestartPositions c__gdxcollectrestartpositions
 #define C__gdxDataReadRawFastFilt c__gdxdatareadrawfastfilt
 #define C__gdxDataReadRawStart c__gdxdatareadrawstart
 #define C__gdxDataReadSlice c__gdxdatareadslice
@@ -2178,6 +2181,33 @@ GDX_API void GDX_CALLCONV C__gdxMapAcronymsToNaNSet(TGXFileRec_t *TGXFile, int x
 GDX_API void GDX_CALLCONV C__gdxMapAcronymsToNaNSet(TGXFileRec_t *TGXFile, int x)
 {
   gdxMapAcronymsToNaNSet(TGXFile,x);
+}
+
+/* (polars-gdx extension) checkpointed record-range raw read */
+GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, long long EndPos, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos);
+/* (polars-gdx extension) */
+GDX_API int GDX_CALLCONV C__gdxSymbolDataSpan(TGXFileRec_t *TGXFile, int SyNr, long long *StartPos, long long *EndPos);
+GDX_API int GDX_CALLCONV C__gdxCollectRestartPositions(TGXFileRec_t *TGXFile, int SyNr, TDataStoreExProc_t DP, void *Uptr);
+GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, long long EndPos, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos)
+{
+  INT64 np;
+  int res = gdxDataReadRawRange(TGXFile, SyNr, (INT64) StartPos, (INT64) EndPos, DP, NrRecs, Uptr, &np);
+  *NextPos = np;
+  return res;
+}
+GDX_API int GDX_CALLCONV C__gdxSymbolDataSpan(TGXFileRec_t *TGXFile, int SyNr, long long *StartPos, long long *EndPos)
+{
+  INT64 s, e;
+  int res = gdxSymbolDataSpan(TGXFile, SyNr, &s, &e);
+  *StartPos = s;
+  *EndPos = e;
+  return res;
+}
+/* (polars-gdx extension) */
+GDX_API int GDX_CALLCONV C__gdxCollectRestartPositions(TGXFileRec_t *TGXFile, int SyNr, TDataStoreExProc_t DP, void *Uptr)
+{
+  int res = gdxCollectRestartPositions(TGXFile, SyNr, DP, Uptr);
+  return res;
 }
 
 #endif
