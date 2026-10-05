@@ -279,7 +279,10 @@ def test_threads_auto_resolves_to_cpu_count_for_large_symbols(monkeypatch):
     monkeypatch.setattr(lazy, "_AUTO_THREADS_MIN_RECORDS", 1_000_000)
     import os
 
-    cpus = len(os.sched_getaffinity(0))
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - non-Linux
+        cpus = os.cpu_count()
     assert lazy._resolve_threads("auto", 2_000_000) == cpus
     assert lazy._resolve_threads("auto", 500_000) is None
     assert lazy._resolve_threads(4, 2_000_000) == 4
