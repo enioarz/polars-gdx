@@ -84,6 +84,15 @@ def main():
         return scan_gdx(GDX, symbol="bigpar").filter(
             pl.col("dim_0") == FILTER_LABEL).collect()
 
+    # ---- polars-gdx: parallel full read (threads=4) ----
+    def pgx_parallel():
+        return scan_gdx(GDX, symbol="bigpar", threads=4).collect()
+
+    # ---- polars-gdx: is_in predicate (pushed into native prefilter) ----
+    def pgx_is_in():
+        return scan_gdx(GDX, symbol="bigpar").filter(
+            pl.col("dim_0").is_in([FILTER_LABEL])).collect()
+
     # ---- gamsapi: gams.transfer full read into pandas ----
     def gamsapi_full():
         c = gt.Container(system_directory=str(SYSDIR))
@@ -99,9 +108,11 @@ def main():
     results = []
     for name, fn in [
         ("polars-gdx  full read", pgx_full),
+        ("polars-gdx  full read, threads=4", pgx_parallel),
         ("gamsapi     full read", gamsapi_full),
         ("polars-gdx  prefiltered (native)", pgx_prefilter),
         ("polars-gdx  predicate (native prefilter)", pgx_predicate),
+        ("polars-gdx  is_in predicate (native prefilter)", pgx_is_in),
         ("gamsapi     full read + pandas filter", gamsapi_filter),
     ]:
         dt, out = timeit(fn)

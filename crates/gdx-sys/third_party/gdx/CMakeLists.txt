@@ -43,7 +43,11 @@ else ()
 	set(CMAKE_BUILD_RPATH $ORIGIN)
 endif (APPLE)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DGC_NO_MUTEX")
+# Internal mutexes enabled: the GDX wrapper protects its global state
+# (library load, object count, error callback) with pthread/Windows mutexes,
+# which is required for concurrent reads on independent file handles
+# (polars-gdx parallel scanning). Per-handle read calls stay lock-free.
+# set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DGC_NO_MUTEX")
 
 # Windows
 if (MSVC OR CMAKE_HOST_WIN32 OR CMAKE_GENERATOR_TOOLSET STREQUAL "ClangCL")

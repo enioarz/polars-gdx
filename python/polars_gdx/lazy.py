@@ -92,6 +92,7 @@ def read_gdx(
     symbol: str,
     value_field: str | None = None,
     key_filter: dict[int, Sequence[str]] | None = None,
+    threads: int | None = None,
 ) -> pl.DataFrame:
     """Eagerly read one symbol of a GDX file into a DataFrame.
 
@@ -100,7 +101,11 @@ def read_gdx(
     Polars predicate pushdown) is still used under the hood.
     """
     return scan_gdx(
-        path, symbol=symbol, value_field=value_field, key_filter=key_filter
+        path,
+        symbol=symbol,
+        value_field=value_field,
+        key_filter=key_filter,
+        threads=threads,
     ).collect()
 
 
@@ -110,6 +115,7 @@ def scan_gdx(
     symbol: str,
     value_field: str | None = None,
     key_filter: dict[int, Sequence[str]] | None = None,
+    threads: int | None = None,
 ) -> pl.LazyFrame:
     """Lazily scan one symbol of a GDX file.
 
@@ -129,6 +135,11 @@ def scan_gdx(
         while reading, so records with non-matching keys are skipped before
         materialisation. This runs in the Rust read loop, in addition to any
         predicate pushdown Polars performs on the produced frame.
+    threads
+        Number of worker threads for the raw read. When > 1 and no row
+        limit applies, the file is opened once per worker and each scans a
+        contiguous range of the first key dimension, so record order matches
+        the serial read exactly. ``None``/0/1 means serial.
 
     Notes
     -----
@@ -217,6 +228,7 @@ def scan_gdx(
             value_field=(None if value_name == "value" else value_name),
             key_filter=filters,
             n_rows=(n_rows if native_limit_safe else None),
+            threads=threads,
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         df = pl.from_arrow(batch)
@@ -294,31 +306,43 @@ def _predicate_key_filter(
 
 
 def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
-    """Rebuild an eq-conjunction predicate with (rewritten) exact labels.
+    """Rebuild the predicate with (rewritten) exact labels.
 
-    All labels must resolve to at least one stored label (the caller checked);
-    an empty per-dimension label set means no rows at all, expressed as an
-    all-false conjunction.
+    Within a dimension, labels are alternatives (OR) — a dimension's
+    constraint is a membership test; across dimensions they conjoin (AND),
+    matching the native prefilter semantics for both `==` and `is_in`.
+    All labels must resolve to at least one stored label (the caller
+    checked); an empty per-dimension label set means no rows at all.
     """
     expr: pl.Expr | None = None
     for d, labels in filters:
         if not labels:
             return pl.lit(False)
-        for l in labels:
-            eq = pl.col(key_names[d]).cast(pl.String) == l
-            expr = eq if expr is None else expr & eq
+        col = pl.col(key_names[d]).cast(pl.String)
+        dim_expr = col == labels[0] if len(labels) == 1 else col.is_in(labels)
+        expr = dim_expr if expr is None else expr & dim_expr
     return expr if expr is not None else pl.lit(False)
 
 
-def _case_insensitive_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
-    """Rebuild an eq-conjunction predicate with case-insensitive equality."""
+def _case_insensitive_expr(
+    filters: list[tuple[int, list[str]]], key_names: list[str]
+) -> pl.Expr:
+    """Rebuild the predicate with case-insensitive matching.
+
+    Same OR-within-dimension / AND-across-dimensions semantics as
+    :func:`_exact_expr`.
+    """
     expr: pl.Expr | None = None
     for d, labels in filters:
         if not labels:
             return pl.lit(False)
-        for l in labels:
-            eq = pl.col(key_names[d]).cast(pl.String).str.to_uppercase() == l.upper()
-            expr = eq if expr is None else expr & eq
+        col = pl.col(key_names[d]).cast(pl.String).str.to_uppercase()
+        dim_expr = (
+            col == labels[0].upper()
+            if len(labels) == 1
+            else col.is_in([l.upper() for l in labels])
+        )
+        expr = dim_expr if expr is None else expr & dim_expr
     return expr if expr is not None else pl.lit(False)
 
 
@@ -327,25 +351,68 @@ def _collect_eq_filters(
 ) -> bool:
     """Walk a serialized predicate plan; collect key-column constraints.
 
-    Returns True when the whole node is translatable, False otherwise.
+    Recognises `col == "label"` and `col.is_in([labels])` (plus conjunctions
+    thereof). Returns True when the whole node is translatable, else False.
     """
-    if "BinaryExpr" not in node:
-        return False
-    b = node["BinaryExpr"]
-    if b["op"] == "And":
-        return _collect_eq_filters(b["left"], key_names, out) and _collect_eq_filters(
-            b["right"], key_names, out
-        )
-    if b["op"] != "Eq":
-        return False
-    for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
-        if "Column" in col_side and col_side["Column"] in key_names:
-            label = _string_literal(lit_side)
-            if label is not None:
-                out.append((key_names.index(col_side["Column"]), [label]))
-                return True
+    if "BinaryExpr" in node:
+        b = node["BinaryExpr"]
+        if b["op"] == "And":
+            return _collect_eq_filters(b["left"], key_names, out) and (
+                _collect_eq_filters(b["right"], key_names, out)
+            )
+        if b["op"] != "Eq":
             return False
+        for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
+            if "Column" in col_side and col_side["Column"] in key_names:
+                label = _string_literal(lit_side)
+                if label is not None:
+                    out.append((key_names.index(col_side["Column"]), [label]))
+                    return True
+                return False
+        return False
+    if "Function" in node:
+        f = node["Function"]
+        opts = f.get("function", {}).get("Boolean", {})
+        if "IsIn" not in opts:
+            return False
+        inputs = f.get("input", [])
+        if len(inputs) != 2 or "Column" not in inputs[0]:
+            return False
+        col = inputs[0]["Column"]
+        if col not in key_names:
+            return False
+        labels = _list_literal_strings(inputs[1])
+        if labels is None:
+            return False
+        out.append((key_names.index(col), labels))
+        return True
     return False
+
+
+def _list_literal_strings(node: dict) -> list[str] | None:
+    """String values of an Arrow-IPC list literal, else None.
+
+    Polars serializes `is_in` list literals as a continuation marker
+    (0xFFFFFFFF) followed by an Arrow IPC stream of a one-column table.
+    """
+    try:
+        raw = bytes(node["Literal"]["Scalar"]["List"])
+    except (KeyError, TypeError):
+        return None
+    try:
+        import pyarrow as pa
+
+        reader = pa.ipc.open_stream(pa.BufferReader(raw))
+        table = pa.Table.from_batches(list(reader))
+    except Exception:
+        return None
+    col = table.column(0)
+    if pa.types.is_string(col.type) or pa.types.is_large_string(col.type):
+        return [v for v in col.to_pylist() if v is not None]
+    # string_view (pyarrow >= 16): not covered by is_string
+    if "string_view" in str(col.type):
+        return [v for v in col.to_pylist() if v is not None]
+    return None
 
 
 def _string_literal(node: dict) -> str | None:

@@ -249,6 +249,197 @@ impl GdxFile {
         self.read_symbol_raw(info, value_field, pred, limit)
     }
 
+    /// Parallel read of a symbol across `threads` independent file handles.
+    ///
+    /// Opens the same file once per worker thread (independent GDX objects;
+    /// the library keeps no mutable global state in the direct `c__*` entry
+    /// points) and scans disjoint contiguous ranges of the first-dimension
+    /// UEL space concurrently. Records are stored sorted by key, so the
+    /// per-range results are concatenated in range order to reproduce the
+    /// single-threaded record order exactly.
+    ///
+    /// `pred` may report [`RecordAction::Stop`]: per-thread it stops that
+    /// thread's scan once the first-dimension key leaves the thread's range
+    /// or the filter's allowed set (whichever comes first).
+    ///
+    /// Falls back to the serial path when `threads <= 1` or the symbol has
+    /// fewer than two first-dimension UELs.
+    #[allow(clippy::type_complexity)]
+    pub fn read_symbol_raw_parallel(
+        path: impl AsRef<Path>,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred_builder: &(dyn Fn() -> Box<dyn Fn(&[i32]) -> RecordAction + Send> + Sync),
+        limit: Option<usize>,
+        threads: usize,
+        range_skip: &(dyn Fn(i32, i32) -> bool + Sync),
+    ) -> Result<RawSymbolData> {
+        if threads <= 1 {
+            let file = GdxFile::open(path)?;
+            let pred = pred_builder();
+            let pred_ref: ActionPred<'_> = Some(&*pred);
+            return file.read_symbol_raw(info, value_field, pred_ref, limit);
+        }
+        let (uelcnt, _) = {
+            // Cheap probe on a throwaway handle: total UEL space to partition.
+            let probe = GdxFile::open(&path)?;
+            probe.uel_counts()?
+        };
+        if uelcnt < 2 {
+            let file = GdxFile::open(path)?;
+            let pred = pred_builder();
+            let pred_ref: ActionPred<'_> = Some(&*pred);
+            return file.read_symbol_raw(info, value_field, pred_ref, limit);
+        }
+        let threads = threads.min(uelcnt as usize);
+        let path = path.as_ref().to_path_buf();
+        let ranges = split_ranges(uelcnt as usize, threads);
+        // A global row limit under parallelism would need coordination;
+        // keep it per-thread conservative (may over-deliver is NOT allowed,
+        // so only apply per-thread limits when no limit is set).
+        let per_limit = None::<usize>;
+        let _ = limit;
+        let results: std::sync::Mutex<Vec<(usize, Result<RawSymbolData>)>> =
+            std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for (t, (lo, hi)) in ranges.iter().enumerate() {
+                let results = &results;
+                let path = path.clone();
+                scope.spawn(move || {
+                    let res = if range_skip(*lo, *hi) {
+                        Ok(RawSymbolData::with_capacity(info.dim, 0))
+                    } else {
+                        GdxFile::open(&path).and_then(|file| {
+                            let pred = pred_builder();
+                            let pred_ref: ActionPred<'_> = Some(&*pred);
+                            file.read_symbol_raw_range_unlocked(
+                                info,
+                                value_field,
+                                pred_ref,
+                                per_limit,
+                                *lo,
+                                *hi,
+                            )
+                        })
+                    };
+                    if let Ok(mut guard) = results.lock() {
+                        guard.push((t, res));
+                    }
+                });
+            }
+        });
+        let mut parts = results.into_inner().unwrap();
+        parts.sort_by_key(|(t, _)| *t);
+        // Merge in range order (records sorted by first-dim key, ranges
+        // disjoint and ordered, so concatenation preserves global order).
+        let mut keys: Vec<Vec<u32>> = vec![Vec::new(); info.dim];
+        let mut values: Vec<f64> = Vec::new();
+        for (_, res) in parts {
+            let part = res?;
+            for (k, pk) in keys.iter_mut().zip(part.keys.iter()) {
+                k.extend_from_slice(pk);
+            }
+            values.extend_from_slice(&part.values);
+        }
+        Ok(RawSymbolData { keys, values })
+    }
+
+    /// Number of UELs and highest mapped UEL for the open file.
+    pub fn uel_counts(&self) -> Result<(i32, i32)> {
+        let _guard = crate::lock::lock();
+        unsafe {
+            let (mut uelcnt, mut highmap) = (0i32, 0i32);
+            if ffi::c__gdxumuelinfo(self.obj, &mut uelcnt, &mut highmap) == 0 {
+                return Err(op_error(self.obj, "gdxUMUELInfo"));
+            }
+            Ok((uelcnt, highmap))
+        }
+    }
+
+    /// Serial read restricted to a contiguous range of first-dimension UEL
+    /// numbers, `[lo, hi]` inclusive (1-based; `lo >= 1`, `hi >= lo`). Records
+    /// outside the range are skipped; the scan stops once the first-dimension
+    /// key exceeds `hi` (records are stored sorted by key). Other dimensions
+    /// are filtered only through `pred`, as usual.
+    pub fn read_symbol_raw_range(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: ActionPred<'_>,
+        limit: Option<usize>,
+        lo: i32,
+        hi: i32,
+    ) -> Result<RawSymbolData> {
+        let _guard = crate::lock::lock();
+        unsafe { self.read_symbol_raw_range_locked(info, value_field, pred, limit, lo, hi) }
+    }
+
+    /// Range read on a worker-private handle, skipping the process-global
+    /// GDX lock. Safe only when this handle is used by a single thread and
+    /// no other thread is inside a locked GDX sequence that assumes
+    /// exclusive access to the whole library (the vendored library's internal
+    /// mutexes protect its global state; per-handle calls are lock-free).
+    pub(crate) fn read_symbol_raw_range_unlocked(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: ActionPred<'_>,
+        limit: Option<usize>,
+        lo: i32,
+        hi: i32,
+    ) -> Result<RawSymbolData> {
+        unsafe { self.read_symbol_raw_range_locked(info, value_field, pred, limit, lo, hi) }
+    }
+
+    unsafe fn read_symbol_raw_range_locked(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: ActionPred<'_>,
+        limit: Option<usize>,
+        lo: i32,
+        hi: i32,
+    ) -> Result<RawSymbolData> {
+        let vidx = value_field.index();
+        let reserve = info.records.min(1024 * 1024);
+        let mut data = RawSymbolData::with_capacity(info.dim, reserve);
+        // Combine the caller predicate with the range restriction on the
+        // first-dimension key: skip below lo, stop past hi (sorted store).
+        let combined = move |keys: &[i32]| -> RecordAction {
+            let k0 = keys[0];
+            if k0 < lo {
+                return RecordAction::Skip;
+            }
+            if k0 > hi {
+                return RecordAction::Stop;
+            }
+            match pred {
+                Some(f) => f(keys),
+                None => RecordAction::Accept,
+            }
+        };
+        let sink = RecordSink {
+            data: std::ptr::from_mut(&mut data),
+            special: std::ptr::from_ref(&self.special),
+            vidx,
+            dim: info.dim,
+            pred: Some(&combined),
+            remaining: std::cell::Cell::new(limit),
+        };
+        let mut cb_nrecs = 0;
+        let ok = ffi::c__gdxdatareadrawfastex(
+            self.obj,
+            info.number as i32,
+            store_record_ex,
+            &mut cb_nrecs,
+            &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
+        );
+        if ok == 0 {
+            return Err(op_error(self.obj, "gdxDataReadRawFastEx"));
+        }
+        Ok(data)
+    }
+
     /// The file's UEL table: entry `i` is the label of UEL number `i + 1`.
     /// Missing entries yield an empty-string placeholder.
     pub fn uel_table(&self) -> Result<Arc<[String]>> {
@@ -503,6 +694,26 @@ impl Drop for GdxFile {
             ffi::gdxfree(&mut self.obj);
         }
     }
+}
+
+/// Split `n` items into `t` contiguous, roughly equal ranges (1-based,
+/// inclusive; empty ranges omitted).
+fn split_ranges(n: usize, t: usize) -> Vec<(i32, i32)> {
+    let t = t.max(1);
+    let per = n / t;
+    let extra = n % t;
+    let mut out = Vec::with_capacity(t);
+    let mut lo = 1usize;
+    for i in 0..t {
+        let len = per + if i < extra { 1 } else { 0 };
+        if len == 0 {
+            continue;
+        }
+        let hi = lo + len - 1;
+        out.push((lo as i32, hi as i32));
+        lo = hi + 1;
+    }
+    out
 }
 
 /// Map a GDX special-value sentinel onto an ordinary `f64`.
