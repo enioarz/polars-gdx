@@ -19,9 +19,17 @@ tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
 ## Key design facts (do not rediscover these)
 
 - **Read path**: `scan_gdx()` → `pl.register_io_source` → Rust `read_arrow()` →
-  raw UEL indices via `gdxDataReadRawFast` (bulk C callback, ONE FFI crossing per symbol)
+  raw UEL indices via `gdxDataReadRawFastEx` (bulk C callback with user-data pointer and
+  early-termination return, ONE FFI crossing per symbol — used for unfiltered, filtered
+  AND limited reads alike)
   → Arrow dictionary-encoded key columns + Float64 value column → pyarrow RecordBatch
   → `pl.from_arrow` (zero-copy). Labels are NEVER materialized per record.
+
+- **Domain scan**: `Reader.domain_elements(symbol, dim_pos)` (→ `gdxGetDomainElements`,
+  DOMC_EXPAND) lists the unique UEL numbers used by one dimension via a bulk C callback;
+  exposed as `read_domains(path, symbol=...)` in Python for fast `unique()`-style label
+  discovery without materialising records (the file scan still happens, inside the C
+  library — it skips record materialisation, not the scan).
 - **Prefiltering** happens on raw i32 UEL indices inside the C read loop. Filter labels are
   resolved to UEL indices once (`resolve_uel_indices` + `uel_index()` reverse map). An empty
   resolved index set correctly means "zero rows" — do not drop empty filters.

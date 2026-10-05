@@ -160,6 +160,30 @@ extern "C" {
 
     /// UEL count and highest mapped index for the open file.
     pub fn c__gdxumuelinfo(obj: *mut GdxObj, uelcnt: *mut c_int, highmap: *mut c_int) -> c_int;
+    /// Bulk raw read with early termination and a user-data pointer: calls
+    /// `dp(indx, vals, afdim, uptr)` once per record from a single FFI
+    /// crossing; the read stops when `dp` returns 0.
+    /// Signature: `int (*)(const int*, const double*, int, void*)`.
+    pub fn c__gdxdatareadrawfastex(
+        obj: *mut GdxObj,
+        synr: c_int,
+        dp: extern "C" fn(*const c_int, *const c_double, c_int, *mut c_void) -> c_int,
+        nrecs: *mut c_int,
+        uptr: *mut c_void,
+    ) -> c_int;
+    /// List the unique elements actually used by one dimension of a symbol:
+    /// calls `dp(rawindex, mappedindex, uptr)` once per unique element
+    /// (in UEL order). `filternr` must be `DOMC_EXPAND` (-1, no filter).
+    /// Signature: `void (*)(int, int, void*)`.
+    pub fn c__gdxgetdomainelements(
+        obj: *mut GdxObj,
+        synr: c_int,
+        dimpos: c_int,
+        filternr: c_int,
+        dp: extern "C" fn(c_int, c_int, *mut c_void),
+        nrelem: *mut c_int,
+        uptr: *mut c_void,
+    ) -> c_int;
     /// Resolve UEL number `uelnr` to its label string.
     /// Writes into `uel` (caller provides [`GMS_SSSIZE`] buffer); sets `uelmap`.
     /// Returns 1 on success, 0 if `uelnr` is out of range.

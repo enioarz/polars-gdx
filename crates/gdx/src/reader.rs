@@ -12,6 +12,10 @@ use crate::error::{GdxError, Result};
 
 /// Record prefilter on raw UEL indices.
 pub type IndexPred<'a> = Option<&'a dyn Fn(&[i32]) -> bool>;
+
+/// `FilterNr` sentinel accepted by `gdxGetDomainElements`: no filter.
+const DOMC_EXPAND: i32 = -1;
+
 use crate::types::{Record, SymbolInfo, SymbolType, ValueField};
 
 /// A GDX file opened for reading.
@@ -158,6 +162,44 @@ impl GdxFile {
         Ok(map)
     }
 
+    /// The unique UEL numbers used by one dimension (`dim_pos`, 0-based) of a
+    /// symbol, in UEL order. The scan runs inside the C library via a bulk
+    /// callback (one FFI crossing): no record is materialised, no label
+    /// string is resolved — the cost of `unique(dim)` without reading the
+    /// data. Empty when `dim_pos` lies outside the symbol's own dimensions.
+    pub fn domain_elements(&self, info: &SymbolInfo, dim_pos: usize) -> Result<Vec<i32>> {
+        if info.dim == 0 || dim_pos >= info.dim {
+            return Ok(Vec::new());
+        }
+        let _guard = crate::lock::lock();
+        let uelcnt = unsafe {
+            let (mut uelcnt, mut highmap) = (0i32, 0i32);
+            if ffi::c__gdxumuelinfo(self.obj, &mut uelcnt, &mut highmap) == 0 {
+                return Err(op_error(self.obj, "gdxUMUELInfo"));
+            }
+            uelcnt
+        };
+        // seen[n] marks UEL number n (1-based) as delivered; slot 0 unused.
+        let mut seen = vec![false; uelcnt.max(0) as usize + 1];
+        let sink = DomainSink { seen: &mut seen };
+        let mut nrelem = 0;
+        let ok = unsafe {
+            ffi::c__gdxgetdomainelements(
+                self.obj,
+                info.number as i32,
+                dim_pos as i32 + 1,
+                DOMC_EXPAND,
+                store_domain_element,
+                &mut nrelem,
+                &sink as *const DomainSink<'_> as *mut std::ffi::c_void,
+            )
+        };
+        if ok == 0 {
+            return Err(unsafe { op_error(self.obj, "gdxGetDomainElements") });
+        }
+        Ok((1..=uelcnt).filter(|&n| seen[n as usize]).collect())
+    }
+
     /// Read a symbol in fully raw form: per-dimension UEL indices plus one
     /// value field, without materialising any label strings.
     ///
@@ -216,101 +258,79 @@ impl GdxFile {
         let vidx = value_field.index();
         let mut data = RawSymbolData::with_capacity(info.dim, info.records);
 
-        let (pinf, minf) = (
-            self.special[ffi::GMS_SVIDX_PINF],
-            self.special[ffi::GMS_SVIDX_MINF],
-        );
-        let (undef, na) = (
-            self.special[ffi::GMS_SVIDX_UNDEF],
-            self.special[ffi::GMS_SVIDX_NA],
-        );
-        let eps = self.special[ffi::GMS_SVIDX_EPS];
-        let mut nrecs = 0;
+        let nrecs = 0;
+        let _ = nrecs;
 
-        // Filtered read: per-record loop so the predicate can run on raw
-        // indices before anything is stored.
+        // Filtered and limited reads alike use the `gdxDataReadRawFastEx`
+        // bulk callback: one FFI crossing for the whole loop, with the index
+        // predicate and optional limit evaluated inside the callback before
+        // anything is stored (returning 0 terminates the C read loop).
         if let Some(f) = pred {
-            if ffi::c__gdxdatareadrawstart(self.obj, info.number as i32, &mut nrecs) == 0 {
-                return Err(op_error(self.obj, "gdxDataReadRawStart"));
-            }
-            let mut key_indices = [0i32; ffi::GMS_MAX_INDEX_DIM];
-            let mut values = [0.0f64; ffi::GMS_VAL_MAX];
-            let mut dimfrst = 0;
-            let mut remaining = limit;
-            while ffi::c__gdxdatareadraw(
+            let sink = RecordSink {
+                data: std::ptr::from_mut(&mut data),
+                special: std::ptr::from_ref(&self.special),
+                vidx,
+                dim: info.dim,
+                pred: Some(f),
+                remaining: std::cell::Cell::new(limit),
+            };
+            let mut cb_nrecs = 0;
+            let ok = ffi::c__gdxdatareadrawfastex(
                 self.obj,
-                key_indices.as_mut_ptr(),
-                values.as_mut_ptr(),
-                &mut dimfrst,
-            ) == 1
-            {
-                if !f(&key_indices[..info.dim]) {
-                    continue;
-                }
-                for (d, k) in key_indices[..info.dim].iter().enumerate() {
-                    data.keys[d].push((*k - 1).max(0) as u32);
-                }
-                data.values
-                    .push(map_special(values[vidx], pinf, minf, undef, na, eps));
-                if let Some(r) = remaining.as_mut() {
-                    *r -= 1;
-                    if *r == 0 {
-                        break;
-                    }
-                }
+                info.number as i32,
+                store_record_ex,
+                &mut cb_nrecs,
+                &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
+            );
+            if ok == 0 {
+                return Err(op_error(self.obj, "gdxDataReadRawFastEx"));
             }
-            ffi::c__gdxdatareaddone(self.obj);
             return Ok(data);
         }
 
-        // Limited unfiltered read: per-record loop so we can stop early.
         if let Some(limit) = limit {
-            if ffi::c__gdxdatareadrawstart(self.obj, info.number as i32, &mut nrecs) == 0 {
-                return Err(op_error(self.obj, "gdxDataReadRawStart"));
-            }
-            let mut key_indices = [0i32; ffi::GMS_MAX_INDEX_DIM];
-            let mut values = [0.0f64; ffi::GMS_VAL_MAX];
-            let mut dimfrst = 0;
-            let mut remaining = limit;
-            while ffi::c__gdxdatareadraw(
+            let sink = RecordSink {
+                data: std::ptr::from_mut(&mut data),
+                special: std::ptr::from_ref(&self.special),
+                vidx,
+                dim: info.dim,
+                pred: None,
+                remaining: std::cell::Cell::new(Some(limit)),
+            };
+            let mut cb_nrecs = 0;
+            let ok = ffi::c__gdxdatareadrawfastex(
                 self.obj,
-                key_indices.as_mut_ptr(),
-                values.as_mut_ptr(),
-                &mut dimfrst,
-            ) == 1
-            {
-                for (d, k) in key_indices[..info.dim].iter().enumerate() {
-                    data.keys[d].push((*k - 1).max(0) as u32);
-                }
-                data.values
-                    .push(map_special(values[vidx], pinf, minf, undef, na, eps));
-                remaining -= 1;
-                if remaining == 0 {
-                    break;
-                }
+                info.number as i32,
+                store_record_ex,
+                &mut cb_nrecs,
+                &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
+            );
+            if ok == 0 {
+                return Err(op_error(self.obj, "gdxDataReadRawFastEx"));
             }
-            ffi::c__gdxdatareaddone(self.obj);
             return Ok(data);
         }
 
-        // Unfiltered unlimited read: bulk callback, one FFI crossing for the
-        // whole loop. The sink is routed through a thread-local of raw pointers
-        // because the C callback signature carries no user-data argument; the
-        // global GDX lock plus same-thread callback execution keeps this
-        // sound.
+        // Unfiltered unlimited read: bulk callback with a user-data pointer,
+        // one FFI crossing for the whole loop.
         let sink = RecordSink {
             data: std::ptr::from_mut(&mut data),
             special: std::ptr::from_ref(&self.special),
             vidx,
             dim: info.dim,
+            pred: None,
+            remaining: std::cell::Cell::new(None),
         };
-        SINK.with(|s| s.set(Some(sink)));
         let mut cb_nrecs = 0;
-        let ok =
-            ffi::c__gdxdatareadrawfast(self.obj, info.number as i32, store_record, &mut cb_nrecs);
-        SINK.with(|s| s.take());
+        let ok = ffi::c__gdxdatareadrawfastex(
+            self.obj,
+            info.number as i32,
+            store_record_ex,
+            &mut cb_nrecs,
+            &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
+        );
         if ok == 0 {
-            return Err(op_error(self.obj, "gdxDataReadRawFast"));
+            return Err(op_error(self.obj, "gdxDataReadRawFastEx"));
         }
         Ok(data)
     }
@@ -542,6 +562,90 @@ unsafe fn op_error(obj: *mut ffi::GdxObj, op: &'static str) -> GdxError {
     }
 }
 
+/// Per-read sink state passed to the C bulk-read callbacks. The legacy
+/// `c__gdxdatareadrawfast` path routes it through a thread-local (no
+/// user-data argument); the `Ex` callbacks receive it via `Uptr`.
+struct RecordSink<'a> {
+    data: *mut RawSymbolData,
+    special: *const [f64; ffi::GMS_SVIDX_MAX],
+    vidx: usize,
+    dim: usize,
+    pred: IndexPred<'a>,
+    remaining: std::cell::Cell<Option<usize>>,
+}
+
+impl Clone for RecordSink<'_> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data,
+            special: self.special,
+            vidx: self.vidx,
+            dim: self.dim,
+            pred: self.pred,
+            remaining: std::cell::Cell::new(self.remaining.get()),
+        }
+    }
+}
+
+// The callbacks run synchronously on the same thread inside the
+// `c__gdxdatareadrawfastex` call, which is itself bracketed by the global GDX
+// lock; the sink is only dereferenced there. The `Send` impl covers the raw
+// pointer crossing the (never actually taken) thread boundary.
+unsafe impl Send for RecordSink<'_> {}
+
+/// Callback for `c__gdxdatareadrawfastex` (filtered and/or limited reads):
+/// receives the sink via `Uptr`. Returns 0 to terminate the C read loop once
+/// the stored-record limit is reached, 1 to continue.
+extern "C" fn store_record_ex(
+    indx: *const i32,
+    vals: *const f64,
+    _afdim: i32,
+    uptr: *mut std::ffi::c_void,
+) -> i32 {
+    let sink = unsafe { &*(uptr as *const RecordSink<'_>) };
+    unsafe {
+        let keys = std::slice::from_raw_parts(indx, sink.dim);
+        if let Some(pred) = sink.pred {
+            if !pred(keys) {
+                return 1;
+            }
+        }
+        let data = &mut *sink.data;
+        for (d, &k) in keys.iter().enumerate() {
+            data.keys[d].push((k - 1).max(0) as u32);
+        }
+        let v = *vals.add(sink.vidx);
+        data.values.push(map_special(
+            v,
+            (*sink.special)[ffi::GMS_SVIDX_PINF],
+            (*sink.special)[ffi::GMS_SVIDX_MINF],
+            (*sink.special)[ffi::GMS_SVIDX_UNDEF],
+            (*sink.special)[ffi::GMS_SVIDX_NA],
+            (*sink.special)[ffi::GMS_SVIDX_EPS],
+        ));
+    }
+    if let Some(r) = sink.remaining.get() {
+        if r == 0 {
+            return 0;
+        }
+        sink.remaining.set(Some(r - 1));
+    }
+    1
+}
+
+/// Sink for `c__gdxgetdomainelements`: marks delivered UEL numbers as seen.
+struct DomainSink<'a> {
+    seen: &'a mut [bool],
+}
+
+extern "C" fn store_domain_element(rawindex: i32, _mappedindex: i32, uptr: *mut std::ffi::c_void) {
+    let sink = unsafe { &mut *(uptr as *mut DomainSink<'_>) };
+    if rawindex > 0 {
+        if let Some(slot) = sink.seen.get_mut(rawindex as usize) {
+            *slot = true;
+        }
+    }
+}
 #[cfg(test)]
 mod parity {
     //! Verify that raw-mode reading produces the same keys and values as the
@@ -619,54 +723,5 @@ mod parity {
 
         // Both records share the "seattle" UEL — the Arc pointers must be identical.
         assert!(Arc::ptr_eq(&records[0].keys[0], &records[1].keys[0]));
-    }
-}
-
-/// Per-read sink state passed to the C bulk-read callback via thread-local.
-struct RecordSink {
-    data: *mut RawSymbolData,
-    special: *const [f64; ffi::GMS_SVIDX_MAX],
-    vidx: usize,
-    dim: usize,
-}
-
-impl Clone for RecordSink {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl Copy for RecordSink {}
-
-// Sound because the callback runs synchronously on the same thread inside the
-// `c__gdxdatareadrawfast` call bracketed by the SINK set/take below, and all
-// GDX access is serialized by the global FFI lock. The callback only reads the
-// sink (no take/set per record); `RecordSink` is `Copy` so the slot stays
-// populated for the whole call.
-unsafe impl Send for RecordSink {}
-
-thread_local! {
-    static SINK: std::cell::Cell<Option<RecordSink>> = const { std::cell::Cell::new(None) };
-}
-
-extern "C" fn store_record(indx: *const i32, vals: *const f64) {
-    let Some(sink) = SINK.with(|s| s.get()) else {
-        return;
-    };
-    unsafe {
-        let keys = std::slice::from_raw_parts(indx, sink.dim);
-        let data = &mut *sink.data;
-        for (d, &k) in keys.iter().enumerate() {
-            data.keys[d].push((k - 1).max(0) as u32);
-        }
-        let v = *vals.add(sink.vidx);
-        data.values.push(map_special(
-            v,
-            (*sink.special)[ffi::GMS_SVIDX_PINF],
-            (*sink.special)[ffi::GMS_SVIDX_MINF],
-            (*sink.special)[ffi::GMS_SVIDX_UNDEF],
-            (*sink.special)[ffi::GMS_SVIDX_NA],
-            (*sink.special)[ffi::GMS_SVIDX_EPS],
-        ));
     }
 }

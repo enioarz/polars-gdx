@@ -23,6 +23,45 @@ if TYPE_CHECKING:
 _VALUE_FIELDS = ("level", "marginal", "lower", "upper", "scale")
 
 
+def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
+    """List the labels actually used per index dimension of a symbol.
+
+    Returns a DataFrame with one column per dimension (named like
+    ``scan_gdx``'s key columns), each holding the unique labels used by that
+    dimension, in file order.
+
+    This is the fast equivalent of reading the symbol and taking
+    ``unique()`` per key column: the scan runs inside the GDX library via a
+    bulk callback — no records are materialised and no value column is read —
+    so it costs one pass over the raw indices regardless of the number of
+    records. (Columns are padded to equal length with ``null``.)
+    """
+    reader = Reader(str(path))
+    try:
+        info = {r[0]: r for r in reader.symbols()}
+        if symbol not in info:
+            raise ValueError(
+                f"symbol {symbol!r} not found in {path!r}; available: {sorted(info)}"
+            )
+        _, _type_str, dim, _n, domains, _text = info[symbol]
+        uels = reader.uel_table()
+        names = _key_names(domains, dim, reserved=set())
+        series = []
+        for d in range(dim):
+            used = reader.domain_elements(symbol, d)
+            labels = [uels[i - 1] if 0 < i <= len(uels) else None for i in used]
+            series.append(pl.Series(names[d], labels, dtype=pl.String))
+    finally:
+        reader.close()
+    if not series:
+        return pl.DataFrame()
+    longest = max(len(s) for s in series)
+    series = [s.rechunk() for s in series]
+    return pl.DataFrame(
+        {s.name: s.extend_constant(None, longest - len(s)) for s in series}
+    )
+
+
 def list_symbols(path: str | Path) -> pl.DataFrame:
     """List the symbols in a GDX file as a DataFrame."""
     reader = Reader(str(path))
@@ -143,10 +182,9 @@ def scan_gdx(
             pred_expr = predicate
             native, folded = _predicate_key_filter(pred_expr, key_names, reader)
             if folded:
-                # Some labels only match case-insensitively: Polars' `==` is
-                # case-sensitive, so the native prefilter would admit rows
-                # that the re-applied predicate would then drop silently.
-                # Fall back to a case-folded predicate on the full read; the
+                # Some labels match several stored labels that differ only in
+                # case: no single stored label can stand in for them, so fall
+                # back to a case-folded predicate on the full read; the
                 # predicate re-apply makes a native row limit unsafe.
                 pred_expr = _case_insensitive_expr(native, key_names)
                 native_limit_safe = False
@@ -160,8 +198,10 @@ def scan_gdx(
             else:
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
-                # the raw read. The predicate is re-applied below for exact
-                # semantics (no-op on the already-prefiltered rows).
+                # the raw read. Case-mismatched labels were rewritten to their
+                # (unique) stored label, so the re-applied predicate must use
+                # the rewritten labels too — Polars' `==` is case-sensitive.
+                pred_expr = _exact_expr(native, key_names)
                 merged = {d: list(labels) for d, labels in explicit_filters or []}
                 for d, labels in native:
                     if d in merged:
@@ -226,7 +266,9 @@ def _predicate_key_filter(
     # exists in the file under different casing still matches, but is flagged
     # so the caller can keep Polars-side semantics correct.
     uels = set(reader.uel_table())
-    folded_uels = {l.upper(): l for l in uels}
+    folded_uels: dict[str, list[str]] = {}
+    for l in uels:
+        folded_uels.setdefault(l.upper(), []).append(l)
     resolved = []
     folded = False
     for d, labels in filters:
@@ -234,7 +276,13 @@ def _predicate_key_filter(
         for l in labels:
             if l in uels:
                 existing.append(l)
+            elif len(folded_uels.get(l.upper(), [])) == 1:
+                # Case-mismatched but unambiguous: stand in the stored label so
+                # the native prefilter (and the rebuilt predicate) still apply.
+                existing.append(folded_uels[l.upper()][0])
             elif l.upper() in folded_uels:
+                # Several stored labels differ only in case: only a
+                # case-insensitive predicate can select between them.
                 existing.append(l)
                 folded = True
         if not existing:
@@ -245,15 +293,33 @@ def _predicate_key_filter(
     return resolved, folded
 
 
+def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
+    """Rebuild an eq-conjunction predicate with (rewritten) exact labels.
+
+    All labels must resolve to at least one stored label (the caller checked);
+    an empty per-dimension label set means no rows at all, expressed as an
+    all-false conjunction.
+    """
+    expr: pl.Expr | None = None
+    for d, labels in filters:
+        if not labels:
+            return pl.lit(False)
+        for l in labels:
+            eq = pl.col(key_names[d]).cast(pl.String) == l
+            expr = eq if expr is None else expr & eq
+    return expr if expr is not None else pl.lit(False)
+
+
 def _case_insensitive_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
     """Rebuild an eq-conjunction predicate with case-insensitive equality."""
     expr: pl.Expr | None = None
     for d, labels in filters:
+        if not labels:
+            return pl.lit(False)
         for l in labels:
             eq = pl.col(key_names[d]).cast(pl.String).str.to_uppercase() == l.upper()
             expr = eq if expr is None else expr & eq
-    assert expr is not None
-    return expr
+    return expr if expr is not None else pl.lit(False)
 
 
 def _collect_eq_filters(
