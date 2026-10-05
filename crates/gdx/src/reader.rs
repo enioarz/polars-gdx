@@ -13,6 +13,22 @@ use crate::error::{GdxError, Result};
 /// Record prefilter on raw UEL indices.
 pub type IndexPred<'a> = Option<&'a dyn Fn(&[i32]) -> bool>;
 
+/// What the read loop should do with a record, evaluated on its raw UEL
+/// indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordAction {
+    /// Store the record and continue.
+    Accept,
+    /// Skip the record and continue.
+    Skip,
+    /// Skip the record and terminate the scan: the caller knows no further
+    /// record can match (GDX stores records sorted by key indices).
+    Stop,
+}
+
+/// Record prefilter returning a [`RecordAction`].
+pub type ActionPred<'a> = Option<&'a dyn Fn(&[i32]) -> RecordAction>;
+
 /// `FilterNr` sentinel accepted by `gdxGetDomainElements`: no filter.
 const DOMC_EXPAND: i32 = -1;
 
@@ -212,11 +228,25 @@ impl GdxFile {
         &self,
         info: &SymbolInfo,
         value_field: ValueField,
-        pred: IndexPred<'_>,
+        pred: ActionPred<'_>,
         limit: Option<usize>,
     ) -> Result<RawSymbolData> {
         let _guard = crate::lock::lock();
         unsafe { self.read_symbol_raw_locked(info, value_field, pred, limit) }
+    }
+
+    /// Like [`GdxFile::read_symbol_raw`], kept as an alias: the predicate may
+    /// report [`RecordAction::Stop`] to terminate the scan early (records are
+    /// stored sorted by key indices, so a first-dimension filter can stop
+    /// once the scan moves past its highest allowed UEL).
+    pub fn read_symbol_raw_stoppable(
+        &self,
+        info: &SymbolInfo,
+        value_field: ValueField,
+        pred: ActionPred<'_>,
+        limit: Option<usize>,
+    ) -> Result<RawSymbolData> {
+        self.read_symbol_raw(info, value_field, pred, limit)
     }
 
     /// The file's UEL table: entry `i` is the label of UEL number `i + 1`.
@@ -252,7 +282,7 @@ impl GdxFile {
         &self,
         info: &SymbolInfo,
         value_field: ValueField,
-        pred: IndexPred<'_>,
+        pred: ActionPred<'_>,
         limit: Option<usize>,
     ) -> Result<RawSymbolData> {
         let vidx = value_field.index();
@@ -570,7 +600,7 @@ struct RecordSink<'a> {
     special: *const [f64; ffi::GMS_SVIDX_MAX],
     vidx: usize,
     dim: usize,
-    pred: IndexPred<'a>,
+    pred: ActionPred<'a>,
     remaining: std::cell::Cell<Option<usize>>,
 }
 
@@ -606,8 +636,10 @@ extern "C" fn store_record_ex(
     unsafe {
         let keys = std::slice::from_raw_parts(indx, sink.dim);
         if let Some(pred) = sink.pred {
-            if !pred(keys) {
-                return 1;
+            match pred(keys) {
+                RecordAction::Accept => {}
+                RecordAction::Skip => return 1,
+                RecordAction::Stop => return 0,
             }
         }
         let data = &mut *sink.data;
