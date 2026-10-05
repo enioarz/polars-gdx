@@ -332,12 +332,19 @@ GDX_INLINE int gdxDataReadRawFastEx( TGXFileRec_t *pgx, int SyNr, ::TDataStoreEx
 /* (polars-gdx extension) */
 GDX_INLINE int gdxDataReadRawRange( TGXFileRec_t *pgx, int SyNr, INT64 StartPos, INT64 EndPos, ::TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos )
 {
-   return reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, StartPos, EndPos, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, NextPos );
+   int64_t np64 {};
+   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, StartPos, EndPos, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, &np64 ) };
+   *NextPos = np64;
+   return res;
 }
 /* (polars-gdx extension) */
 GDX_INLINE int gdxSymbolDataSpan( TGXFileRec_t *pgx, int SyNr, INT64 *StartPos, INT64 *EndPos )
 {
-   return reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxSymbolDataSpan(SyNr, *StartPos, *EndPos );
+   int64_t s64 {}, e64 {};
+   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxSymbolDataSpan(SyNr, s64, e64 ) };
+   *StartPos = s64;
+   *EndPos = e64;
+   return res;
 
 }
 /* (polars-gdx extension) */

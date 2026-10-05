@@ -39,7 +39,7 @@
 #endif
 #include <map>      // for map, operator==, _Rb_tree_const_iterator
 #include <utility>  // for pair
-#include <filesystem>// for file_size
+#include <fstream>  // for ifstream
 
 #if defined( _WIN32 )
 #include <windows.h>
@@ -3867,7 +3867,12 @@ bool TGXFileObj::gdxSymbolDataSpan( int SyNr, int64_t &StartPos, int64_t &EndPos
 {
    if( SyNr < 1 || SyNr > NameList->size() ) return false;
    StartPos = (*NameList->GetObject( SyNr ))->SPosition;
-   int64_t end { std::filesystem::file_size( FFile->GetFileName() ) };
+   int64_t end { -1 };
+   if( std::ifstream f { FFile->GetFileName(), std::ios::binary }; f )
+   {
+      f.seekg( 0, std::ios::end );
+      end = static_cast<int64_t>( f.tellg() );
+   }
    for( int N { 1 }; N <= NameList->size(); N++ )
    {
       const auto *obj { *NameList->GetObject( N ) };
