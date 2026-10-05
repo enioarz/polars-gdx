@@ -849,6 +849,18 @@ fn cached_restart_positions(path: &Path, info: &SymbolInfo) -> Result<Arc<Vec<Re
     }
     let probe = GdxFile::open(path)?;
     let positions = Arc::new(probe.collect_restart_positions(info)?);
+    // The span-seek path assumes records are sorted by dim-0 key, i.e.
+    // restarts are delivered in ascending key0 order. If a file ever
+    // violated that, a key window could silently drop rows while the
+    // worker-boundary validation still passes; refuse the index instead
+    // so callers fall back to the UEL-range/serial paths.
+    if positions.windows(2).any(|w| w[0].key0 > w[1].key0) {
+        return Err(GdxError::Operation {
+            op: "gdxCollectRestartPositions",
+            code: 0,
+            message: "restart index is not sorted by first-dimension key".to_string(),
+        });
+    }
     restart_cache()
         .lock()
         .unwrap()

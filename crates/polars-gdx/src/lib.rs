@@ -15,6 +15,15 @@ fn to_py_err(e: gdx::GdxError) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
 }
 
+/// Cold-cache dim-0 filters only build the restart index (one sequential
+/// pass ≈ a serial read) when the filter's span sits far enough into the
+/// file that the UEL-range path would decode nearly everything anyway:
+/// the filter's highest UEL number over the file's UEL count approximates
+/// how far into the data that span starts. Below this threshold the
+/// UEL-range path is already cheap; above it the index pass pays for
+/// itself by letting every later filtered read seek straight to the span.
+const LATE_SPAN_MIN_KEY_FRACTION: f64 = 0.75;
+
 fn closed_err() -> PyErr {
     PyRuntimeError::new_err("reader is closed")
 }
@@ -290,7 +299,10 @@ impl Reader {
                     // highest UEL over the UEL count approximates how far
                     // into the file the range path would have to decode.
                     let late_span = match file.0.uel_counts() {
-                        Ok((uelcnt, _)) => uelcnt > 0 && f64::from(max) / f64::from(uelcnt) > 0.75,
+                        Ok((uelcnt, _)) => {
+                            uelcnt > 0
+                                && f64::from(max) / f64::from(uelcnt) > LATE_SPAN_MIN_KEY_FRACTION
+                        }
                         Err(_) => false,
                     };
                     if late_span || gdx::restart_positions_cached(&self.path, info) {
