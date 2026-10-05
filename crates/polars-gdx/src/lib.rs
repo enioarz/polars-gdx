@@ -97,6 +97,65 @@ impl Reader {
         Ok(file.0.symbols().iter().map(symbol_tuple).collect())
     }
 
+    /// The unique UEL numbers (1-based) used by one dimension of a symbol,
+    /// in UEL order — the raw-index equivalent of `unique(dim)`, obtained
+    /// with a single bulk C scan that materialises no records.
+    fn domain_elements(&self, name: &str, dim_pos: usize) -> PyResult<Vec<i32>> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(closed_err());
+        };
+        let info = file
+            .0
+            .symbol(name)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("symbol {name:?} not found")))?;
+        file.0.domain_elements(info, dim_pos).map_err(to_py_err)
+    }
+
+    /// Resolve key-filter labels to raw UEL indices (case-insensitive), then
+    /// restrict each dimension's index set to the UELs actually used by that
+    /// dimension of the symbol (bulk C domain scan, no record read). This is
+    /// `resolve_uel_indices` plus a used-UELS intersection: predicates whose
+    /// label exists globally but never in that dimension drop to an empty
+    /// filter — a guaranteed-empty read detected before touching the data.
+    fn resolve_uel_indices_used(
+        &self,
+        filters: Vec<(usize, Vec<String>)>,
+        symbol: &str,
+    ) -> PyResult<Vec<(usize, Vec<i32>)>> {
+        let Some(file) = self.file.as_ref() else {
+            return Err(closed_err());
+        };
+        let info = file
+            .0
+            .symbol(symbol)
+            .ok_or_else(|| PyRuntimeError::new_err(format!("symbol {symbol:?} not found")))?;
+        let as_sets: Vec<(usize, std::collections::HashSet<String>)> = filters
+            .into_iter()
+            .map(|(d, labels)| (d, labels.into_iter().collect()))
+            .collect();
+        let mut resolved = self.resolve_uel_indices(&as_sets)?;
+        for (d, idxs) in resolved.iter_mut() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let used = file.0.domain_elements(info, *d).map_err(to_py_err)?;
+            if used.is_empty() {
+                continue;
+            }
+            let used_set: std::collections::HashSet<i32> = used.into_iter().collect();
+            idxs.retain(|&i| used_set.contains(&i));
+            if idxs.is_empty() {
+                // Label never used in this dimension: no record can match.
+                continue;
+            }
+            if idxs.len() == 1 {
+                // Single-index fast path in the read loop.
+                continue;
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Read one symbol as Arrow IPC (Feather V2) bytes, with optional key
     /// prefiltering applied inside the native read loop.
     ///

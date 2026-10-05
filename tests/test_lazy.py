@@ -1,7 +1,7 @@
 import polars as pl
 import pytest
 
-from polars_gdx import list_symbols, read_gdx, scan_gdx
+from polars_gdx import list_symbols, read_domains, read_gdx, scan_gdx
 
 GDX = "tests/data/trnsport.gdx"
 
@@ -138,4 +138,28 @@ def test_head_after_untranslatable_predicate():
 
 def test_single_label_filter_absent_label_yields_no_rows():
     df = scan_gdx(GDX, symbol="x", key_filter={0: ["atlantis"]}).collect()
+    assert df.height == 0
+
+
+def test_read_domains_matches_unique():
+    df = read_gdx(GDX, symbol="x")
+    domains = read_domains(GDX, symbol="x")
+    assert domains.columns == ["dim_0", "dim_1"]
+    assert set(domains["dim_0"].drop_nulls()) == set(df["dim_0"].unique())
+    assert set(domains["dim_1"].drop_nulls()) == set(df["dim_1"].unique())
+
+
+def test_read_domains_unused_uel_excluded():
+    # "seattle" appears in the UEL table of the whole file; the domain scan
+    # must list only labels actually used by the requested symbol.
+    domains = read_domains(GDX, symbol="d")
+    used = set(read_gdx(GDX, symbol="d")["dim_1"].unique())
+    assert set(domains["dim_1"].drop_nulls()) == used
+
+
+def test_filter_label_unused_in_dimension_yields_no_rows():
+    # "seattle" exists globally, but is never used in dim 1 of symbol "x":
+    # the used-UEL intersection must detect the guaranteed-empty read without
+    # scanning the data.
+    df = scan_gdx(GDX, symbol="x", key_filter={1: ["seattle"]}).collect()
     assert df.height == 0
