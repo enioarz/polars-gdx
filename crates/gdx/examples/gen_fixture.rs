@@ -9,7 +9,12 @@ fn main() {
     let n4 = 6i64;
     let total = (n0 * n1 * n2 * n3 * n4) as usize;
     eprintln!("total records: {total}");
-    let mut w = GdxWriter::create("/tmp/big.gdx", "polars-gdx bench").unwrap();
+    let compr = std::env::var("COMPRESS").is_ok();
+    if compr {
+        std::env::set_var("GDXCOMPRESS", "1");
+    }
+    let out = std::env::var("OUT").unwrap_or_else(|_| "/tmp/big.gdx".into());
+    let mut w = GdxWriter::create(&out, "polars-gdx bench").unwrap();
     let mut records = Vec::with_capacity(total);
     for a in 1..=n0 {
         for b in 1..=n1 {
@@ -43,5 +48,5 @@ fn main() {
     )
     .unwrap();
     w.finish().unwrap();
-    eprintln!("written /tmp/big.gdx");
+    eprintln!("written {out} (compressed={compr})");
 }
