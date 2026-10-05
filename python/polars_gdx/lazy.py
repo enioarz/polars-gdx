@@ -22,6 +22,26 @@ if TYPE_CHECKING:
 
 _VALUE_FIELDS = ("level", "marginal", "lower", "upper", "scale")
 
+#: Smallest symbol (in records) for which ``threads="auto"`` parallelises
+#: the raw read. Below this, open/coordination overhead outweighs the gain.
+_AUTO_THREADS_MIN_RECORDS = 5_000_000
+
+
+def _resolve_threads(threads: int | str | None, n_records: int) -> int | None:
+    """``"auto"`` -> CPU count for large symbols, else the given value."""
+    if threads == "auto":
+        if n_records < _AUTO_THREADS_MIN_RECORDS:
+            return None
+        import os
+
+        try:
+            return len(os.sched_getaffinity(0))
+        except AttributeError:  # pragma: no cover - non-Linux
+            return os.cpu_count()
+    if threads == 0:
+        return None
+    return threads
+
 
 def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
     """List the labels actually used per index dimension of a symbol.
@@ -92,7 +112,7 @@ def read_gdx(
     symbol: str,
     value_field: str | None = None,
     key_filter: dict[int, Sequence[str]] | None = None,
-    threads: int | None = None,
+    threads: int | str | None = None,
 ) -> pl.DataFrame:
     """Eagerly read one symbol of a GDX file into a DataFrame.
 
@@ -115,7 +135,7 @@ def scan_gdx(
     symbol: str,
     value_field: str | None = None,
     key_filter: dict[int, Sequence[str]] | None = None,
-    threads: int | None = None,
+    threads: int | str | None = None,
 ) -> pl.LazyFrame:
     """Lazily scan one symbol of a GDX file.
 
@@ -139,7 +159,10 @@ def scan_gdx(
         Number of worker threads for the raw read. When > 1 and no row
         limit applies, the file is opened once per worker and each scans a
         contiguous range of the first key dimension, so record order matches
-        the serial read exactly. ``None``/0/1 means serial.
+        the serial read exactly. ``"auto"`` (recommended for large symbols)
+        parallelises reads of symbols with at least
+        ``_AUTO_THREADS_MIN_RECORDS`` records using all available cores;
+        smaller symbols stay serial. ``None``/0/1 means serial.
 
     Notes
     -----
@@ -168,6 +191,7 @@ def scan_gdx(
     _, type_str, dim, _n, domains, _text = info[symbol]
     if value_field is not None and value_field not in _VALUE_FIELDS:
         raise ValueError(f"value_field must be one of {_VALUE_FIELDS}, got {value_field!r}")
+    threads = _resolve_threads(threads, _n)
     value_name = "value" if type_str in ("Set", "Parameter", "Alias") else (value_field or "level")
     # Key column names must never collide with the value column (a domain
     # set literally named ``value`` would otherwise overwrite it in the
