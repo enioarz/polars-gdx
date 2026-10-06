@@ -31,7 +31,7 @@ tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
   Arrow dictionary columns map to `Categorical` when no schema is given — so key
   columns MUST be declared `pl.Enum(uel_table)` AND passed to `pl.from_arrow` too,
   otherwise every collect raises SchemaError (incoming Categorical != target String).
-  `is_pure=True` is passed when supported (Polars ≥ 1.44) so repeated identical
+  `is_pure=True` is passed so repeated identical
   scans de-duplicate within one plan.
 
 - **Domain scan**: `Reader.domain_elements(symbol, dim_pos)` (→ `gdxGetDomainElements`,
