@@ -33,6 +33,20 @@ tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
 - **Prefiltering** happens on raw i32 UEL indices inside the C read loop. Filter labels are
   resolved to UEL indices once (`resolve_uel_indices` + `uel_index()` reverse map). An empty
   resolved index set correctly means "zero rows" — do not drop empty filters.
+- **Positional parallel reads (uncompressed AND block-compressed)**: the C layer
+  (gxfile.cpp: gdxDataReadRawRange / gdxCollectRestartPositions) works on *checkpoints*.
+  For uncompressed data a checkpoint is a plain physical file position; for block-compressed
+  symbols (32 KiB independent zlib blocks, gmsstrm.cpp FillBuffer) it is the pair
+  (physical start of the block holding the record, offset within the decompressed block),
+  so workers resume mid-block exactly. TBufferedFileStream tracks FBlockStart in
+  FillBuffer and provides GetCheckpoint*/SetCheckpoint; the compressed branch is
+  FBlockStart = TXFileStream::GetPosition() BEFORE reading the 3-byte TCompressHeader
+  (beware: after the read it is already past the header). PrepareSymbolReadAt enables
+  compression per symbol (FFile->SetCompression(CurSyPtr->SIsCompressed)) and seeks
+  via SetCheckpoint. The restart-collection callback delivers the offset in Vals[0]
+  as a double (Vals is unused for uncompressed symbols). The coordinator validates
+  total record counts and exact boundary handoff and falls back to a verified serial
+  read on any mismatch.
 - **Predicate pushdown**: the Python IO-source callback receives the Polars predicate as a
   deserialized `pl.Expr` (NOT bytes — plugins.py deserializes before calling). Conjunctions of
   `pl.col(key) == "literal"` are folded into the native prefilter by inspecting the plan

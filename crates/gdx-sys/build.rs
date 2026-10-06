@@ -106,6 +106,14 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
+        src.join("src/gdlib/gmsstrm.cpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        src.join("src/gdlib/gmsstrm.hpp").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
         src.join("generated/gdxcwrap.h").display()
     );
 }

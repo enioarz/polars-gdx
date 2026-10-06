@@ -89,6 +89,7 @@
 #define C__gdxDataReadRawRange c__gdxdatareadrawrange
 #define C__gdxSymbolDataSpan c__gdxsymboldataspan
 #define C__gdxCollectRestartPositions c__gdxcollectrestartpositions
+#define C__gdxSymbolIsCompressed c__gdxsymboliscompressed
 #define C__gdxDataReadRawFastFilt c__gdxdatareadrawfastfilt
 #define C__gdxDataReadRawStart c__gdxdatareadrawstart
 #define C__gdxDataReadSlice c__gdxdatareadslice
@@ -2184,15 +2185,20 @@ GDX_API void GDX_CALLCONV C__gdxMapAcronymsToNaNSet(TGXFileRec_t *TGXFile, int x
 }
 
 /* (polars-gdx extension) checkpointed record-range raw read */
-GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, long long EndPos, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos);
+GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, unsigned StartOffset, long long EndPos, unsigned EndOffset, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos, unsigned *NextOffset);
+GDX_API int GDX_CALLCONV C__gdxSymbolIsCompressed(TGXFileRec_t *TGXFile, int SyNr);
 /* (polars-gdx extension) */
 GDX_API int GDX_CALLCONV C__gdxSymbolDataSpan(TGXFileRec_t *TGXFile, int SyNr, long long *StartPos, long long *EndPos);
 GDX_API int GDX_CALLCONV C__gdxCollectRestartPositions(TGXFileRec_t *TGXFile, int SyNr, TDataStoreExProc_t DP, void *Uptr);
-GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, long long EndPos, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos)
+GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, unsigned StartOffset, long long EndPos, unsigned EndOffset, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos, unsigned *NextOffset)
 {
-  INT64 np;
-  int res = gdxDataReadRawRange(TGXFile, SyNr, (INT64) StartPos, (INT64) EndPos, DP, NrRecs, Uptr, &np);
-  *NextPos = np;
+  int res = gdxDataReadRawRange(TGXFile, SyNr, (INT64) StartPos, StartOffset, (INT64) EndPos, EndOffset, DP, NrRecs, Uptr, (INT64 *) NextPos, NextOffset);
+  return res;
+}
+/* (polars-gdx extension) */
+GDX_API int GDX_CALLCONV C__gdxSymbolIsCompressed(TGXFileRec_t *TGXFile, int SyNr)
+{
+  int res = gdxSymbolIsCompressed(TGXFile, SyNr);
   return res;
 }
 GDX_API int GDX_CALLCONV C__gdxSymbolDataSpan(TGXFileRec_t *TGXFile, int SyNr, long long *StartPos, long long *EndPos)

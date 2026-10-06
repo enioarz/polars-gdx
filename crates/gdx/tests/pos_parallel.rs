@@ -53,12 +53,10 @@ fn pos_parallel_repeats_are_deterministic() {
 
 const COMPRESSED_FIXTURE: &str = "/tmp/big_compressed.gdx";
 
-/// Block-compressed symbols cannot use positional checkpointing (logical and
-/// physical positions diverge); the coordinator must silently fall back to
-/// a serial read instead of erroring (gdxCollectRestartPositions returns
-/// failure without an error code for them).
+/// Block-compressed symbols use (block start, offset-in-block) checkpoints:
+/// the positional parallel read must deliver exactly the serial data.
 #[test]
-fn pos_parallel_falls_back_for_compressed_data() {
+fn pos_parallel_matches_serial_compressed() {
     if !std::path::Path::new(COMPRESSED_FIXTURE).exists() {
         eprintln!("skipping: {COMPRESSED_FIXTURE} not found (generate with COMPRESS=1 OUT={COMPRESSED_FIXTURE} cargo run --release -p gdx --example gen_fixture)");
         return;
@@ -67,11 +65,14 @@ fn pos_parallel_falls_back_for_compressed_data() {
     let info = file.symbol("big").expect("symbol big");
     let vf = ValueField::Level;
     let serial = file.read_symbol_raw(info, vf, None, None).unwrap();
-    let builder = || accept_all_builder();
-    let par = read_symbol_raw_parallel_pos(COMPRESSED_FIXTURE, info, vf, &builder, 8).unwrap();
-    assert_eq!(par.values.len(), serial.values.len());
-    for d in 0..info.dim {
-        assert_eq!(par.keys[d], serial.keys[d]);
+    for threads in [2usize, 3, 4, 8] {
+        let builder = || accept_all_builder();
+        let par =
+            read_symbol_raw_parallel_pos(COMPRESSED_FIXTURE, info, vf, &builder, threads).unwrap();
+        assert_eq!(par.values.len(), serial.values.len(), "threads={threads}");
+        for d in 0..info.dim {
+            assert_eq!(par.keys[d], serial.keys[d], "dim {d} threads={threads}");
+        }
     }
 }
 
@@ -149,25 +150,36 @@ fn span_parallel_matches_serial_filtered() {
     }
 }
 
-/// Block-compressed symbols cannot build a restart index; the span read
-/// must report that (Err) so callers can fall back to the UEL-range path.
+/// The span-seek read works on block-compressed symbols (checkpoint pairs
+/// resume mid-block exactly) and must deliver exactly the in-span records.
 #[test]
-fn span_parallel_unavailable_for_compressed_data() {
+fn span_parallel_matches_serial_filtered_compressed() {
     if !std::path::Path::new(COMPRESSED_FIXTURE).exists() {
         eprintln!("skipping: {COMPRESSED_FIXTURE} not found (generate with COMPRESS=1 OUT={COMPRESSED_FIXTURE} cargo run --release -p gdx --example gen_fixture)");
         return;
     }
     let file = GdxFile::open(COMPRESSED_FIXTURE).unwrap();
     let info = file.symbol("big").expect("symbol big");
-    let builder = || accept_all_builder();
-    let res = read_symbol_raw_span_parallel(
-        COMPRESSED_FIXTURE,
-        info,
-        ValueField::Level,
-        &builder,
-        4,
-        1,
-        1,
-    );
-    assert!(res.is_err());
+    let vf = ValueField::Level;
+    let serial = file.read_symbol_raw(info, vf, None, None).unwrap();
+    let (lo, hi) = (3i32, 3i32);
+    let expected: Vec<usize> = serial.keys[0]
+        .iter()
+        .enumerate()
+        .filter(|(_, &k)| (lo..=hi).contains(&(k as i32 + 1)))
+        .map(|(i, _)| i)
+        .collect();
+    for threads in [1usize, 2, 4] {
+        let builder = || span_pred_builder(lo, hi);
+        let span =
+            read_symbol_raw_span_parallel(COMPRESSED_FIXTURE, info, vf, &builder, threads, lo, hi)
+                .unwrap();
+        assert_eq!(
+            span.values.len(),
+            expected.len(),
+            "threads={threads}: row count"
+        );
+        let want: Vec<f64> = expected.iter().map(|&i| serial.values[i]).collect();
+        assert_eq!(span.values, want, "threads={threads}");
+    }
 }

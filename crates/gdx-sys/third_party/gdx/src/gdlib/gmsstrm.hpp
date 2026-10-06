@@ -249,6 +249,12 @@ class TBufferedFileStream : public TXFileStream
 
    bool FCompress, FCanCompress;
 
+   // (polars-gdx extension) physical position of the first byte of the
+   // compressed block currently held in the buffer (when reading with
+   // compression enabled); needed to express an exact resume point as a
+   // (physical block start, offset-in-block) checkpoint pair.
+   int64_t FBlockStart {};
+
    bool FillBuffer();
 
 protected:
@@ -267,6 +273,15 @@ public:
    [[nodiscard]] bool GetCanCompress() const;
 
    int64_t GetPosition() override;
+
+   // (polars-gdx extension) exact resume points for compressed streams.
+   // A checkpoint names the position of the record's first byte as
+   // (physical start of the block holding it, offset within the
+   // decompressed block data). Resuming there reproduces the byte stream
+   // exactly, so records can be decoded without any preceding state.
+   [[nodiscard]] int64_t GetCheckpointBlock() const { return FBlockStart; }
+   [[nodiscard]] uint32_t GetCheckpointOffset() const { return NrRead; }
+   void SetCheckpoint( int64_t BlockStart, uint32_t OffsetInBlock );
 
    void SetPosition( int64_t p ) override;
 };

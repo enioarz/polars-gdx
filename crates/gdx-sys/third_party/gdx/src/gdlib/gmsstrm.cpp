@@ -593,6 +593,7 @@ std::string TXFileStream::GetFileName() const
 
 bool TBufferedFileStream::FillBuffer()
 {
+   FBlockStart = 0;
    if( !FCompress ) NrLoaded = TXFileStream::Read( BufPtr.data(), BufSize );
    else if( !FCanCompress )
    {
@@ -601,9 +602,13 @@ bool TBufferedFileStream::FillBuffer()
    }
    else
    {
+      FBlockStart = TXFileStream::GetPosition();// header starts here
       if( const auto RLen = ui16(TXFileStream::Read( &CBufPtr->cxHeader, sizeof( TCompressHeader ) ));
          RLen < sizeof( TCompressHeader ) )
+      {
          NrLoaded = 0;
+         FBlockStart = 0;
+      }
       else
       {
          const auto WLen = ui16( ( CBufPtr->cxHeader.cxB1 << 8 ) + CBufPtr->cxHeader.cxB2 );
@@ -619,6 +624,31 @@ bool TBufferedFileStream::FillBuffer()
    }
    NrRead = NrWritten = 0;
    return NrLoaded > 0;
+}
+
+// (polars-gdx extension)
+void TBufferedFileStream::SetCheckpoint( int64_t BlockStart, uint32_t OffsetInBlock )
+{
+   if( NrWritten > 0 ) FlushBuffer();
+   NrLoaded = NrRead = 0;
+   FBlockStart = 0;
+   if( !FCompress )
+   {
+      // uncompressed data: a checkpoint is just a physical position
+      TXFileStream::SetPosition( BlockStart );
+      return;
+   }
+   if( OffsetInBlock == 0 )
+   {
+      // position the stream just before the block header; the next
+      // FillBuffer() loads the whole block from its start
+      TXFileStream::SetPosition( BlockStart );
+      return;
+   }
+   // mid-block resume: load the block, then advance within it
+   TXFileStream::SetPosition( BlockStart );
+   if( FillBuffer() && OffsetInBlock <= NrLoaded )
+      NrRead = OffsetInBlock;
 }
 
 int64_t TBufferedFileStream::GetPosition()
@@ -781,6 +811,7 @@ void TBufferedFileStream::SetCompression( bool V )
    if( ( FCompress || V ) && NrWritten > 0 ) FlushBuffer();
    if( FCompress != V )
       NrLoaded = NrRead = 0;
+   FBlockStart = 0;
    FCompress = V;
 }
 

@@ -345,20 +345,23 @@ impl GdxFile {
     }
 
     /// (parallel extension) Checkpointed positional read on a
-    /// worker-private handle: reads records starting at the physical file
-    /// position `start_pos` (0 = start of the symbol's data) until the
-    /// stream position reaches `end_pos` (exclusive; `i64::MAX` = end of
-    /// data), delivering them through `pred`/`limit` as usual. Skips the
-    /// process-global GDX lock; the caller guarantees single-threaded use
-    /// of this handle. A nonzero `start_pos` must be a restart point (a
-    /// record boundary whose next record has first-changed dimension 0);
-    /// the coordinator guarantees this by construction.
+    /// worker-private handle: reads records starting at the checkpoint
+    /// (`start_pos`, `start_off`) (0 = start of the symbol's data) until the
+    /// stream reaches the checkpoint (`end_pos`, `end_off`) (exclusive;
+    /// `i64::MAX` = end of data), delivering them through `pred`/`limit` as
+    /// usual. For uncompressed data the offsets are ignored; for
+    /// block-compressed data they name a compressed block start and the
+    /// offset within its decompressed data. Skips the process-global GDX
+    /// lock; the caller guarantees single-threaded use of this handle. A
+    /// nonzero `start_pos` must be a restart checkpoint (a record boundary
+    /// whose record has first-changed dimension 1); the coordinator
+    /// guarantees this by construction.
     ///
-    /// Returns the data read, the position just past the last record
+    /// Returns the data read, the checkpoint just past the last record
     /// consumed (0 at end of data) and the number of records the C layer
     /// offered to the sink (pre-predicate; used by the coordinator to
     /// validate the positional plan).
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub(crate) fn read_symbol_raw_pos_unlocked(
         &self,
         info: &SymbolInfo,
@@ -366,8 +369,10 @@ impl GdxFile {
         pred: ActionPred<'_>,
         limit: Option<usize>,
         start_pos: i64,
+        start_off: u32,
         end_pos: i64,
-    ) -> Result<(RawSymbolData, i64, usize)> {
+        end_off: u32,
+    ) -> Result<(RawSymbolData, RestartPoint, usize)> {
         let vidx = value_field.index();
         let mut data = RawSymbolData::with_capacity(info.dim, 0);
         let sink = RecordSink {
@@ -381,22 +386,41 @@ impl GdxFile {
         };
         let mut cb_nrecs = 0;
         let mut next_pos = 0i64;
+        let mut next_off = 0u32;
         let ok = unsafe {
             ffi::c__gdxdatareadrawrange(
                 self.obj,
                 info.number as i32,
                 start_pos,
+                start_off,
                 end_pos,
+                end_off,
                 store_record_ex,
                 &mut cb_nrecs,
                 &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
                 &mut next_pos,
+                &mut next_off,
             )
         };
         if ok == 0 {
             return Err(unsafe { op_error(self.obj, "gdxDataReadRawRange") });
         }
-        Ok((data, next_pos, sink.seen.get()))
+        Ok((
+            data,
+            RestartPoint {
+                pos: next_pos,
+                off: next_off,
+                key0: 0,
+            },
+            sink.seen.get(),
+        ))
+    }
+
+    /// (parallel extension) Whether the symbol's data section is
+    /// block-compressed.
+    pub fn symbol_is_compressed(&self, info: &SymbolInfo) -> bool {
+        let _guard = crate::lock::lock();
+        unsafe { ffi::c__gdxsymboliscompressed(self.obj, info.number as i32) != 0 }
     }
 
     /// (parallel extension) Physical byte span [start, end) of symbol
@@ -422,7 +446,7 @@ impl GdxFile {
     pub fn collect_restart_positions(&self, info: &SymbolInfo) -> Result<Vec<RestartPoint>> {
         extern "C" fn collect_dp(
             indx: *const i32,
-            _vals: *const f64,
+            vals: *const f64,
             _afdim: i32,
             uptr: *mut std::ffi::c_void,
         ) -> i32 {
@@ -430,8 +454,17 @@ impl GdxFile {
             let packed = unsafe { std::slice::from_raw_parts(indx, 3) };
             let lo = packed[0] as u32 as u64;
             let hi = packed[1] as u32 as u64;
+            let off = if vals.is_null() {
+                0u32
+            } else {
+                // The C layer delivers the checkpoint offset within the
+                // decompressed block as a double; only nonzero for
+                // block-compressed symbols.
+                unsafe { *vals as u32 }
+            };
             out.push(RestartPoint {
                 pos: ((hi << 32) | lo) as i64,
+                off,
                 key0: packed[2],
             });
             1
@@ -822,6 +855,9 @@ type RestartCacheKey = (PathBuf, usize);
 #[derive(Debug, Clone, Copy)]
 pub struct RestartPoint {
     pub pos: i64,
+    /// Offset within the decompressed block for block-compressed symbols;
+    /// 0 for uncompressed data (a checkpoint is just a physical position).
+    pub off: u32,
     pub key0: i32,
 }
 
@@ -869,22 +905,26 @@ fn cached_restart_positions(path: &Path, info: &SymbolInfo) -> Result<Arc<Vec<Re
 }
 
 /// Positional parallel read of a symbol across `threads` independent file
-/// handles (uncompressed data only).
+/// handles (uncompressed and block-compressed data).
 ///
 /// Unlike [`GdxFile::read_symbol_raw_parallel`], which splits by
 /// first-dimension UEL ranges (so the last worker still decodes the whole
 /// stream up to its range), this splits by *file position*: a cached
-/// restart-position index (one cheap sequential pass, built once per
+/// restart checkpoint index (one sequential pass, built once per
 /// file+symbol) provides exact record boundaries, and each worker decodes
-/// only its own byte range starting in-frame. This removes the serial
-/// wall-time floor for filters on non-leading dimensions, where every
-/// record must be decoded.
+/// only its own byte range starting in-frame. For block-compressed symbols
+/// a checkpoint is the pair (physical start of the compressed block holding
+/// the record, offset within the decompressed block), so workers resume
+/// mid-block exactly; uncompressed symbols keep plain physical positions.
+/// This removes the serial wall-time floor for filters on non-leading
+/// dimensions, where every record must be decoded, and for compressed
+/// files, which previously could not be positionally split at all.
 ///
 /// Correctness contract: the sum of delivered records must equal
 /// `info.records` exactly; on any mismatch the function falls back to a
-/// serial read. Adjacent ranges meet exactly at restart-record boundaries
-/// (each range reports the boundary; the next range starts there), so
-/// every record is delivered by exactly one worker.
+/// serial read. Adjacent ranges meet exactly at restart checkpoints (each
+/// range reports the boundary; the next range starts there), so every
+/// record is delivered by exactly one worker.
 #[allow(clippy::type_complexity)]
 pub fn read_symbol_raw_parallel_pos(
     path: impl AsRef<Path>,
@@ -894,7 +934,8 @@ pub fn read_symbol_raw_parallel_pos(
     threads: usize,
 ) -> Result<RawSymbolData> {
     let path = path.as_ref().to_path_buf();
-    // Probe: symbol data byte span [data_start, data_end).
+    // Probe: symbol data byte span [data_start, data_end) (physical; for
+    // compressed symbols the span of the compressed blocks).
     let (data_start, data_end) = {
         let probe = GdxFile::open(&path)?;
         probe.symbol_data_span(info)?
@@ -910,15 +951,15 @@ pub fn read_symbol_raw_parallel_pos(
     // Plan contiguous byte ranges over the data span; workers sync to the
     // first restart record at/after their planned start, so actual work is
     // roughly balanced for many-group symbols.
-    // Exact plan: one cheap sequential decode pass collects the physical
-    // position of every restart record (a record whose decode needs no
-    // delta state from the previous one). Ranges are split at those
-    // positions — plus the data span itself, which bounds the tail — so
-    // every worker starts in-frame and no misframed resync can occur.
+    // Exact plan: one cheap sequential decode pass collects the checkpoint
+    // of every restart record (a record whose decode needs no delta state
+    // from the previous one). Ranges are split at those checkpoints — plus
+    // the data span itself, which bounds the tail — so every worker starts
+    // in-frame and no misframed resync can occur.
     // Planning can legitimately fail for symbols the positional path does
-    // not support (scalars, block-compressed data): the C layer reports
-    // those as a failed gdxCollectRestartPositions without an error code.
-    // Such symbols read fine serially, so fall back instead of erroring.
+    // not support (scalars): the C layer reports those as a failed
+    // gdxCollectRestartPositions without an error code. Such symbols read
+    // fine serially, so fall back instead of erroring.
     let restarts = match cached_restart_positions(&path, info) {
         Ok(r) => r,
         Err(_) => {
@@ -934,29 +975,46 @@ pub fn read_symbol_raw_parallel_pos(
         let pred_ref: ActionPred<'_> = Some(&*pred);
         return file.read_symbol_raw(info, value_field, pred_ref, None);
     }
-    // Choose up to `threads` split points evenly over the restart index,
-    // weighting by byte position so work is balanced by decode volume.
+    // End-of-data sentinel checkpoint: strictly greater than any checkpoint
+    // inside the data span, so the last worker always decodes to the end.
+    let data_end_cp = RestartPoint {
+        pos: data_end,
+        off: u32::MAX,
+        key0: 0,
+    };
+    // Choose up to `threads` split checkpoints weighted by byte position so
+    // work is balanced by decode volume (physical bytes approximate the
+    // decode cost well for both compressed and uncompressed data).
     let per = span / threads as i64;
-    let mut starts: Vec<i64> = Vec::with_capacity(threads);
-    starts.push(0);
+    let mut starts: Vec<RestartPoint> = Vec::with_capacity(threads);
+    starts.push(RestartPoint {
+        pos: 0,
+        off: 0,
+        key0: 0,
+    });
     let mut target = per;
-    let mut it = restarts.iter().skip(1).map(|r| r.pos).peekable();
+    let mut it = restarts.iter().skip(1).copied().peekable();
     while starts.len() < threads {
-        // advance the restart cursor to the position nearest `target`
-        while let Some(&pos) = it.peek() {
-            if pos < target {
+        // advance the restart cursor to the checkpoint nearest `target`
+        while let Some(&cp) = it.peek() {
+            if cp.pos < target {
                 it.next();
             } else {
                 break;
             }
         }
-        let Some(&pos) = it.peek() else { break };
-        starts.push(pos);
+        let Some(&cp) = it.peek() else { break };
+        starts.push(cp);
         target += per;
         it.next();
     }
-    let ends: Vec<i64> = starts.iter().skip(1).copied().chain([data_end]).collect();
-    type PartResult = Result<(RawSymbolData, i64, usize)>;
+    let ends: Vec<RestartPoint> = starts
+        .iter()
+        .skip(1)
+        .copied()
+        .chain([data_end_cp])
+        .collect();
+    type PartResult = Result<(RawSymbolData, RestartPoint, usize)>;
     let results: std::sync::Mutex<Vec<(usize, PartResult)>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for (t, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -966,7 +1024,16 @@ pub fn read_symbol_raw_parallel_pos(
                 let res = GdxFile::open(&path).and_then(|file| {
                     let pred = pred_builder();
                     let pred_ref: ActionPred<'_> = Some(&*pred);
-                    file.read_symbol_raw_pos_unlocked(info, value_field, pred_ref, None, start, end)
+                    file.read_symbol_raw_pos_unlocked(
+                        info,
+                        value_field,
+                        pred_ref,
+                        None,
+                        start.pos,
+                        start.off,
+                        end.pos,
+                        end.off,
+                    )
                 });
                 if let Ok(mut guard) = results.lock() {
                     guard.push((t, res));
@@ -1008,25 +1075,25 @@ pub fn read_symbol_raw_parallel_pos(
 }
 
 /// Span-seek parallel read for first-dimension key filters (uncompressed
-/// data only).
+/// and block-compressed data).
 ///
 /// `key_lo`/`key_hi` delimit the inclusive range of dim-0 UEL numbers the
 /// caller's filter may accept. Records are stored sorted by dim-0 key and
 /// every dim-0 group starts with a restart record, so all matching records
-/// live in one contiguous byte window whose exact boundaries come from the
-/// cached restart index (which also records each group's dim-0 key).
-/// Workers seek straight into that window and decode only its bytes,
-/// split at restart positions across `threads` independent handles.
-/// Unlike the UEL-range split, no worker decodes the prefix before the
-/// filter's span, so late spans cost the same as early ones.
+/// live in one contiguous window whose exact boundary checkpoints come from
+/// the cached restart index (which also records each group's dim-0 key).
+/// Workers seek straight into that window and decode only its bytes, split
+/// at restart checkpoints across `threads` independent handles. Unlike the
+/// UEL-range split, no worker decodes the prefix before the filter's span,
+/// so late spans cost the same as early ones — including on block-compressed
+/// files, where the prefix would otherwise have to be decompressed too.
 ///
-/// Correctness contract: each worker must stop exactly at the next
-/// worker's start position (and the last at the window end), proving the
-/// ranges met at restart boundaries and every record in the window was
-/// delivered by exactly one worker; on mismatch the function falls back
-/// to a serial read. Returns Err when the restart index cannot be built
-/// (block-compressed data, scalars) so the caller can fall back to the
-/// UEL-range path.
+/// Correctness contract: each worker must stop exactly at the next worker's
+/// start checkpoint (and the last at the window end), proving the ranges
+/// met at restart boundaries and every record in the window was delivered
+/// by exactly one worker; on mismatch the function falls back to a serial
+/// read. Returns Err when the restart index cannot be built (scalars) so
+/// the caller can fall back to the UEL-range path.
 #[allow(clippy::type_complexity)]
 pub fn read_symbol_raw_span_parallel(
     path: impl AsRef<Path>,
@@ -1047,55 +1114,61 @@ pub fn read_symbol_raw_span_parallel(
         let probe = GdxFile::open(&path)?;
         probe.symbol_data_span(info)?
     };
-    // Byte window covering every record with dim-0 key in [key_lo, key_hi]:
-    // from the first restart whose key reaches key_lo up to (exclusive)
-    // the first restart whose key exceeds key_hi, or the end of the data.
+    // Window covering every record with dim-0 key in [key_lo, key_hi]:
+    // from the first restart whose key reaches key_lo up to (exclusive) the
+    // first restart whose key exceeds key_hi, or the end of the data.
     // When key_lo falls between two group keys the window starts at the
     // later group; the predicate discards nothing needed either way.
     let Some(start_idx) = restarts.iter().position(|r| r.key0 >= key_lo) else {
         // No dim-0 group reaches the filter's lowest key: no rows.
         return Ok(empty());
     };
-    let window_start = restarts[start_idx].pos;
+    let window_start = restarts[start_idx];
     let window_end = restarts[start_idx..]
         .iter()
         .position(|r| r.key0 > key_hi)
-        .map(|i| restarts[start_idx + i].pos)
-        .unwrap_or(data_end);
-    if window_end <= window_start {
+        .map(|i| restarts[start_idx + i])
+        // End-of-window sentinel: strictly greater than any checkpoint
+        // inside the window, so the last worker decodes to the window end.
+        .unwrap_or(RestartPoint {
+            pos: data_end,
+            off: u32::MAX,
+            key0: 0,
+        });
+    if window_end.pos <= window_start.pos {
         return Ok(empty());
     }
-    // Plan up to `threads` split points at restart positions strictly inside
+    // Plan up to `threads` split checkpoints at restarts strictly inside
     // the window, weighted by byte distance (same policy as the positional
     // path, restricted to the window).
     let threads = threads.max(1).min(info.records);
-    let span = window_end - window_start;
+    let span = window_end.pos - window_start.pos;
     let per = span / threads as i64;
-    let mut starts: Vec<i64> = Vec::with_capacity(threads);
+    let mut starts: Vec<RestartPoint> = Vec::with_capacity(threads);
     starts.push(window_start);
     if per > 0 {
-        let mut target = window_start + per;
+        let mut target = window_start.pos + per;
         let mut it = restarts[start_idx + 1..]
             .iter()
-            .map(|r| r.pos)
-            .take_while(|&pos| pos < window_end)
+            .copied()
+            .take_while(|cp| cp.pos < window_end.pos)
             .peekable();
         while starts.len() < threads {
-            while let Some(&pos) = it.peek() {
-                if pos < target {
+            while let Some(&cp) = it.peek() {
+                if cp.pos < target {
                     it.next();
                 } else {
                     break;
                 }
             }
-            let Some(&pos) = it.peek() else { break };
-            starts.push(pos);
+            let Some(&cp) = it.peek() else { break };
+            starts.push(cp);
             target += per;
             it.next();
         }
     }
-    let ends: Vec<i64> = starts.iter().skip(1).copied().chain([window_end]).collect();
-    type PartResult = Result<(RawSymbolData, i64, usize)>;
+    let ends: Vec<RestartPoint> = starts.iter().skip(1).copied().chain([window_end]).collect();
+    type PartResult = Result<(RawSymbolData, RestartPoint, usize)>;
     let results: std::sync::Mutex<Vec<(usize, PartResult)>> = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for (t, (&start, &end)) in starts.iter().zip(ends.iter()).enumerate() {
@@ -1105,7 +1178,16 @@ pub fn read_symbol_raw_span_parallel(
                 let res = GdxFile::open(&path).and_then(|file| {
                     let pred = pred_builder();
                     let pred_ref: ActionPred<'_> = Some(&*pred);
-                    file.read_symbol_raw_pos_unlocked(info, value_field, pred_ref, None, start, end)
+                    file.read_symbol_raw_pos_unlocked(
+                        info,
+                        value_field,
+                        pred_ref,
+                        None,
+                        start.pos,
+                        start.off,
+                        end.pos,
+                        end.off,
+                    )
                 });
                 if let Ok(mut guard) = results.lock() {
                     guard.push((t, res));
@@ -1116,15 +1198,17 @@ pub fn read_symbol_raw_span_parallel(
     let mut parts = results.into_inner().unwrap();
     parts.sort_by_key(|(t, _)| *t);
     // Validate the plan: each worker must report that it stopped exactly at
-    // the next worker's start (the last at the window end, or 0 when the
-    // window runs to the end of the data). Any mismatch means the restart
-    // index cannot be trusted for this file; fall back to a serial read.
+    // the next worker's start checkpoint (the last at the window end, or 0
+    // when the window runs to the end of the data). Any mismatch means the
+    // restart index cannot be trusted for this file; fall back to a serial
+    // read.
     let mut all_ok = true;
     for (i, (_, res)) in parts.iter().enumerate() {
         match res {
-            Ok((_, next_pos, _)) => {
+            Ok((_, next, _)) => {
                 let expected = ends[i];
-                if *next_pos != expected && !(*next_pos == 0 && expected == data_end) {
+                let at_data_end = next.pos == 0 && expected.pos == data_end;
+                if (next.pos != expected.pos || next.off != expected.off) && !at_data_end {
                     all_ok = false;
                     break;
                 }
