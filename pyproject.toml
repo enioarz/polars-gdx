@@ -13,7 +13,7 @@ license-files = [
   "crates/gdx-sys/third_party/gdx/LICENSE",
   "crates/gdx-sys/third_party/gdx/zlib/LICENSE",
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [{ name = "enioarz" }]
 keywords = ["polars", "gams", "gdx", "energy-modeling", "optimization"]
 classifiers = [
@@ -23,7 +23,6 @@ classifiers = [
   "Operating System :: Microsoft :: Windows",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
