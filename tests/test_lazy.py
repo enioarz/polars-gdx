@@ -1,7 +1,7 @@
 import polars as pl
 import pytest
 
-from polars_gdx import list_symbols, read_domains, read_gdx, scan_gdx
+from polars_gdx import Reader, list_symbols, read_domains, read_gdx, scan_gdx
 
 GDX = "tests/data/trnsport.gdx"
 
@@ -332,3 +332,44 @@ def test_compressed_filtered_read_parity():
     parallel2 = read_gdx(COMPRESSED, symbol="big", key_filter={1: ["j123"]}, threads=3)
     assert serial2.equals(parallel2)
     assert parallel2.height == 40
+
+
+# ---------------------------------------------------------------------------
+# Polars 2.0: key columns are dictionary-encoded Categoricals
+# ---------------------------------------------------------------------------
+
+def test_key_columns_are_enum_over_uel_table():
+    df = read_gdx(GDX, symbol="x")
+    uels = Reader(GDX).uel_table()
+    for col in ("dim_0", "dim_1"):
+        assert isinstance(df.schema[col], pl.Enum)
+        assert list(df.schema[col].categories) == uels
+
+
+def test_is_in_case_mismatch_matches_nothing():
+    """Exact matching: a case-mismatched label selects no rows."""
+    lf = scan_gdx(GDX, symbol="x")
+    assert lf.filter(pl.col("dim_1").is_in(["chicago"])).collect().height == 2
+    lf = scan_gdx(GDX, symbol="x")
+    assert lf.filter(pl.col("dim_1").is_in(["CHICAGO"])).collect().height == 0
+
+
+def test_scan_declared_schema_matches_batches():
+    lf = scan_gdx(GDX, symbol="x")
+    df = lf.collect()
+    assert lf.collect_schema() == df.schema
+
+
+def test_enum_supports_string_ops_after_cast():
+    df = read_gdx(GDX, symbol="x")
+    upper = df.select(pl.col("dim_0").cast(pl.String).str.to_uppercase())
+    assert upper["dim_0"].to_list() == [l.upper() for l in df["dim_0"].to_list()]
+
+
+def test_enum_join_group_by_unique():
+    df = read_gdx(GDX, symbol="x")
+    keys = df.select("dim_0", "dim_1").unique()
+    joined = df.join(keys, on=["dim_0", "dim_1"])
+    assert joined.height == df.height
+    grouped = df.group_by("dim_0").len()
+    assert grouped.height == df["dim_0"].n_unique()

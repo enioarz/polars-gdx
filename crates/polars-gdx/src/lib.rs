@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
@@ -123,7 +123,7 @@ impl Reader {
         file.0.domain_elements(info, dim_pos).map_err(to_py_err)
     }
 
-    /// Resolve key-filter labels to raw UEL indices (case-insensitive), then
+    /// Resolve key-filter labels to raw UEL indices (exact match), then
     /// restrict each dimension's index set to the UELs actually used by that
     /// dimension of the symbol (bulk C domain scan, no record read). This is
     /// `resolve_uel_indices` plus a used-UELS intersection: predicates whose
@@ -176,7 +176,7 @@ impl Reader {
     ///   Variables/Equations (default `level`).
     /// - `key_filter`: list of `(dim_index, allowed_labels)` pairs; records
     ///   with a key outside the allowed set are skipped before materialising.
-    ///   Labels are matched case-insensitively (GAMS semantics).
+    ///   Labels are matched exactly (case-sensitively).
     ///
     /// Returns an `arrow` RecordBatch (zero-copy into Python via PyCapsule).
     ///
@@ -423,11 +423,10 @@ impl Reader {
     }
 
     /// Resolve filter labels to their raw UEL indices for the open file,
-    /// matching case-insensitively (ASCII-folded) the way GAMS does.
+    /// matching exactly (case-sensitively).
     ///
     /// Labels not present in the file are simply never matched; they map to
-    /// no index and the filter stays empty for that label (no error). When
-    /// several UELs differ only by case, the lowest UEL number wins. The
+    /// no index and the filter stays empty for that label (no error). The
     /// index vectors are sorted so the hot-path predicate can use binary
     /// search.
     fn resolve_uel_indices(
@@ -438,23 +437,11 @@ impl Reader {
             return Err(closed_err());
         };
         let label_to_index = file.0.uel_index().map_err(to_py_err)?;
-        let mut folded: HashMap<String, i32> = HashMap::with_capacity(label_to_index.len());
-        for (label, &idx) in label_to_index.iter() {
-            let entry = folded.entry(label.to_ascii_uppercase()).or_insert(idx);
-            if idx < *entry {
-                *entry = idx;
-            }
-        }
         let mut out = Vec::with_capacity(filters.len());
         for (d, labels) in filters {
             let mut idxs: Vec<i32> = labels
                 .iter()
-                .filter_map(|l| {
-                    label_to_index
-                        .get(l.as_str())
-                        .copied()
-                        .or_else(|| folded.get(&l.to_ascii_uppercase()).copied())
-                })
+                .filter_map(|l| label_to_index.get(l.as_str()).copied())
                 .collect();
             idxs.sort_unstable();
             idxs.dedup();

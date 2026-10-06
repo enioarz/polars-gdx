@@ -168,10 +168,9 @@ def scan_gdx(
 
     Notes
     -----
-    **Label matching**: key labels are matched case-insensitively
-    (ASCII-folded), the way GAMS does, for both ``key_filter`` and
-    ``filter(pl.col(key) == label)`` predicates. The labels stored in the
-    produced frame keep the file's original casing.
+    **Label matching**: key labels are matched **exactly** (case-sensitive,
+    byte-for-byte as stored in the file) for both ``key_filter`` and
+    ``filter(pl.col(key) == label)`` predicates.
 
     **File handle lifetime**: the underlying GDX file stays open until the
     returned LazyFrame is collected and released, because Polars may read the
@@ -199,7 +198,16 @@ def scan_gdx(
     # set literally named ``value`` would otherwise overwrite it in the
     # schema dict and break the Arrow record batch).
     key_names = _key_names(domains, dim, reserved={value_name})
-    schema = {name: pl.String for name in key_names} | {value_name: pl.Float64}
+    # Key columns are declared as Polars Enums over the file's UEL table.
+    # The Rust layer emits Arrow dictionary arrays whose values are exactly
+    # the UEL table (file order) and whose indices are the raw 0-based UEL
+    # numbers, so Polars reinterprets the buffers zero-copy: no string
+    # materialisation, and `==`/`is_in`/join/group-by on keys run as integer
+    # category comparisons. Polars 2.0 maps Arrow dictionaries to Categorical
+    # when no schema is given and enforces the schema declared to
+    # register_io_source, so this must be declared explicitly.
+    key_dtype = pl.Enum(reader.uel_table())
+    schema = {name: key_dtype for name in key_names} | {value_name: pl.Float64}
 
     explicit_filters = None
     if key_filter:
@@ -217,17 +225,8 @@ def scan_gdx(
         native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
-            native, folded = _predicate_key_filter(pred_expr, key_names, reader)
-            if folded:
-                # Some labels match several stored labels that differ only in
-                # case: no single stored label can stand in for them, so fall
-                # back to a case-folded predicate on the full read; the
-                # predicate re-apply makes a native row limit unsafe.
-                pred_expr = _case_insensitive_expr(native, key_names)
-                native_limit_safe = False
-                if explicit_filters is None:
-                    filters = None
-            elif native is None:
+            native = _predicate_key_filter(pred_expr, key_names, reader)
+            if native is None:
                 # Predicate not fully translatable: a native row limit could
                 # under-fill head(n), so read unlimited and let Polars-side
                 # filter().head(n) apply.
@@ -235,9 +234,7 @@ def scan_gdx(
             else:
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
-                # the raw read. Case-mismatched labels were rewritten to their
-                # (unique) stored label, so the re-applied predicate must use
-                # the rewritten labels too — Polars' `==` is case-sensitive.
+                # the raw read, and re-apply it exactly on the produced frame.
                 pred_expr = _exact_expr(native, key_names)
                 merged = {d: list(labels) for d, labels in explicit_filters or []}
                 for d, labels in native:
@@ -257,7 +254,9 @@ def scan_gdx(
             threads=threads,
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
-        df = pl.from_arrow(batch)
+        # Passing the Enum schema makes Polars reinterpret the dictionary
+        # indices as enum physicals instead of decoding to strings.
+        df = pl.from_arrow(batch, schema=schema)
         if pred_expr is not None:
             df = df.filter(pred_expr)
         if n_rows is not None:
@@ -266,73 +265,48 @@ def scan_gdx(
             df = df.select(with_columns)
         yield df
 
-    return register_io_source(_read, schema=schema)
+    # `is_pure` lets the optimizer de-duplicate repeated occurrences of the
+    # same scan within one plan (the source is a deterministic file read).
+    return register_io_source(_read, schema=schema, is_pure=True)
 
 
 def _predicate_key_filter(
     pred: pl.Expr, key_names: list[str], reader: Reader
-) -> tuple[list[tuple[int, list[str]]] | None, bool]:
+) -> list[tuple[int, list[str]]] | None:
     """Extract a native key filter from a predicate, if possible.
 
     Recognises conjunctions of `pl.col(k) == "label"` (either operand order)
-    where `k` is a key column, by inspecting the predicate's serialized plan.
-    Returns ``(filters, folded)``:
+    and `col.is_in([labels])` where `k` is a key column, by inspecting the
+    predicate's serialized plan. Returns a list of
+    ``(dim_index, allowed_labels)`` pairs, or None when the predicate cannot
+    be translated (the caller falls back to Polars-side filtering).
 
-    - ``filters``: list of ``(dim_index, allowed_labels)``, or None when the
-      predicate cannot be translated (caller falls back to Polars-side
-      filtering).
-    - ``folded``: True when some labels exist in the file only under a
-      different letter case (matched via ASCII case folding, GAMS-style).
-      The caller must then re-apply a case-insensitive predicate itself
-      instead of folding the constraint into the native prefilter, because
-      the re-applied Polars ``==`` would otherwise silently drop those rows.
-      When ``folded`` is True, ``filters`` carries the full extracted
-      constraint set (with the user-supplied labels) for that rebuild.
+    Labels are matched exactly (case-sensitively) against the file's UEL
+    table; labels not present in the file can never match, so they are
+    dropped, and an empty set means no rows at all.
     """
     try:
         plan = json.loads(pred.meta.serialize(format="json"))
     except Exception:
-        return None, False
+        return None
     filters: list[tuple[int, list[str]]] = []
     if not _collect_eq_filters(plan, key_names, filters):
-        return None, False
+        return None
     if not filters:
-        return None, False
-    # Resolve labels against the file's UEL table: labels not present in the
-    # file can never match, so drop them; an empty set means no rows at all.
-    # Matching is case-insensitive (ASCII-folded) like GAMS: a label that only
-    # exists in the file under different casing still matches, but is flagged
-    # so the caller can keep Polars-side semantics correct.
+        return None
     uels = set(reader.uel_table())
-    folded_uels: dict[str, list[str]] = {}
-    for l in uels:
-        folded_uels.setdefault(l.upper(), []).append(l)
     resolved = []
-    folded = False
     for d, labels in filters:
-        existing = []
-        for l in labels:
-            if l in uels:
-                existing.append(l)
-            elif len(folded_uels.get(l.upper(), [])) == 1:
-                # Case-mismatched but unambiguous: stand in the stored label so
-                # the native prefilter (and the rebuilt predicate) still apply.
-                existing.append(folded_uels[l.upper()][0])
-            elif l.upper() in folded_uels:
-                # Several stored labels differ only in case: only a
-                # case-insensitive predicate can select between them.
-                existing.append(l)
-                folded = True
+        existing = [l for l in labels if l in uels]
         if not existing:
-            if folded:
-                return filters, True
-            return [(d, [])], False
+            # Label never used in this dimension: no record can match.
+            return [(d, [])]
         resolved.append((d, existing))
-    return resolved, folded
+    return resolved
 
 
 def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
-    """Rebuild the predicate with (rewritten) exact labels.
+    """Rebuild the predicate with exact (stored) labels.
 
     Within a dimension, labels are alternatives (OR) — a dimension's
     constraint is a membership test; across dimensions they conjoin (AND),
@@ -344,30 +318,10 @@ def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> p
     for d, labels in filters:
         if not labels:
             return pl.lit(False)
-        col = pl.col(key_names[d]).cast(pl.String)
+        # No `.cast(pl.String)`: key columns are Enums, so `==`/`is_in` on
+        # the stored labels resolve to integer category comparisons.
+        col = pl.col(key_names[d])
         dim_expr = col == labels[0] if len(labels) == 1 else col.is_in(labels)
-        expr = dim_expr if expr is None else expr & dim_expr
-    return expr if expr is not None else pl.lit(False)
-
-
-def _case_insensitive_expr(
-    filters: list[tuple[int, list[str]]], key_names: list[str]
-) -> pl.Expr:
-    """Rebuild the predicate with case-insensitive matching.
-
-    Same OR-within-dimension / AND-across-dimensions semantics as
-    :func:`_exact_expr`.
-    """
-    expr: pl.Expr | None = None
-    for d, labels in filters:
-        if not labels:
-            return pl.lit(False)
-        col = pl.col(key_names[d]).cast(pl.String).str.to_uppercase()
-        dim_expr = (
-            col == labels[0].upper()
-            if len(labels) == 1
-            else col.is_in([l.upper() for l in labels])
-        )
         expr = dim_expr if expr is None else expr & dim_expr
     return expr if expr is not None else pl.lit(False)
 

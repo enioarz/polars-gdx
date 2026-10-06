@@ -1,4 +1,4 @@
-"""Tests for plan 05 (case-insensitive labels) and plan 06 (reader lifecycle,
+"""Tests for plan 05 (exact label matching) and plan 06 (reader lifecycle,
 key/value name collision) from docs/plans/."""
 
 import polars as pl
@@ -21,51 +21,32 @@ def edge_available():
 
 
 # ---------------------------------------------------------------------------
-# Plan 05 — case-insensitive label matching (GAMS parity)
+# Plan 05 — exact label matching
 # ---------------------------------------------------------------------------
 
 
-def test_key_filter_case_insensitive():
-    """key_filter matches GAMS-style: case-insensitive, file casing preserved."""
-    df = read_gdx(GDX, symbol="x", key_filter={0: ["SEATTLE"]})
+def test_key_filter_exact_match():
+    """key_filter matches labels exactly (case-sensitively)."""
+    df = read_gdx(GDX, symbol="x", key_filter={0: ["seattle"]})
     assert df.height == 3
     assert set(df["dim_0"].unique()) == {"seattle"}
 
 
-def test_key_filter_case_insensitive_mixed_case_labels(edge_available):
-    if not edge_available:
-        pytest.skip("edgecase fixture not present")
-    df = read_gdx(EDGE, symbol="mixed", key_filter={0: ["seattle", "san-diego"]})
-    assert set(df["dim_0"].unique()) == {"Seattle", "SAN-DIEGO"}
-    assert df.height == 2
+def test_key_filter_wrong_case_yields_no_rows():
+    df = read_gdx(GDX, symbol="x", key_filter={0: ["SEATTLE"]})
+    assert df.height == 0
 
 
-def test_predicate_case_insensitive_single():
-    """filter(pl.col(key) == label) matches regardless of the label's case."""
-    lower = (
-        scan_gdx(GDX, symbol="x").filter(pl.col("dim_0") == "seattle").collect()
-    )
-    upper = (
-        scan_gdx(GDX, symbol="x").filter(pl.col("dim_0") == "SEATTLE").collect()
-    )
-    assert lower.height == 3
-    assert upper.height == 3
-    assert lower.equals(upper)
-
-
-def test_predicate_case_insensitive_conjunction(edge_available):
-    if not edge_available:
-        pytest.skip("edgecase fixture not present")
-    lf = scan_gdx(EDGE, symbol="mixed")
-    df = lf.filter(pl.col("dim_0") == "SEATTLE").collect()
-    assert df.height == 1
-    assert df["dim_0"][0] == "Seattle"
-
-
-def test_predicate_case_sensitive_result_unchanged():
-    """Exact-case labels keep the native prefilter path (assert the result)."""
+def test_predicate_exact_match():
+    """filter(pl.col(key) == label) matches the exact stored label."""
     df = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0") == "seattle").collect()
+    assert df.height == 3
     assert set(df["dim_0"].unique()) == {"seattle"}
+
+
+def test_predicate_wrong_case_yields_no_rows():
+    df = scan_gdx(GDX, symbol="x").filter(pl.col("dim_0") == "SEATTLE").collect()
+    assert df.height == 0
 
 
 # ---------------------------------------------------------------------------
