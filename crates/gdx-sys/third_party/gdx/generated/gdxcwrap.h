@@ -95,7 +95,8 @@ int gdxDataReadRaw( TGXFileRec_t *pgdx, int *KeyInt, double *Values, int *DimFrs
 int gdxDataReadRawFast( TGXFileRec_t *pgdx, int SyNr, TDataStoreProc_t DP, int *NrRecs );
 int gdxDataReadRawFastEx( TGXFileRec_t *pgdx, int SyNr, TDataStoreExProc_t DP, int *NrRecs, void *Uptr );
 /* (polars-gdx extension) checkpointed record-range raw read */
-int gdxDataReadRawRange( TGXFileRec_t *pgdx, int SyNr, INT64 StartPos, INT64 EndPos, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos );
+int gdxDataReadRawRange( TGXFileRec_t *pgdx, int SyNr, INT64 StartPos, unsigned StartOffset, INT64 EndPos, unsigned EndOffset, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos, unsigned *NextOffset );
+int gdxSymbolIsCompressed( TGXFileRec_t *pgdx, int SyNr );
 /* (polars-gdx extension) */
 int gdxSymbolDataSpan( TGXFileRec_t *pgdx, int SyNr, INT64 *StartPos, INT64 *EndPos );
 int gdxDataReadRawFastFilt( TGXFileRec_t *pgdx, int SyNr, const char **UelFilterStr, TDataStoreFiltProc_t DP );
@@ -330,12 +331,22 @@ GDX_INLINE int gdxDataReadRawFastEx( TGXFileRec_t *pgx, int SyNr, ::TDataStoreEx
    return reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawFastEx(SyNr, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr );
 }
 /* (polars-gdx extension) */
-GDX_INLINE int gdxDataReadRawRange( TGXFileRec_t *pgx, int SyNr, INT64 StartPos, INT64 EndPos, ::TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos )
+GDX_INLINE int gdxDataReadRawRange( TGXFileRec_t *pgx, int SyNr, INT64 StartPos, unsigned StartOffset, INT64 EndPos, unsigned EndOffset, ::TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos, unsigned *NextOffset )
 {
+   // int64_t/uint32_t locals: INT64 (long) and int64_t (long long) are
+   // distinct types on some platforms (e.g. macOS), so marshal through
+   // locals instead of passing INT64* where int64_t* is expected.
    int64_t np64 {};
-   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, StartPos, EndPos, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, &np64 ) };
+   uint32_t no64 {};
+   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, static_cast<int64_t>( StartPos ), StartOffset, static_cast<int64_t>( EndPos ), EndOffset, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, &np64, &no64 ) };
    *NextPos = np64;
+   *NextOffset = no64;
    return res;
+}
+/* (polars-gdx extension) */
+GDX_INLINE int gdxSymbolIsCompressed( TGXFileRec_t *pgx, int SyNr )
+{
+   return reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxSymbolIsCompressed(SyNr) ? 1 : 0;
 }
 /* (polars-gdx extension) */
 GDX_INLINE int gdxSymbolDataSpan( TGXFileRec_t *pgx, int SyNr, INT64 *StartPos, INT64 *EndPos )

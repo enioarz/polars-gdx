@@ -303,3 +303,32 @@ def test_threads_auto_resolves_to_cpu_count_for_large_symbols(monkeypatch):
     assert lazy._resolve_threads(4, 2_000_000) == 4
     assert lazy._resolve_threads(None, 2_000_000) is None
     assert lazy._resolve_threads(0, 2_000_000) is None
+
+
+COMPRESSED = "tests/data/compressed.gdx"
+
+
+def test_compressed_read_parity():
+    if not __import__("pathlib").Path(COMPRESSED).exists():
+        pytest.skip("compressed fixture not present")
+    serial = read_gdx(COMPRESSED, symbol="big")
+    assert serial.height == 20000
+    for threads in (2, 4):
+        parallel = read_gdx(COMPRESSED, symbol="big", threads=threads)
+        assert serial.equals(parallel), threads
+
+
+def test_compressed_filtered_read_parity():
+    if not __import__("pathlib").Path(COMPRESSED).exists():
+        pytest.skip("compressed fixture not present")
+    # first-dimension filter: span-seek window, workers resume mid-block
+    serial = read_gdx(COMPRESSED, symbol="big", key_filter={0: ["i7"]})
+    parallel = read_gdx(COMPRESSED, symbol="big", key_filter={0: ["i7"]}, threads=4)
+    assert serial.equals(parallel)
+    assert set(parallel["i"]) == {"i7"}
+    assert parallel.height == 500
+    # non-leading dimension filter: positional split across workers
+    serial2 = read_gdx(COMPRESSED, symbol="big", key_filter={1: ["j123"]})
+    parallel2 = read_gdx(COMPRESSED, symbol="big", key_filter={1: ["j123"]}, threads=3)
+    assert serial2.equals(parallel2)
+    assert parallel2.height == 40

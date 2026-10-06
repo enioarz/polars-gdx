@@ -890,18 +890,23 @@ public:
 
    /**
     * @brief (polars-gdx extension) Checkpointed record-range read in Raw mode.
-    * @details Reads records [StartRec, EndRec) of symbol SyNr in raw mode.
-    * StartPos is the physical file position returned by a previous range
-    * read's NextPos (0 for the start of the symbol data). The record at
-    * StartRec must be a restart point (first-changed dimension 0) or the
-    * first record of the symbol. On return *NextPos holds the physical
-    * position just past the last record read (0 at end of data). Returns
+    * @details Reads records of symbol SyNr in raw mode starting at the
+    * checkpoint (StartPos, StartOffset): for uncompressed data StartPos is
+    * a physical file position and StartOffset is ignored; for block-compressed
+    * data StartPos is the physical start of the compressed block holding the
+    * resume record and StartOffset that record's offset within the
+    * decompressed block (a pair collected by gdxCollectRestartPositions).
+    * The read stops before the first restart record at or past the end
+    * checkpoint; that checkpoint is reported via (NextPos, NextOffset) so the
+    * next range resumes exactly there. Returns
     * non-zero on success.
     */
    bool gdxSymbolDataSpan( int SyNr, int64_t &StartPos, int64_t &EndPos );
+   bool gdxSymbolIsCompressed( int SyNr );
 
-   int gdxDataReadRawRange( int SyNr, int64_t StartPos, int64_t EndPos,
-                            TDataStoreExProc_t DP, int &NrRecs, void *Uptr, int64_t *NextPos );
+   int gdxDataReadRawRange( int SyNr, int64_t StartPos, uint32_t StartOffset, int64_t EndPos,
+                            uint32_t EndOffset, TDataStoreExProc_t DP, int &NrRecs, void *Uptr,
+                            int64_t *NextPos, uint32_t *NextOffset );
    /**
     * @brief (polars-gdx extension) Collect the exact physical start positions
     * of every restart record (first-changed dimension 1 / absolute dim-0 key)
@@ -1877,7 +1882,7 @@ int gdxDataReadRawFastFilt_DP_FC( const int *Indx, const double *Vals, void *Upt
 void mapDefaultRecordValues(double *AVals) const;
 
 // (polars-gdx extension) raw read state resuming at a byte-position checkpoint
-bool PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t StartPos, int64_t StartRec,
+bool PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t StartPos, uint32_t StartOffset,
                           int &NrRecs );
 
 public:

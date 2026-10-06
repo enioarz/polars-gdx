@@ -3726,7 +3726,7 @@ int TGXFileObj::gdxDataReadRawFastEx( int SyNr, TDataStoreExProc_t DP, int &NrRe
 // data: for compressed data the logical and physical byte positions
 // diverge (block compression), so checkpointed resume is not offered.
 bool TGXFileObj::PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t StartPos,
-                                      int64_t /*StartRec*/, int &NrRecs )
+                                      uint32_t StartOffset, int &NrRecs )
 {
    if( in( fmode, fr_str_data, fr_map_data, fr_mapr_data, fr_raw_data ) )
       gdxDataReadDone();
@@ -3756,10 +3756,12 @@ bool TGXFileObj::PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t
       } while( CurSyPtr->SDataType == dt_alias );
       assert( CurSyPtr->SDataType == dt_set && "Bad aliased set-1" );
    }
-   if( CurSyPtr->SIsCompressed )
-      return false;// checkpointed resume unsupported for compressed data
+   // (polars-gdx extension) compressed symbols ARE supported here: the
+   // checkpoint pair (StartPos, StartOffset) names the physical start of
+   // the block holding the resume record plus the record's offset within
+   // the decompressed block, so resuming mid-block is exact.
    FCurrentDim = CurSyPtr->SDim;
-   FFile->SetCompression( false );
+   FFile->SetCompression( CurSyPtr->SIsCompressed );
    DataSize = DataTypSize[CurSyPtr->SDataType];
    if( DataSize > 0 ) LastDataField = static_cast<tvarvaltype>( DataSize - 1 );
    NrRecs = CurSyPtr->SDataCount;
@@ -3785,35 +3787,39 @@ bool TGXFileObj::PrepareSymbolReadAt( std::string_view Caller, int SyNr, int64_t
    std::fill_n( PrevElem.begin(), FCurrentDim, -1 );
    LastReadWasRestart = false;
    if( StartPos > 0 )
-      FFile->SetPosition( StartPos );
+      FFile->SetCheckpoint( StartPos, StartOffset );
    fmode = fr_raw_data;
    return true;
 }
 
 // (polars-gdx extension)
-// Checkpointed positional range read (uncompressed data only).
+// Checkpointed range read. A checkpoint names the byte where a record
+// begins: for uncompressed data it is just a physical file position
+// (StartOffset ignored); for block-compressed data it is the pair
+// (physical start of the block holding the record, offset of the record
+// within the decompressed block). Checkpoints are collected by
+// gdxCollectRestartPositions, whose records (first-changed dimension 1)
+// carry absolute key state, so a worker resuming there decodes without
+// any delta state. The coordinator validates the result (total record
+// count, exact boundary handoff) and falls back to a serial read when
+// anything is off.
 //
-// StartPos = 0: read from the start of the symbol data.
-// StartPos > 0: an exact restart-record start position collected by
-// gdxCollectRestartPositions (a record with first-changed dimension 1
-// stored with absolute keys, needing no delta state). The stream is
-// positioned there directly; no resynchronisation scan is needed or
-// performed. The coordinator validates the result (total record count)
-// and falls back to a serial read when anything is off.
-//
-// Delivery: every record from StartPos (or the symbol start) until
-// (exclusive) the first restart record that starts at or past EndPos, or
-// end of data. Restart records at or past EndPos are not delivered; their
-// start position is reported in *NextPos (0 at end of data) so the next
-// range can resume exactly there. Records between EndPos and that next
-// restart belong to the still-open dim-0 group and ARE delivered here,
-// because they cannot be decoded without the previous record's state.
-int TGXFileObj::gdxDataReadRawRange( int SyNr, int64_t StartPos, int64_t EndPos,
-                                     TDataStoreExProc_t DP, int &NrRecs, void *Uptr, int64_t *NextPos )
+// Delivery: every record from the start checkpoint (or the symbol start)
+// until (exclusive) the first restart record at or past the end checkpoint,
+// or end of data. Such a restart record is not delivered; its checkpoint
+// is reported via (*NextPos, *NextOffset) (0 at end of data) so the next
+// range can resume exactly there. Records between the end checkpoint and
+// that next restart belong to the still-open dim-0 group and ARE delivered
+// here, because they cannot be decoded without the previous record's state.
+int TGXFileObj::gdxDataReadRawRange( int SyNr, int64_t StartPos, uint32_t StartOffset,
+                                    int64_t EndPos, uint32_t EndOffset,
+                                    TDataStoreExProc_t DP, int &NrRecs, void *Uptr,
+                                    int64_t *NextPos, uint32_t *NextOffset )
 {
    *NextPos = 0;
+   *NextOffset = 0;
    int NrAvail {};
-   if( !PrepareSymbolReadAt( "gdxDataReadRawRange"s, SyNr, StartPos, 0, NrAvail ) )
+   if( !PrepareSymbolReadAt( "gdxDataReadRawRange"s, SyNr, StartPos, StartOffset, NrAvail ) )
    {
       NrRecs = -1;
       return false;
@@ -3830,17 +3836,24 @@ int TGXFileObj::gdxDataReadRawRange( int SyNr, int64_t StartPos, int64_t EndPos,
    }
    std::array<double, valscale + 1> AVals {};
    int AFDim {};
-   // StartPos == 0 reads from the symbol start; StartPos > 0 is an exact
-   // restart-record position collected by gdxCollectRestartPositions, so
-   // decoding begins in-frame with full state and no resync is needed.
-   int64_t recStart { FFile->GetPosition() };// start of the next record
-   int64_t boundary { 0 };
+   // A start checkpoint of 0 reads from the symbol start; a nonzero one is
+   // an exact restart-record checkpoint collected by
+   // gdxCollectRestartPositions, so decoding begins in-frame with full
+   // state and no resync is needed.
+   const auto recStartCheckpoint = [this]() -> std::pair<int64_t, uint32_t> {
+      if( !FFile->GetCompression() ) return { FFile->GetPosition(), 0 };
+      return { FFile->GetCheckpointBlock(), FFile->GetCheckpointOffset() };
+   };
+   auto recStart { recStartCheckpoint() };// start of the next record
+   std::pair<int64_t, uint32_t> boundary { 0, 0 };
    bool stopped { false };
    while( DoRead( AVals.data(), AFDim ) )
    {
       // recStart is where the just-decoded record began (captured before
       // the DoRead consumed its bytes).
-      if( LastReadWasRestart && recStart >= EndPos )
+      const bool pastEnd { recStart.first > EndPos
+                           || ( recStart.first == EndPos && recStart.second >= EndOffset ) };
+      if( LastReadWasRestart && pastEnd )
       {
          boundary = recStart;// next range starts exactly here
          break;
@@ -3850,9 +3863,14 @@ int TGXFileObj::gdxDataReadRawRange( int SyNr, int64_t StartPos, int64_t EndPos,
          stopped = true;
          break;
       }
-      recStart = FFile->GetPosition();
+      recStart = recStartCheckpoint();
    }
-   *NextPos = stopped ? 0 : boundary;
+   if( stopped )
+   {
+      boundary = { 0, 0 };
+   }
+   *NextPos = boundary.first;
+   *NextOffset = boundary.second;
    gdxDataReadDone();
    return true;
 }
@@ -3881,20 +3899,34 @@ bool TGXFileObj::gdxSymbolDataSpan( int SyNr, int64_t &StartPos, int64_t &EndPos
    EndPos = end;
    return EndPos > StartPos;
 }
+// (polars-gdx extension)
+// Whether symbol SyNr's data section is block-compressed. Returns false for
+// the universe (SyNr 0) or a bad symbol number.
+bool TGXFileObj::gdxSymbolIsCompressed( int SyNr )
+{
+   if( SyNr < 1 || SyNr > NameList->size() ) return false;
+   return ( *NameList->GetObject( SyNr ) )->SIsCompressed;
+}
+
 
 // (polars-gdx extension)
 // One sequential decode pass over symbol SyNr's data, delivering the exact
-// physical start position of every restart record (first-changed dimension
-// 1: an absolute dim-0 key) to DP. Delivery format in Indx:
-//   Indx[0] = low  32 bits of the physical position (int32)
-//   Indx[1] = high 32 bits of the physical position (int32, always 0 for
+// start checkpoint of every restart record (first-changed dimension
+// 1: an absolute dim-0 key) to DP. Delivery format:
+//   Indx[0] = low  32 bits of the checkpoint position (int32)
+//   Indx[1] = high 32 bits of the checkpoint position (int32, always 0 for
 //             files < 2 GiB)
 //   Indx[2] = dim-0 UEL number of the restart record (raw, 1-based), so
 //             callers can seek straight to the byte range covered by a
-//             first-dimension key span (polars-gdx extension: was the
-//             0-based record number, which no caller consumed)
-// Vals is unused (nullptr). Positions are strictly increasing and the first
-// delivered position equals the symbol's data start. Uncompressed data only.
+//             first-dimension key span
+//   Vals, when non-null, receives the checkpoint offset within the
+//   decompressed block in Vals[0] (0 for uncompressed data, where a
+//   checkpoint is just a physical position).
+// For uncompressed data the checkpoint position is a physical file
+// position; for block-compressed data it is the physical start of the
+// compressed block holding the record, to be combined with the offset.
+// Checkpoints are strictly increasing and the first equals the symbol's
+// data start.
 bool TGXFileObj::gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, void *Uptr )
 {
    int NrAvail {};
@@ -3907,18 +3939,23 @@ bool TGXFileObj::gdxCollectRestartPositions( int SyNr, TDataStoreExProc_t DP, vo
    }
    std::array<double, valscale + 1> AVals {};
    int AFDim {};
-   int64_t recStart { FFile->GetPosition() };
+   const auto recStartCheckpoint = [this]() -> std::pair<int64_t, uint32_t> {
+      if( !FFile->GetCompression() ) return { FFile->GetPosition(), 0 };
+      return { FFile->GetCheckpointBlock(), FFile->GetCheckpointOffset() };
+   };
+   auto recStart { recStartCheckpoint() };
    while( DoRead( AVals.data(), AFDim ) )
    {
       if( LastReadWasRestart )
       {
-         const auto pos { static_cast<uint64_t>( recStart ) };
+         const auto pos { static_cast<uint64_t>( recStart.first ) };
          std::array<int, 3> packed { static_cast<int>( pos & 0xFFFFFFFFULL ),
                                      static_cast<int>( pos >> 32U ),
                                      LastElem[0] };
-         if( !DP( packed.data(), nullptr, AFDim, Uptr ) ) break;
+         const double offset { static_cast<double>( recStart.second ) };
+         if( !DP( packed.data(), &offset, AFDim, Uptr ) ) break;
       }
-      recStart = FFile->GetPosition();
+      recStart = recStartCheckpoint();
    }
    gdxDataReadDone();
    return true;

@@ -173,21 +173,32 @@ extern "C" {
     ) -> c_int;
 
     /// (polars-gdx extension) Checkpointed positional raw read. Delivers
-    /// records of symbol `synr` to `dp`, starting at the physical file
-    /// position `start_pos` (0 = start of the symbol data) and stopping once
-    /// the stream position reaches `end_pos` (exclusive; `i64::MAX` = to
-    /// the end of the data). On return `*next_pos` holds the position just
-    /// past the last record consumed (0 at end of data).
+    /// records of symbol `synr` to `dp`, starting at the checkpoint
+    /// (`start_pos`, `start_offset`) (0 = start of the symbol data) and
+    /// stopping once the stream reaches the checkpoint (`end_pos`,
+    /// `end_offset`) (exclusive; `i64::MAX` = to the end of the data).
+    /// For uncompressed data the offsets are ignored; for block-compressed
+    /// data `start_pos` is the physical start of the compressed block
+    /// holding the resume record and `start_offset` the record's offset
+    /// within the decompressed block. On return `*next_pos`/`*next_offset`
+    /// hold the checkpoint just past the last record consumed (0 at end of
+    /// data).
     pub fn c__gdxdatareadrawrange(
         obj: *mut GdxObj,
         synr: c_int,
         start_pos: i64,
+        start_offset: u32,
         end_pos: i64,
+        end_offset: u32,
         dp: extern "C" fn(*const c_int, *const c_double, c_int, *mut c_void) -> c_int,
         nrecs: *mut c_int,
         uptr: *mut c_void,
         next_pos: *mut i64,
+        next_offset: *mut u32,
     ) -> c_int;
+    /// (polars-gdx extension) Whether symbol `synr`'s data section is
+    /// block-compressed. Returns 0 on failure (treated as uncompressed).
+    pub fn c__gdxsymboliscompressed(obj: *mut GdxObj, synr: c_int) -> c_int;
     /// (polars-gdx extension) Byte span [start, end) of symbol `synr`'s
     /// data section (physical, uncompressed). Returns 0 on failure.
     pub fn c__gdxsymboldataspan(
