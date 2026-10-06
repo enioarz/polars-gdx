@@ -333,7 +333,14 @@ GDX_INLINE int gdxDataReadRawFastEx( TGXFileRec_t *pgx, int SyNr, ::TDataStoreEx
 /* (polars-gdx extension) */
 GDX_INLINE int gdxDataReadRawRange( TGXFileRec_t *pgx, int SyNr, INT64 StartPos, unsigned StartOffset, INT64 EndPos, unsigned EndOffset, ::TDataStoreExProc_t DP, int *NrRecs, void *Uptr, INT64 *NextPos, unsigned *NextOffset )
 {
-   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, StartPos, StartOffset, EndPos, EndOffset, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, NextPos, NextOffset ) };
+   // int64_t/uint32_t locals: INT64 (long) and int64_t (long long) are
+   // distinct types on some platforms (e.g. macOS), so marshal through
+   // locals instead of passing INT64* where int64_t* is expected.
+   int64_t np64 {};
+   uint32_t no64 {};
+   const int res { reinterpret_cast<gdx::TGXFileObj *>( pgx )->gdxDataReadRawRange(SyNr, static_cast<int64_t>( StartPos ), StartOffset, static_cast<int64_t>( EndPos ), EndOffset, (gdx::TDataStoreExProc_t) DP, *NrRecs, Uptr, &np64, &no64 ) };
+   *NextPos = np64;
+   *NextOffset = no64;
    return res;
 }
 /* (polars-gdx extension) */

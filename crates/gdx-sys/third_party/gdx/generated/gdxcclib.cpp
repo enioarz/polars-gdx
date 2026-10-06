@@ -2192,7 +2192,11 @@ GDX_API int GDX_CALLCONV C__gdxSymbolDataSpan(TGXFileRec_t *TGXFile, int SyNr, l
 GDX_API int GDX_CALLCONV C__gdxCollectRestartPositions(TGXFileRec_t *TGXFile, int SyNr, TDataStoreExProc_t DP, void *Uptr);
 GDX_API int GDX_CALLCONV C__gdxDataReadRawRange(TGXFileRec_t *TGXFile, int SyNr, long long StartPos, unsigned StartOffset, long long EndPos, unsigned EndOffset, TDataStoreExProc_t DP, int *NrRecs, void *Uptr, long long *NextPos, unsigned *NextOffset)
 {
-  int res = gdxDataReadRawRange(TGXFile, SyNr, (INT64) StartPos, StartOffset, (INT64) EndPos, EndOffset, DP, NrRecs, Uptr, (INT64 *) NextPos, NextOffset);
+  INT64 np;
+  unsigned no;
+  int res = gdxDataReadRawRange(TGXFile, SyNr, (INT64) StartPos, StartOffset, (INT64) EndPos, EndOffset, DP, NrRecs, Uptr, &np, &no);
+  *NextPos = np;
+  *NextOffset = no;
   return res;
 }
 /* (polars-gdx extension) */
