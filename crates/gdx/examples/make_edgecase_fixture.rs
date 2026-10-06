@@ -1,6 +1,6 @@
 //! Writes fixtures for edge-case tests: a symbol whose domain set is
 //! literally named `value` (key/value column-name collision) and mixed-case
-//! UELs (case-insensitive label matching).
+//! UELs (exact label matching keeps the file's casing).
 
 use std::sync::Arc;
 
@@ -48,7 +48,7 @@ fn main() {
     )
     .unwrap();
 
-    // Mixed-case UELs for case-insensitive matching tests.
+    // Mixed-case UELs: exact matching must preserve the file's casing.
     w.write_symbol(
         "mixed",
         "mixed-case labels",

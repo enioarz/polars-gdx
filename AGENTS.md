@@ -23,7 +23,16 @@ tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
   early-termination return, ONE FFI crossing per symbol — used for unfiltered, filtered
   AND limited reads alike)
   → Arrow dictionary-encoded key columns + Float64 value column → pyarrow RecordBatch
-  → `pl.from_arrow` (zero-copy). Labels are NEVER materialized per record.
+  → `pl.from_arrow(batch, schema=schema)` with `pl.Enum(uel_table)` key dtypes (zero-copy:
+  dictionary values ARE the full UEL table in file order, indices are raw 0-based UEL
+  numbers, so Polars reinterprets the buffers as Enum physicals). Labels are NEVER
+  materialized per record.
+- **Polars 2.0 contract**: `register_io_source` now ENFORCES the declared schema, and
+  Arrow dictionary columns map to `Categorical` when no schema is given — so key
+  columns MUST be declared `pl.Enum(uel_table)` AND passed to `pl.from_arrow` too,
+  otherwise every collect raises SchemaError (incoming Categorical != target String).
+  `is_pure=True` is passed when supported (Polars ≥ 1.44) so repeated identical
+  scans de-duplicate within one plan.
 
 - **Domain scan**: `Reader.domain_elements(symbol, dim_pos)` (→ `gdxGetDomainElements`,
   DOMC_EXPAND) lists the unique UEL numbers used by one dimension via a bulk C callback;
@@ -82,12 +91,12 @@ cargo run -p gdx --release --example make_bench -- /tmp/bench_big.gdx 2000000
 .venv/bin/python benchmarks/bench_vs_gamsapi.py /tmp/bench_big.gdx
 ```
 
-## Benchmark results (2026-10, gamsapi 54.5.0, 2M records, best of 5)
+## Benchmark results (2026-10, gamsapi 54.5.0, polars 2.0.0, 2M records, best of 5)
 
 | Scenario | polars-gdx | gamsapi |
 | --- | ---: | ---: |
-| Full read | 0.126 s | 0.086 s |
-| filter() → native prefilter (1000 rows) | 0.081 s | 0.087 s (full read + pandas filter) |
+| Full read | 0.117 s | 0.086 s |
+| filter() → native prefilter (1000 rows) | 0.006 s | 0.087 s (full read + pandas filter) |
 
 gamsapi's pandas path has no lazy/pushdown: it must materialize everything, so our advantage
 grows with predicate selectivity. Full-read speed is comparable (gamsapi writes straight into
