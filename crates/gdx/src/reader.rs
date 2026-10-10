@@ -618,69 +618,20 @@ impl GdxFile {
         limit: Option<usize>,
     ) -> Result<RawSymbolData> {
         let vidx = value_field.index();
-        let mut data = RawSymbolData::with_capacity(info.dim, info.records);
-
-        // Filtered and limited reads alike use the `gdxDataReadRawFastEx`
-        // bulk callback: one FFI crossing for the whole loop, with the index
-        // predicate and optional limit evaluated inside the callback before
-        // anything is stored (returning 0 terminates the C read loop).
-        if let Some(f) = pred {
-            let sink = RecordSink {
-                data: std::ptr::from_mut(&mut data),
-                special: std::ptr::from_ref(&self.special),
-                vidx,
-                dim: info.dim,
-                pred: Some(f),
-                remaining: std::cell::Cell::new(limit),
-                seen: std::cell::Cell::new(0),
-            };
-            let mut cb_nrecs = 0;
-            let ok = ffi::c__gdxdatareadrawfastex(
-                self.obj,
-                info.number as i32,
-                store_record_ex,
-                &mut cb_nrecs,
-                &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
-            );
-            if ok == 0 {
-                return Err(op_error(self.obj, "gdxDataReadRawFastEx"));
-            }
+        let capacity = limit.map_or(info.records, |n| n.min(info.records));
+        let mut data = RawSymbolData::with_capacity(info.dim, capacity);
+        if limit == Some(0) {
             return Ok(data);
         }
 
-        if let Some(limit) = limit {
-            let sink = RecordSink {
-                data: std::ptr::from_mut(&mut data),
-                special: std::ptr::from_ref(&self.special),
-                vidx,
-                dim: info.dim,
-                pred: None,
-                remaining: std::cell::Cell::new(Some(limit)),
-                seen: std::cell::Cell::new(0),
-            };
-            let mut cb_nrecs = 0;
-            let ok = ffi::c__gdxdatareadrawfastex(
-                self.obj,
-                info.number as i32,
-                store_record_ex,
-                &mut cb_nrecs,
-                &sink as *const RecordSink<'_> as *mut std::ffi::c_void,
-            );
-            if ok == 0 {
-                return Err(op_error(self.obj, "gdxDataReadRawFastEx"));
-            }
-            return Ok(data);
-        }
-
-        // Unfiltered unlimited read: bulk callback with a user-data pointer,
-        // one FFI crossing for the whole loop.
+        // One callback handles filtered, limited and full reads alike.
         let sink = RecordSink {
             data: std::ptr::from_mut(&mut data),
             special: std::ptr::from_ref(&self.special),
             vidx,
             dim: info.dim,
-            pred: None,
-            remaining: std::cell::Cell::new(None),
+            pred,
+            remaining: std::cell::Cell::new(limit),
             seen: std::cell::Cell::new(0),
         };
         let mut cb_nrecs = 0;
@@ -1132,7 +1083,9 @@ pub fn read_symbol_raw_span_parallel(
             off: u32::MAX,
             key0: 0,
         });
-    if window_end.pos <= window_start.pos {
+    // Compressed checkpoints may share a physical block while referring to
+    // different records inside it. Compare the decompressed offsets too.
+    if (window_end.pos, window_end.off) <= (window_start.pos, window_start.off) {
         return Ok(empty());
     }
     // Plan up to `threads` split checkpoints at restarts strictly inside
@@ -1384,6 +1337,9 @@ extern "C" fn store_record_ex(
     uptr: *mut std::ffi::c_void,
 ) -> i32 {
     let sink = unsafe { &*(uptr as *const RecordSink<'_>) };
+    if sink.remaining.get() == Some(0) {
+        return 0;
+    }
     sink.seen.set(sink.seen.get() + 1);
     unsafe {
         let keys = std::slice::from_raw_parts(indx, sink.dim);
@@ -1409,10 +1365,10 @@ extern "C" fn store_record_ex(
         ));
     }
     if let Some(r) = sink.remaining.get() {
-        if r == 0 {
+        sink.remaining.set(Some(r - 1));
+        if r == 1 {
             return 0;
         }
-        sink.remaining.set(Some(r - 1));
     }
     1
 }

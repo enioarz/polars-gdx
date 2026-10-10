@@ -41,10 +41,13 @@ jobs:
       - name: Run benchmark vs gamsapi
         run: |
           python benchmarks/bench_vs_gamsapi.py /tmp/bench_big.gdx
+      - name: Measure read paths
+        run: python benchmarks/bench_read_paths.py /tmp/bench_big.gdx > benchmarks/read-path-results.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: benchmark-results
           path: |
             benchmarks/bench_vs_gamsapi.py
+            benchmarks/read-path-results.json
           if-no-files-found: ignore

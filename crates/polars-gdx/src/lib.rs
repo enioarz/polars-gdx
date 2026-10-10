@@ -29,9 +29,11 @@ fn closed_err() -> PyErr {
 }
 
 /// `GdxFile` holds a raw FFI pointer, so it is structurally `!Send`/`!Sync`.
-/// The `gdx` crate serializes every FFI call behind a process-global mutex,
-/// which makes cross-thread access sound; all methods here take `&self` and
-/// are safe under concurrent calls. The `Option` wrapper allows releasing the
+/// Python entry points retain the GIL, serializing access to the inner
+/// `RefCell` caches. The GDX mutex protects native operations, but does not
+/// cover every cache access. Do not release the GIL or declare free-threaded
+/// support without adding synchronization for the whole handle and its caches.
+/// The `Option` wrapper allows releasing the
 /// file handle early via `close()`; dropping it runs `GdxFile`'s own `Drop`
 /// (close + free under the global lock), so no extra cleanup is needed here.
 struct SendGdxFile(GdxFile);
@@ -222,6 +224,17 @@ impl Reader {
             self.resolve_uel_indices(&filters)?
         };
         let vfield = field.unwrap_or(ValueField::Level);
+        // A conjunction containing an empty allowed set cannot match a record.
+        // Skip both serial decoding and parallel restart-index construction.
+        if n_rows == Some(0) || index_filters.iter().any(|(_, allowed)| allowed.is_empty()) {
+            let mut data = gdx::RawSymbolData {
+                keys: vec![Vec::new(); info.dim],
+                values: Vec::new(),
+            };
+            let batch = to_record_batch(self, info, &mut data, key_names, vfield)?;
+            return Ok(batch.into_pyarrow(py)?.into_any());
+        }
+
         // Membership bitmaps per filtered dimension: one bit per UEL number,
         // so the hot-path check per record is a single load instead of a
         // binary search. Records are stored sorted by key indices, so when
