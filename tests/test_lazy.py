@@ -16,6 +16,31 @@ def test_list_symbols():
     assert df.filter(pl.col("name") == "x")["dim"][0] == 2
 
 
+@pytest.mark.parametrize("helper", [list_symbols, read_domains])
+@pytest.mark.parametrize("fail", [False, True])
+def test_metadata_helpers_close_reader(monkeypatch, helper, fail):
+    readers = []
+    original = Reader.symbols
+
+    def symbols(reader):
+        readers.append(reader)
+        if fail:
+            raise RuntimeError("metadata failure")
+        return original(reader)
+
+    monkeypatch.setattr(Reader, "symbols", symbols)
+    kwargs = {"symbol": "x"} if helper is read_domains else {}
+    if fail:
+        with pytest.raises(RuntimeError, match="metadata failure"):
+            helper(GDX, **kwargs)
+    else:
+        helper(GDX, **kwargs)
+    # Keeping the Reader alive distinguishes explicit closure from GC cleanup.
+    assert len(readers) == 1
+    with pytest.raises(RuntimeError, match="reader is closed"):
+        original(readers[0])
+
+
 def test_scan_projection_pushdown():
     lf = scan_gdx(GDX, symbol="cost")
     df = lf.select("dim_1").collect()

@@ -1,6 +1,6 @@
 """Lazy GDX scanning via Polars' IO source interface.
 
-The Rust extension streams Arrow IPC bytes per symbol; Polars drives reading
+The Rust extension returns an Arrow RecordBatch per symbol; Polars drives reading
 through `pl.register_io_source`, so column projection is pushed down and only
 the columns actually selected are materialised by Polars. Key prefiltering is
 additionally applied inside the native GDX read loop, before any record is
@@ -56,8 +56,7 @@ def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
     so it costs one pass over the raw indices regardless of the number of
     records. (Columns are padded to equal length with ``null``.)
     """
-    reader = Reader(str(path))
-    try:
+    with Reader(str(path)) as reader:
         info = {r[0]: r for r in reader.symbols()}
         if symbol not in info:
             raise ValueError(
@@ -71,8 +70,6 @@ def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
             used = reader.domain_elements(symbol, d)
             labels = [uels[i - 1] if 0 < i <= len(uels) else None for i in used]
             series.append(pl.Series(names[d], labels, dtype=pl.String))
-    finally:
-        reader.close()
     if not series:
         return pl.DataFrame()
     longest = max(len(s) for s in series)
@@ -84,8 +81,8 @@ def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
 
 def list_symbols(path: str | Path) -> pl.DataFrame:
     """List the symbols in a GDX file as a DataFrame."""
-    reader = Reader(str(path))
-    rows = reader.symbols()
+    with Reader(str(path)) as reader:
+        rows = reader.symbols()
     return pl.DataFrame(
         {
             "name": [r[0] for r in rows],
@@ -414,7 +411,7 @@ def _key_names(domains: list[str], dim: int, reserved: set[str]) -> list[str]:
             candidate = f"dim_{i}"
         # Column names must be unique and must never collide with the value
         # column; de-duplicate with a positional suffix.
-        if candidate in names or candidate in reserved:
+        while candidate in names or candidate in reserved:
             candidate = f"{candidate}_{i}"
         names.append(candidate)
     return names
