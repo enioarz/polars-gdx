@@ -62,12 +62,10 @@ tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
   (`expr.meta.serialize(format="json")`: `BinaryExpr`/`Eq`/`And`/`Column`/`Literal.Scalar.String`).
   The predicate is ALWAYS re-applied after the native prefilter for exact semantics. Everything
   else (value columns, other ops) falls back to Polars-side filtering — that is correct behavior.
-- **Bulk callback soundness**: `c__gdxdatareadrawfast` has no user-data argument; the record
-  sink is routed through a thread-local (`SINK: Cell<Option<RecordSink>>`) holding raw pointers.
-  Sound because the callback runs synchronously on the same thread, bracketed by set/take,
-  and all GDX FFI access is serialized by the global mutex in `gdx/src/lock.rs`.
-- The filtered read path uses the per-record `gdxDataReadRaw` loop (predicate must run before
-  storing); only unfiltered reads use the bulk callback.
+- **Bulk callback soundness**: `c__gdxdatareadrawfastex` receives a user-data pointer
+  to a stack-scoped `RecordSink`. The callback runs synchronously on the same thread,
+  and the global GDX mutex brackets the call. Filtered, unfiltered, and limited raw
+  reads all use this callback; predicates run before records are stored.
 - `GdxFile` is `!Send/!Sync` (raw pointer). The plugin wraps it in `SendGdxFile` with explicit
   `unsafe impl Send/Sync` — justified by the global lock.
 - `uel_table()`/`uel_index()` are cached per GdxFile; `uel_table` is exposed to Python as

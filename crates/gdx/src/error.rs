@@ -9,6 +9,9 @@ pub enum GdxError {
     #[error("path contains an interior NUL byte: {0:?}")]
     InvalidPath(PathBuf),
 
+    #[error("invalid writer input: {0}")]
+    InvalidWriteInput(String),
+
     #[error("failed to open {path:?} for reading (gdx error {code}: {message})")]
     OpenRead {
         path: PathBuf,

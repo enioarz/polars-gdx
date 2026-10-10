@@ -34,14 +34,6 @@ const DOMC_EXPAND: i32 = -1;
 
 use crate::types::{Record, SymbolInfo, SymbolType, ValueField};
 
-/// A GDX file opened for reading.
-///
-/// On [`open`](GdxFile::open) the symbol table and special-value sentinels are
-/// loaded eagerly; record data is read on demand via [`read`](GdxFile::read).
-/// The underlying GDX object is closed and freed on drop.
-///
-/// Not thread-safe: the type is intentionally `!Send`/`!Sync` (it holds a raw
-/// pointer). Read the data you need into owned [`Record`]s, then drop the file.
 /// Raw symbol data: per-dimension UEL indices plus a single value column.
 #[derive(Debug, Default)]
 pub struct RawSymbolData {
@@ -79,6 +71,14 @@ enum Filter<'a> {
     Indices(&'a dyn Fn(&[i32]) -> bool),
 }
 
+/// A GDX file opened for reading.
+///
+/// On [`open`](GdxFile::open) the symbol table and special-value sentinels are
+/// loaded eagerly; record data is read on demand via [`read`](GdxFile::read).
+/// The underlying GDX object is closed and freed on drop.
+///
+/// Not thread-safe: the type is intentionally `!Send`/`!Sync` (it holds a raw
+/// pointer). Read the data you need into owned [`Record`]s, then drop the file.
 pub struct GdxFile {
     obj: *mut ffi::GdxObj,
     special: [f64; ffi::GMS_SVIDX_MAX],
@@ -619,9 +619,6 @@ impl GdxFile {
     ) -> Result<RawSymbolData> {
         let vidx = value_field.index();
         let mut data = RawSymbolData::with_capacity(info.dim, info.records);
-
-        let nrecs = 0;
-        let _ = nrecs;
 
         // Filtered and limited reads alike use the `gdxDataReadRawFastEx`
         // bulk callback: one FFI crossing for the whole loop, with the index

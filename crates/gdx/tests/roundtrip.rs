@@ -119,3 +119,66 @@ fn open_nonexistent_errors() {
         .expect("opening a missing file should fail");
     assert!(matches!(err, gdx::GdxError::OpenRead { .. }));
 }
+
+#[test]
+fn invalid_writer_shapes_leave_writer_usable() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("invalid-shapes.gdx");
+    let mut writer = GdxWriter::create(&path, "validation-test").unwrap();
+    let valid = rec(&["a", "b"], [1.0, 0.0, 0.0, 0.0, 0.0]);
+
+    for keys in [&["a"][..], &["a", "b", "c"][..]] {
+        // A bad later record must be rejected before even the valid one is written.
+        let err = writer
+            .write_symbol(
+                "p",
+                "",
+                2,
+                SymbolType::Parameter,
+                0,
+                &[valid.clone(), rec(keys, [1.0; 5])],
+            )
+            .unwrap_err();
+        assert!(matches!(err, gdx::GdxError::InvalidWriteInput(_)));
+    }
+    for domains in [&["i"][..], &["i", "j", "k"][..]] {
+        let err = writer
+            .write_symbol_with_domains(
+                "p",
+                "",
+                2,
+                SymbolType::Parameter,
+                0,
+                std::slice::from_ref(&valid),
+                domains,
+            )
+            .unwrap_err();
+        assert!(matches!(err, gdx::GdxError::InvalidWriteInput(_)));
+    }
+    for dim in [gdx_sys::GMS_MAX_INDEX_DIM + 1, usize::MAX] {
+        let err = writer
+            .write_symbol("p", "", dim, SymbolType::Parameter, 0, &[])
+            .unwrap_err();
+        assert!(matches!(err, gdx::GdxError::InvalidWriteInput(_)));
+    }
+    writer
+        .write_symbol_with_domains(
+            "p",
+            "",
+            2,
+            SymbolType::Parameter,
+            0,
+            std::slice::from_ref(&valid),
+            &["i", "j"],
+        )
+        .unwrap();
+    writer.finish().unwrap();
+
+    let file = GdxFile::open(&path).unwrap();
+    assert_eq!(file.symbols().len(), 1);
+    assert_eq!(file.symbol("p").unwrap().domains, ["i", "j"]);
+    let records = file.read("p").unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].keys, valid.keys);
+    assert_eq!(records[0].values[0], 1.0);
+}

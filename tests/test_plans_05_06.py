@@ -106,6 +106,18 @@ def test_key_names_avoids_value_collision():
     assert names == ["value_0", "value_1"]
 
 
+@pytest.mark.parametrize(
+    "domains,reserved,expected",
+    [
+        (["i", "i_2", "i"], set(), ["i", "i_2", "i_2_2"]),
+        (["value", "value_0"], {"value", "value_0"}, ["value_0_0", "value_0_1"]),
+        (["dim_1", "*"], set(), ["dim_1", "dim_1_1"]),
+    ],
+)
+def test_key_names_handles_suffix_collisions(domains, reserved, expected):
+    assert _key_names(domains, len(domains), reserved) == expected
+
+
 def test_scan_symbol_with_value_domain(edge_available):
     if not edge_available:
         pytest.skip("edgecase fixture not present")

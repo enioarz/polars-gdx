@@ -50,8 +50,6 @@ impl GdxWriter {
         }
     }
 
-    /// Write one symbol with all of its records.
-    ///
     /// Write one symbol with all of its records, recording relaxed domain
     /// names (one per dimension, no domain checking) via
     /// `gdxSymbolSetDomainX`.
@@ -66,11 +64,18 @@ impl GdxWriter {
         records: &[Record],
         domains: &[&str],
     ) -> Result<()> {
+        // Validate before writing the symbol: the C API reads one pointer per
+        // dimension and cannot check the length of the supplied slice.
+        if !domains.is_empty() && domains.len() != dim {
+            return Err(GdxError::InvalidWriteInput(format!(
+                "expected {dim} domain names, got {}",
+                domains.len()
+            )));
+        }
         self.write_symbol(name, text, dim, kind, subtype, records)?;
         if domains.is_empty() {
             return Ok(());
         }
-        debug_assert_eq!(domains.len(), dim, "one domain name per dimension");
         let cname = CString::new(name).map_err(|_| GdxError::InvalidPath(name.into()))?;
         let cdomains: Vec<CString> = domains
             .iter()
@@ -102,6 +107,22 @@ impl GdxWriter {
         subtype: i32,
         records: &[Record],
     ) -> Result<()> {
+        // Check all records before starting a native write, both to keep the
+        // writer usable after invalid input and to prevent out-of-bounds FFI reads.
+        if dim > ffi::GMS_MAX_INDEX_DIM {
+            return Err(GdxError::InvalidWriteInput(format!(
+                "dimension {dim} exceeds the maximum {}",
+                ffi::GMS_MAX_INDEX_DIM
+            )));
+        }
+        for (index, rec) in records.iter().enumerate() {
+            if rec.keys.len() != dim {
+                return Err(GdxError::InvalidWriteInput(format!(
+                    "record {index}: expected {dim} keys, got {}",
+                    rec.keys.len()
+                )));
+            }
+        }
         let cname = CString::new(name).map_err(|_| GdxError::InvalidPath(name.into()))?;
         let ctext = CString::new(text).unwrap_or_default();
 
@@ -120,7 +141,6 @@ impl GdxWriter {
             }
 
             for rec in records {
-                debug_assert_eq!(rec.keys.len(), dim, "record key count must equal dim");
                 let ckeys: Vec<CString> = rec
                     .keys
                     .iter()
