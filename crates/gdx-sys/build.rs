@@ -53,6 +53,17 @@ fn main() {
             .define("CMAKE_RC_COMPILER", format!("{prefix}-windres"));
     }
 
+    // Native Windows/MSVC: the cmake crate replaces CMAKE_<LANG>_FLAGS_RELEASE with
+    // a flag set that carries no /O switch (it relies on the VS toolset defaulting a
+    // missing <Optimization> to MaxSpeed). Newer CMake/toolset combinations, as used
+    // by the CI release runners, emit Disabled instead and silently produce an
+    // unoptimized DLL (~2x slower reads). Define the per-config flags explicitly so
+    // the vendored library is always optimized.
+    if target_os == "windows" && cfg!(target_os = "windows") {
+        cfg.define("CMAKE_C_FLAGS_RELEASE", "/MD /O2 /DNDEBUG")
+            .define("CMAKE_CXX_FLAGS_RELEASE", "/MD /O2 /DNDEBUG");
+    }
+
     let dst = cfg.build_target("gdxcclib64").build();
 
     // With `build_target`, artifacts land in the CMake binary dir (`<dst>/build`),
