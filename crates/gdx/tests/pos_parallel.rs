@@ -27,6 +27,7 @@ fn pos_parallel_matches_serial() {
         let builder = || accept_all_builder();
         let par = read_symbol_raw_parallel_pos(FIXTURE, info, vf, &builder, threads).unwrap();
         assert_eq!(par.values.len(), serial.values.len(), "threads={threads}");
+        assert_eq!(par.values, serial.values, "threads={threads}");
         for d in 0..info.dim {
             assert_eq!(par.keys[d], serial.keys[d], "dim {d} threads={threads}");
         }
@@ -70,6 +71,7 @@ fn pos_parallel_matches_serial_compressed() {
         let par =
             read_symbol_raw_parallel_pos(COMPRESSED_FIXTURE, info, vf, &builder, threads).unwrap();
         assert_eq!(par.values.len(), serial.values.len(), "threads={threads}");
+        assert_eq!(par.values, serial.values, "threads={threads}");
         for d in 0..info.dim {
             assert_eq!(par.keys[d], serial.keys[d], "dim {d} threads={threads}");
         }

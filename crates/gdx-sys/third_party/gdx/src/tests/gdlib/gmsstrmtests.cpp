@@ -27,6 +27,7 @@
 #include "../doctest.hpp"
 #include <fstream>
 #include <filesystem>
+#include <algorithm>
 
 using namespace std::literals::string_literals;
 using namespace gdlib::gmsstrm;
@@ -145,6 +146,77 @@ TEST_CASE( "Writing a single line model without compression" )
 TEST_CASE( "Writing a single line model with compression" )
 {
    testWritingSingleLineModel( true, false );
+}
+
+TEST_CASE( "Buffered scalar reads cross blocks and preserve byte order" )
+{
+   bool compressed = false, swapped = false;
+   SUBCASE( "uncompressed native" ) {}
+   SUBCASE( "compressed native" ) { compressed = true; }
+   SUBCASE( "uncompressed swapped" ) { swapped = true; }
+   SUBCASE( "compressed swapped" ) { compressed = swapped = true; }
+
+   const std::string filename { "buffered-scalars.bin" };
+   int64_t dataStart {};
+   {
+      TBufferedFileStream out { filename, fmCreate };
+      const auto write = [&]( auto value ) {
+         std::array<uint8_t, sizeof( value )> bytes;
+         std::memcpy( bytes.data(), &value, bytes.size() );
+         if( swapped ) std::reverse( bytes.begin(), bytes.end() );
+         REQUIRE_EQ( out.Write( bytes.data(), bytes.size() ), bytes.size() );
+      };
+      // Explicit byte-order header lets the same payload exercise both
+      // native and foreign-endian files on every host architecture.
+      write( uint8_t { sizeof( uint16_t ) } );
+      write( PAT_WORD );
+      write( uint8_t { sizeof( int ) } );
+      write( PAT_INTEGER );
+      write( uint8_t { sizeof( double ) } );
+      write( PAT_DOUBLE );
+      REQUIRE( out.FlushBuffer() );
+      dataStart = out.GetPosition();
+      out.SetCompression( compressed );
+      // Each tuple is 23 bytes. Over 32769 tuples every scalar alignment
+      // crosses a 32 KiB boundary, including a byte at the next block start.
+      for( int i {}; i <= BufferSize; ++i )
+      {
+         write( static_cast<uint8_t>( i ) );
+         write( static_cast<uint16_t>( i * 3 ) );
+         write( -i * 12345 );
+         write( int64_t { -123456789012345LL } + i );
+         write( -i - 0.25 );
+      }
+      REQUIRE( out.FlushBuffer() );
+   }
+   {
+      TMiBufferedStream in { filename, fmOpenRead };
+      REQUIRE_EQ( in.GoodByteOrder(), 0 );
+      in.SetCompression( compressed );
+      in.SetPosition( dataStart );
+      for( int i {}; i <= BufferSize; ++i )
+      {
+         REQUIRE_EQ( in.ReadByte(), static_cast<uint8_t>( i ) );
+         const auto block = in.GetCheckpointBlock();
+         const auto offset = in.GetCheckpointOffset();
+         const auto check = [&]() {
+            REQUIRE_EQ( in.ReadWord(), static_cast<uint16_t>( i * 3 ) );
+            REQUIRE_EQ( in.ReadInteger(), -i * 12345 );
+            REQUIRE_EQ( in.ReadInt64(), int64_t { -123456789012345LL } + i );
+            REQUIRE_EQ( in.ReadDouble(), -i - 0.25 );
+         };
+         check();
+         // Resuming within a compressed block must not retain stale
+         // buffered state. Also cover tuples that straddle the boundary.
+         if( compressed && ( i % 997 == 0 || offset > BufferSize - 23 ) )
+         {
+            in.SetCheckpoint( block, offset );
+            check();
+         }
+      }
+      REQUIRE_EQ( in.GetLastIOResult(), 0 );
+   }
+   std::filesystem::remove( filename );
 }
 
 TEST_SUITE_END();

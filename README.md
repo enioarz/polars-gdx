@@ -56,6 +56,10 @@ vs [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (pandas-backed), on a 2
 
 ¹ gamsapi has no lazy loading or pushdown: it must materialize the whole symbol, then filter. The advantage of polars-gdx grows with predicate selectivity; `head(n)`/`n_rows` terminates the native read after n records.
 
+For compressed loading measurements and reproduction commands, see
+[the compressed-read benchmark](benchmarks/compressed_reads.md).
+`benchmarks/bench_read.py` measures first and repeated reads without a GAMS installation.
+
 ## Free-threaded Python
 
 GIL-disabled Python is **not currently supported**. The PyO3 module requires

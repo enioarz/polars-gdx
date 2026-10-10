@@ -1406,8 +1406,7 @@ bool TGXFileObj::DoRead( double *AVals, int &AFDim )
       return true;
    }
 
-   uint8_t B;
-   FFile->Read( &B, 1 );
+   const uint8_t B = FFile->ReadByte();
    if( B > DeltaForRead )
    {// relative change in last dimension
       if( B == 255 ) return false;
@@ -1446,8 +1445,7 @@ bool TGXFileObj::DoRead( double *AVals, int &AFDim )
    {
       for( int DV { GMS_VAL_LEVEL }; DV <= LastDataField; DV++ )
       {
-         uint8_t BSV;
-         FFile->Read( &BSV, 1 );
+         const uint8_t BSV = FFile->ReadByte();
          TgdxIntlValTyp SV { static_cast<TgdxIntlValTyp>( BSV ) };
          // Delphi doesn't bound check here and just writes adjacent junk
          // but we at least consistently write 0

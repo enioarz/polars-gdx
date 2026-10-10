@@ -338,6 +338,13 @@ def test_compressed_read_parity():
         pytest.skip("compressed fixture not present")
     serial = read_gdx(COMPRESSED, symbol="big")
     assert serial.height == 20000
+    # Check against the generator's values, not just another read path:
+    # both paths share the native decoder and could agree on corrupt data.
+    assert serial.select("i", "j", "value").rows() == [
+        (f"i{i}", f"j{j}", float(i * 1000 + j))
+        for i in range(1, 41)
+        for j in range(1, 501)
+    ]
     for threads in (2, 4):
         parallel = read_gdx(COMPRESSED, symbol="big", threads=threads)
         assert serial.equals(parallel), threads
