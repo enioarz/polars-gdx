@@ -877,26 +877,6 @@ int TMiBufferedStream::GoodByteOrder() const
    return res;
 }
 
-double TMiBufferedStream::ReadDouble()
-{
-   return ReadValueOrdered<double>( RWType::rw_double, order_double );
-}
-
-int TMiBufferedStream::ReadInteger()
-{
-   return ReadValueOrdered<int>( RWType::rw_integer, order_integer );
-}
-
-uint16_t TMiBufferedStream::ReadWord()
-{
-   return ReadValueOrdered<uint16_t>( RWType::rw_word, order_word );
-}
-
-int64_t TMiBufferedStream::ReadInt64()
-{
-   return ReadValueOrdered<int64_t>( RWType::rw_int64, order_integer );
-}
-
 bool TMiBufferedStream::WordsNeedFlip() const
 {
    return order_word;

@@ -260,11 +260,32 @@ class TBufferedFileStream : public TXFileStream
 protected:
    int64_t GetSize() override;
 
+   // Read small scalars directly from the current (possibly decompressed)
+   // block. memcpy permits unaligned input without aliasing violations.
+   // A scalar straddling blocks still goes through Read's refill path.
+   template<typename T>
+   T ReadBufferedValue()
+   {
+      T value {};
+      if( !NrWritten && sizeof( T ) <= NrLoaded - NrRead )
+      {
+         std::memcpy( &value, BufPtr.data() + NrRead, sizeof( T ) );
+         NrRead += sizeof( T );
+      }
+      else Read( &value, sizeof( T ) );
+      return value;
+   }
+
 public:
    TBufferedFileStream( const std::string &FileName, uint16_t Mode );
    ~TBufferedFileStream() override;
    bool FlushBuffer();
    uint32_t Read( void *Buffer, uint32_t Count ) override;
+   uint8_t ReadByte()
+   {
+      if( Paranoid ) ParCheck( RWType::rw_byte );
+      return ReadBufferedValue<uint8_t>();
+   }
    char ReadCharacter();
    uint32_t Write( const void *Buffer, uint32_t Count ) override;
    bool IsEof();
@@ -288,7 +309,7 @@ public:
 
 void reverseBytesMax8( const void *psrc, void *pdest, int sz );
 
-class TMiBufferedStream : public TBufferedFileStream
+class TMiBufferedStream final : public TBufferedFileStream
 {
    uint8_t order_word {}, order_integer {}, order_double {}, size_word {}, size_integer {}, size_double {};
    bool NormalOrder {};
@@ -298,11 +319,10 @@ class TMiBufferedStream : public TBufferedFileStream
    {
       if( Paranoid ) ParCheck( rwt );
       T res;
-      if( !order_type ) Read( &res, sizeof( T ) );
+      if( !order_type ) res = ReadBufferedValue<T>();
       else
       {
-         T tmp;
-         Read( &tmp, sizeof( T ) );
+         T tmp = ReadBufferedValue<T>();
          reverseBytesMax8( &tmp, &res, sizeof( T ) );
       }
       return res;
@@ -337,10 +357,10 @@ public:
    TMiBufferedStream( const std::string &FileName, uint16_t Mode );
    static void ReverseBytes( void *psrc, void *pdest, int sz );
    [[nodiscard]] int GoodByteOrder() const;
-   double ReadDouble() override;
-   int ReadInteger() override;
-   uint16_t ReadWord() override;
-   int64_t ReadInt64() override;
+   double ReadDouble() override { return ReadValueOrdered<double>( RWType::rw_double, order_double ); }
+   int ReadInteger() override { return ReadValueOrdered<int>( RWType::rw_integer, order_integer ); }
+   uint16_t ReadWord() override { return ReadValueOrdered<uint16_t>( RWType::rw_word, order_word ); }
+   int64_t ReadInt64() override { return ReadValueOrdered<int64_t>( RWType::rw_int64, order_integer ); }
    [[nodiscard]] bool WordsNeedFlip() const;
    [[nodiscard]] bool IntsNeedFlip() const;
    void WriteGmsInteger( int N );

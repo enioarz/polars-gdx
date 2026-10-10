@@ -18,6 +18,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: Test native buffered reads
+        run: |
+          cmake -S crates/gdx-sys/third_party/gdx -B /tmp/polars-gdx-native-tests \
+            -DCMAKE_BUILD_TYPE=Release -DNO_TESTS=OFF -DNO_EXAMPLES=ON -DNO_TOOLS=ON \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          cmake --build /tmp/polars-gdx-native-tests --target gdxtest --parallel 2
+          cd /tmp/polars-gdx-native-tests
+          ./gdxtest --test-suite=gdlib::gmsstrm
       - run: pip install patchelf polars pyarrow pytest
       - run: pip install -e .
       - run: pytest tests/ -q
