@@ -56,6 +56,14 @@ vs [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (pandas-backed), on a 2
 
 ¹ gamsapi has no lazy loading or pushdown: it must materialize the whole symbol, then filter. The advantage of polars-gdx grows with predicate selectivity; `head(n)`/`n_rows` terminates the native read after n records.
 
+## Free-threaded Python
+
+GIL-disabled Python is **not currently supported**. The PyO3 module requires
+the GIL, shared reader caches still rely on it, and the wheel/test matrix only
+covers conventional CPython. `threads=` uses native worker handles; it does
+not imply free-threaded Python support. See [the compatibility audit](docs/free-threaded-python.md)
+for the required synchronization, packaging, and testing work.
+
 ## Build
 
 ```sh

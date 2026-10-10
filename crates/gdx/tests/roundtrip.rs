@@ -121,6 +121,43 @@ fn open_nonexistent_errors() {
 }
 
 #[test]
+fn raw_limits_are_exact_and_count_only_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("limits.gdx");
+    write_fixture(&path);
+    let file = GdxFile::open(&path).unwrap();
+    let info = file.symbol("c").unwrap();
+    let full = file
+        .read_symbol_raw(info, ValueField::Level, None, None)
+        .unwrap();
+    let skip_first = |keys: &[i32]| {
+        if keys[1] == full.keys[1][0] as i32 + 1 {
+            gdx::RecordAction::Skip
+        } else {
+            gdx::RecordAction::Accept
+        }
+    };
+    for pred in [
+        None,
+        Some(&skip_first as &dyn Fn(&[i32]) -> gdx::RecordAction),
+    ] {
+        let expected = file
+            .read_symbol_raw(info, ValueField::Level, pred, None)
+            .unwrap();
+        for limit in [0, 1, 2, 10] {
+            let actual = file
+                .read_symbol_raw(info, ValueField::Level, pred, Some(limit))
+                .unwrap();
+            let n = limit.min(expected.len());
+            assert_eq!(actual.values, expected.values[..n]);
+            for (actual, expected) in actual.keys.iter().zip(&expected.keys) {
+                assert_eq!(actual, &expected[..n]);
+            }
+        }
+    }
+}
+
+#[test]
 fn invalid_writer_shapes_leave_writer_usable() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("invalid-shapes.gdx");
