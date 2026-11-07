@@ -21,6 +21,28 @@ jobs:
       - run: pip install patchelf polars pyarrow pytest
       - run: pip install -e .
       - run: pytest tests/ -q
+      # M7 task 042: the same suite against the gdxrs backend default.
+      - run: pytest tests/ -q
+        env:
+          POLARS_GDX_BACKEND: gdxrs
+
+  # M7 task 042: gdxrs-only build/runtime path — no GAMS, no C++, no
+  # vendored native GDX library (cargo feature 'gdxrs' alone).
+  gdxrs-only:
+    if: ${{ !startsWith(github.head_ref || github.ref_name, 'docs/') && !startsWith(github.head_ref || github.ref_name, 'chore/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check -p polars-gdx --no-default-features --features gdxrs
+      - run: cargo clippy -p polars-gdx --no-default-features --features gdxrs --all-targets -- -D warnings
+      - run: pip install maturin patchelf polars pyarrow pytest
+      - run: maturin build --release --no-default-features --features gdxrs --out dist
+      - run: pip install dist/*.whl
+      - run: pytest tests/ -q
 
   benchmark:
     if: ${{ !startsWith(github.head_ref || github.ref_name, 'docs/') && !startsWith(github.head_ref || github.ref_name, 'chore/') }}

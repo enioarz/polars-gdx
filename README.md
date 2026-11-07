@@ -61,6 +61,21 @@ vs [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (pandas-backed), on a 2
 
 ¹ gamsapi has no lazy loading or pushdown: it must materialize the whole symbol, then filter. The advantage of polars-gdx grows with predicate selectivity; `head(n)`/`n_rows` terminates the native read after n records.
 
+## Backends (M7, `develop/m7`)
+
+`scan_gdx`/`read_gdx`/`list_symbols`/`read_domains` accept an explicit
+`backend=` argument: `"legacy"` (the vendored native GDX C library; the 0.6.x
+default) or `"gdxrs"` (a pinned pure-Rust GDX v7 core — no GAMS, C++ or native
+GDX library in that build/runtime path). Backend selection is final: a gdxrs
+source/decode/resource failure is raised, never retried through the legacy
+backend. The two backends produce identical frames except for the documented
+deliberate projection differences (UNDEF/NA/acronyms: `null` under gdxrs vs
+NaN/native acronym numbers under legacy; EPS counts as a projected +0.0 in
+scan statistics). A gdxrs-only wheel builds with
+`maturin build --no-default-features --features gdxrs`. See
+[docs/m7-adapter-contract.md](docs/m7-adapter-contract.md) and
+[docs/m7-development.md](docs/m7-development.md).
+
 ## Free-threaded Python
 
 GIL-disabled Python is **not currently supported**. The PyO3 module requires
