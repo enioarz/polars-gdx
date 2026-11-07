@@ -1,6 +1,6 @@
 # M7 adapter contract — gdxrs backend for polars-gdx
 
-Status: draft for review (task 041). This document defines the contract that tasks
+Status: implementation contract (task 041); implementation and acceptance remain pending. This document defines the contract that tasks
 042–047 implement against. It authorizes no implementation by itself.
 
 Scope boundary: everything in this contract lives in `enioarz/polars-gdx`. No
@@ -14,7 +14,7 @@ workarounds.
 | --- | --- |
 | gdxrs core revision | `9a7411764f176adb613185fa1e45d64b06123683` (gdxrs `main`, post-M6) — adapter depends on it as a git dependency with this rev pinned; bump only via a reviewed change that reruns the affected gates |
 | polars-gdx adapter revision | `23beb2429d4a362c3c078c239d9136ae2f463e27` (`main`, legacy backend only) |
-| Rust | gdxrs toolchain 1.99.1; adapter MSRV 1.80 (workspace `rust-version`), built with 1.99.1 in this qualification |
+| Rust | gdxrs backend requires 1.99.1 (the pinned core's `rust-version`); use 1.99.1 for M7 CI/builds. The legacy workspace declares 1.80, which does not apply to gdxrs-enabled builds and was not requalified here |
 | Python | >= 3.10 (abi3-py310 wheel); qualified on 3.12.15; CI classifiers 3.10–3.14 |
 | PyO3 | 0.25 (`extension-module`, `abi3-py310`), matching arrow-pyarrow 56 |
 | Arrow (Rust) | 56 (`arrow`, `arrow-pyarrow`, `default-features = false`, features `pyarrow`, `ipc`) |
@@ -53,9 +53,9 @@ backend unless an exclusion below says otherwise):
   verified fallback to serial on any boundary/count mismatch.
 - Repeated scans of the same LazyFrame are deterministic (`is_pure=True`).
 
-Independent fixtures: `tests/data/trnsport.gdx`, `tests/data/compressed.gdx`,
+Existing fixtures: `tests/data/trnsport.gdx`, `tests/data/compressed.gdx`,
 `tests/data/edgecase.gdx`; independent native expectations are authored in
-`tests/` (see §7), not derived from either backend.
+`tests/` (see the evidence record), not derived from either backend.
 
 ## 3. Compatibility requirements, exclusions, special-value/acronym policy
 
@@ -83,13 +83,20 @@ Special-value / acronym conversion policy (value column is `pl.Float64`):
   rejected, never silently coerced.
 - `SpecialValue::PositiveInfinity`/`NegativeInfinity` map to `±inf`.
 - `SpecialValue::Undefined`, `NotAvailable` map to `null`.
-- `SpecialValue::Epsilon` maps to its exact stored double bits via the exact
-  conversion (no rounding to 0).
+- `SpecialValue::Epsilon` explicitly maps to positive zero, bits
+  `0x0000000000000000`, preserving the legacy Float64 projection. This loses
+  EPS identity by design; count EPS projections in scan statistics. Match on
+  the typed core value and construct the adapter result directly. Do not call
+  `FloatConversion::Exact` for EPS: it correctly rejects loss of typed identity.
+  Core values and core conversion behavior remain unchanged.
 - `Value::Acronym` has no Float64 representation: with
   `AcronymReadPolicy::Preserve` the adapter surfaces the value as `null` and
   counts occurrences in a scan statistic; with `ToNotAvailable` it maps to
   `null` as NotAvailable. Any different mapping is a contract change requiring
-  independent expected results (task 043 fixtures).
+  independent expected results. The authored expectations are fixed now in
+  [m7-fixture-expectations.md](m7-fixture-expectations.md); tasks 042/043 add the
+  generators and executable assertions. Undefined/NA-to-null intentionally differs
+  from the legacy backend's NaN projection; test that difference explicitly.
 
 ## 4. Backend selection
 
@@ -102,9 +109,17 @@ Special-value / acronym conversion policy (value column is `pl.Float64`):
 ## 5. Schema and dictionary modes
 
 - Mode A (default, budget-admitted): `pl.Enum` over the full UEL table, as today.
-- Mode B (bounded large dictionaries): key columns carry original UEL IDs
-  (UInt32 physical) with explicit label resolution, and/or bounded string
-  batches; batch-local category codes are never reinterpreted as global UEL IDs.
+- Mode B: `key_mode="uel_id"` uses original one-based UEL IDs as UInt32 key
+  columns. `key_mode="enum"` selects mode A and remains the default. No automatic
+  mode switching; bounded string output is deferred beyond M7. Batch-local
+  category codes must never be reinterpreted as global IDs.
+- Mode A strictly decodes UEL labels as UTF-8 and rejects invalid bytes before
+  output; no replacement characters. Mode B does not decode labels. Its explicit
+  bounded resolver, `Reader.resolve_labels(ids)`, returns columns `uel_id: UInt32`
+  and `label: Binary`, preserving request order, duplicate requests and exact
+  original bytes. Zero/out-of-range IDs raise ValueError before any result;
+  requests exceeding the configured conversion budget raise a resource error.
+  String filters encode as UTF-8 and retain exact byte matching in either mode.
 - Full-dictionary Enum is admitted only under the budget in §6; insufficient
   admission is rejected clearly, never by silently changing the planned schema.
 - Schema is chosen before execution and preserved across empty batches,
@@ -123,19 +138,53 @@ One envelope, accounted separately per layer:
 | Python/Polars runtime overhead | accounted separately from the envelope; reported as whole-process RSS/VM, not charged to the core budget |
 | Caller-retained output | outside the envelope; reported separately |
 
-Concrete caps for acceptance (task 047 executes them): 256 MiB library root cap,
-enforced self-checked soft/hard 512 MiB OS process cap (RLIMIT_AS on Linux; the
-OS-cap measurement platform set is Linux, macOS, Windows x64 — functionality is
-qualified on all four platforms), ≤ 4 open descriptors incl. stdio, per-worker
-stack reservations admitted explicitly, scratch files under a bounded scratch cap
-with release verified especially on Windows.
+Concrete task-047 caps (targets to qualify, not existing adapter measurements):
 
-Acceptance recipes (defined here, executed in 047): growing, independently
-oversized record-heavy (raw and zlib-compressed) and metadata-heavy inputs at ≥ 4×
-the OS cap, streamed through noncollecting sinks, ≥ 3 trials with documented
-hardware/storage/cache state, measuring whole-process RSS/VM plus per-layer
-buffers; compare legacy vs gdxrs backends on equivalent decoded work; no
-universal speedup claims.
+- Core plus adapter-owned buffers: **256 MiB combined**, with shares reserved
+  before allocation. This includes live core state, dictionaries, conversion
+  copies, worker stacks/guards, queued output and sink staging. No independent
+  256 MiB allowance per layer or worker.
+- Linux process: enforced self-checked soft/hard **1 GiB RLIMIT_AS**, plus a
+  **512 MiB measured peak-RSS ceiling**. RSS is measured, not claimed as an
+  enforced RLIMIT_RSS. Python/Polars overhead and caller-retained output remain
+  outside the library accounting but inside the process measurements.
+- Scratch: **8 GiB aggregate per active scan**, including temporary indexes,
+  label-resolution spill, merge runs and unpublished sink output. Reserve before
+  writes; exhaustion fails explicitly. Input files and already published caller
+  outputs are excluded. Verify cleanup on success, failure and cancellation,
+  especially on Windows; do not remove caller-owned sources or sidecars.
+- Handles: **16 process descriptors including stdio**, of which at most **12**
+  are adapter-owned source/index/spill/sink handles. Admission is aggregate,
+  never per worker. M6's observed four descriptors are historical native-worker
+  evidence, not a viable adapter/sink cap.
+- At most **4 core workers**, with at most **4 queued batches** and at most
+  **1 MiB per batch**. Conversion/sink staging is charged simultaneously with
+  queued output; fixed slots and explicit backpressure prevent extra hidden
+  batches. Polars execution is limited to two threads for capped qualification;
+  configure other runtime pools explicitly and record their settings. Reject
+  explicit requests above configured worker admission; auto never exceeds it.
+
+The process-cap change is deliberate: in the setup environment, a fresh Python
+3.12 process importing Polars 2.1.0 and PyArrow 26.0.1 with
+`POLARS_MAX_THREADS=2 OPENBLAS_NUM_THREADS=1` reported VmPeak 645,908 KiB and
+VmSize 584,196 KiB before any GDX scan. The proposed 512 MiB address-space cap
+would reject that baseline. The new 1 GiB cap still requires task-047 validation;
+it is not a measured streaming pass. Functionality targets all four native
+platforms; initial enforced OS-cap measurements target Linux only. macOS/Windows
+resource measurements remain unqualified until separately executed and reported.
+
+Acceptance recipes: raw and zlib numeric symbols with **40M/80M records** at
+120 logical bytes per row; metadata-heavy universes with **72M/144M UELs**,
+63-byte labels plus terminator (64 logical bytes each). Both sizes exceed four
+times the 1 GiB process cap logically. Require physical raw/metadata sources
+also to exceed four times the cap; report actual bytes/hashes and fail the size
+gate if they do not. Zlib qualification is logical; compressed physical bytes
+may fit RAM. Required generator count limits must be extended/checked in 047.
+Use noncollecting sinks, at least three trials per case, controlled thread pools,
+and published hardware/storage/cache settings. Report RSS/VM, simultaneous
+per-layer buffers, scratch/handles, first batch, full output and cancellation.
+Compare backends using equivalent decoded work and the declared value projection;
+report losses/regressions without universal speedup claims.
 
 ## 7. Lifecycle: ownership, cancellation, errors, repeated scans
 
@@ -156,3 +205,22 @@ universal speedup claims.
   regression tests, reproducible baseline commands and results, independently
   authored expected results for gaps, the supported-version/platform matrix, and
   an explicit list of commands/fixtures that remain to be implemented.
+
+## 9. Development branch and merge gate
+
+`develop/m7` is the integration target for tasks 041–047. All M7 task PRs target
+that branch, including PR #39; tasks may span multiple reviewed PRs. Branch/task
+merges mean progress only. They do not authorize merging `develop/m7` into `main`.
+
+The final `develop/m7` → `main` PR stays draft until every task 041–047 is complete,
+review findings are resolved, and evidence links identify the exact adapter/core
+revisions qualified. Require the full legacy and gdxrs backend suites, all four
+native functionality/packaging platforms, the bounded streaming/schema/predicate/
+lifecycle gates, gdxrs-only installation without GAMS, and task-047 capped growing
+workloads with three trials. Record failures, skips and unrun cases explicitly;
+unresolved required checks keep the main merge blocked. Keep legacy as default
+and available until a separately reviewed migration change passes its gates.
+No task PR or agent may bypass this gate or merge the integration branch to main
+merely because one PR passed. Final merge requires explicit maintainer approval.
+
+Track each task and its evidence in [m7-development.md](m7-development.md).
