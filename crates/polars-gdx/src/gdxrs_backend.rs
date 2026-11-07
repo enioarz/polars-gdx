@@ -127,13 +127,27 @@ impl GdxrsReader {
                 label_bytes = label_bytes.saturating_add(entry.label.len() + 1);
             }
         }
-        // Vec<String> payload plus the shared Arrow StringArray
-        // (i32 offsets + values + validity bitmap).
+        // The dictionary is retained in two simultaneous copies — the
+        // cached Vec<String> table and the shared Arrow StringArray — and
+        // building the Arrow array needs a further temporary values copy
+        // plus a borrowed-slice vector. All are charged together, since
+        // they are live at the same time:
+        //   strings cache: labels * sizeof(String) + label payload
+        //   Arrow array:   i32 offsets + values payload + validity bitmap
+        //   temporaries:   labels * sizeof(&str) + one values-buffer copy
         let estimate = labels
             .checked_mul(std::mem::size_of::<String>())
+            // String cache payload.
             .and_then(|n| n.checked_add(label_bytes))
+            // Arrow i32 offsets and validity bitmap.
             .and_then(|n| n.checked_add(4 * labels.saturating_add(1)))
             .and_then(|n| n.checked_add(labels.saturating_add(7) / 8))
+            // Arrow values payload (second live copy of the labels).
+            .and_then(|n| n.checked_add(label_bytes))
+            // Conversion temporaries: borrowed-slice vector + one more
+            // transient values-buffer copy while the array is built.
+            .and_then(|n| n.checked_add(labels * std::mem::size_of::<&str>()))
+            .and_then(|n| n.checked_add(label_bytes))
             .ok_or_else(|| {
                 dictionary_admission_err(labels, usize::MAX, self.dictionary_budget_bytes)
             })?;
@@ -440,8 +454,13 @@ impl GdxrsReader {
             }
             filters.push((dim_idx, labels));
         }
-        let resolved = self.resolve_filters(&filters)?;
+        // Reset the per-scan counters, then admit the mode A dictionary
+        // before decoding or accumulating any record: a rejected admission
+        // must not have done the work first (rejected reads report zero
+        // decoded rows).
         *self.statistics.lock().unwrap() = ProjectionStats::default();
+        self.uel_strings()?;
+        let resolved = self.resolve_filters(&filters)?;
         // A conjunction containing an empty allowed set cannot match a
         // record; a zero limit likewise reads nothing. Both still return
         // the planned schema.

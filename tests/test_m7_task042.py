@@ -433,22 +433,38 @@ def test_non_level_fields_project_zeros_for_set_parameter_alias(backend):
 
 
 def test_dictionary_budget_admission_rejects_before_allocation():
-    """Finding 1: the mode A full-dictionary materialization is admitted
-    against an explicit adapter budget before any allocation; insufficient
-    admission is rejected clearly, never by silently changing the schema."""
+    """Findings 1 and 2 (second review round): the mode A full-dictionary
+    materialization is admitted against an explicit adapter budget that
+    counts every simultaneously live copy (cached strings, the Arrow
+    dictionary values, conversion temporaries), and admission is checked
+    before any record is decoded or accumulated."""
     if GdxrsReader is None:
         pytest.skip("gdxrs backend not compiled")
-    # Seven labels need ~200 bytes; a 128-byte budget must reject.
-    with pytest.raises(RuntimeError, match="dictionary budget"):
+    label_bytes = sum(len(label) + 1 for label in UEL_TABLE)
+    labels = len(UEL_TABLE)
+    # A 128-byte budget must reject, and the reported estimate must charge
+    # both retained copies plus temporaries — i.e. strictly more than the
+    # single-copy payload of strings + Arrow offsets.
+    with pytest.raises(RuntimeError, match="dictionary budget") as exc:
         GdxrsReader(M7, dictionary_budget_bytes=128).uel_table()
+    estimate = int(
+        __import__("re").search(r"needs ~(\d+) bytes", str(exc.value)).group(1)
+    )
+    assert estimate >= 2 * label_bytes + labels * 24 + labels * 8
     # The default budget admits the fixture dictionary.
     with GdxrsReader(M7) as reader:
         assert reader.uel_table() == UEL_TABLE
     # A zero budget is invalid configuration.
     with pytest.raises(ValueError, match="positive"):
         GdxrsReader(M7, dictionary_budget_bytes=0).uel_table()
-    # Rejection happens before output: a rejected dictionary never yields
-    # a partially materialized table on a later call.
+    # Admission is checked before decoding: a rejected read of a symbol
+    # with records reports zero decoded rows, proving no records were
+    # decoded or accumulated before the rejection.
     reader = GdxrsReader(M7, dictionary_budget_bytes=128)
     with pytest.raises(RuntimeError, match="dictionary budget"):
-        reader.read_arrow("C")
+        reader.read_arrow("P")
+    assert reader.scan_statistics()["decoded_rows"] == 0
+    # ... and the same holds for a zero-row request.
+    with pytest.raises(RuntimeError, match="dictionary budget"):
+        reader.read_arrow("P", n_rows=0)
+    assert reader.scan_statistics()["decoded_rows"] == 0
