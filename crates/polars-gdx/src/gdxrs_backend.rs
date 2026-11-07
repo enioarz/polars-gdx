@@ -19,7 +19,8 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::array::{
-    ArrayRef, DictionaryArray, Float64Array, Int16Array, Int32Array, StringArray, UInt32Array,
+    ArrayRef, BinaryArray, DictionaryArray, Float64Array, Int16Array, Int32Array, StringArray,
+    UInt32Array,
 };
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -405,16 +406,118 @@ impl GdxrsReader {
         Ok(dict)
     }
 
+    /// Resolve original UEL IDs to their exact label bytes (bounded mode
+    /// B resolver, adapter contract §5). Returns an Arrow RecordBatch
+    /// with columns `uel_id: UInt32` and `label: Binary`, preserving
+    /// request order and duplicate requests and returning the original
+    /// bytes without any decoding. Zero or out-of-range IDs reject the
+    /// whole request with ValueError before any result; a request whose
+    /// conversion allocation exceeds `dictionary_budget_bytes` raises a
+    /// resource error before returning a partial table. Labels are
+    /// fetched through the core's paged label cursor — no full
+    /// dictionary is materialized.
+    fn resolve_labels(&self, ids: Vec<u32>, py: Python<'_>) -> PyResult<PyObject> {
+        let core = self.core()?;
+        let uel_count = core.information().map_err(to_py_err)?.uel_count;
+        let mut validated: Vec<UelId> = Vec::with_capacity(ids.len());
+        for id in &ids {
+            if *id == 0 || *id > uel_count {
+                return Err(PyValueError::new_err(format!(
+                    "gdxrs backend: UEL ID {id} is zero or outside the file table (1..={uel_count})"
+                )));
+            }
+            validated.push(
+                UelId::new(*id)
+                    .map_err(|e| PyValueError::new_err(format!("gdxrs backend: {e}")))?,
+            );
+        }
+        // Admission pass: sum the label bytes before building anything.
+        let mut label_bytes = 0usize;
+        {
+            let mut cursor = core.uel_labels().map_err(to_py_err)?;
+            for id in &validated {
+                let label = cursor.get(*id).map_err(to_py_err)?;
+                label_bytes = label_bytes.saturating_add(label.len());
+            }
+        }
+        // Simultaneous copies: the collected label buffer plus the Arrow
+        // BinaryArray values (offsets + bytes + validity) and the
+        // UInt32 id column.
+        let estimate = ids
+            .len()
+            .checked_mul(std::mem::size_of::<Vec<u8>>())
+            .and_then(|n| n.checked_add(label_bytes))
+            .and_then(|n| n.checked_add(4 * ids.len().saturating_add(1)))
+            .and_then(|n| n.checked_add(label_bytes))
+            .and_then(|n| n.checked_add(ids.len().saturating_add(7) / 8))
+            .and_then(|n| n.checked_add(4 * ids.len()))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("gdxrs backend: label request layout overflow")
+            })?;
+        if estimate > self.dictionary_budget_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label resolution of {} IDs needs ~{estimate} bytes, \
+                 exceeding the adapter dictionary budget of {} bytes",
+                ids.len(),
+                self.dictionary_budget_bytes
+            )));
+        }
+        // Collection pass: exact original bytes, request order preserved.
+        let mut labels: Vec<Vec<u8>> = Vec::with_capacity(validated.len());
+        {
+            let mut cursor = core.uel_labels().map_err(to_py_err)?;
+            for id in &validated {
+                let label = cursor.get(*id).map_err(to_py_err)?;
+                labels.push(label.to_vec());
+            }
+        }
+        let label_column: ArrayRef = Arc::new(BinaryArray::from(
+            labels.iter().map(|b| b.as_slice()).collect::<Vec<_>>(),
+        ));
+        let id_column: ArrayRef = Arc::new(UInt32Array::from(ids));
+        let schema = Schema::new(vec![
+            Field::new("uel_id", arrow::datatypes::DataType::UInt32, false),
+            Field::new("label", arrow::datatypes::DataType::Binary, false),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![id_column, label_column])
+            .map_err(|e| PyRuntimeError::new_err(format!("record batch error: {e}")))?;
+        Ok(batch.into_pyarrow(py)?.into_any())
+    }
+
+    /// Resolve label strings to their original one-based UEL IDs with
+    /// exact (case-sensitive, byte-for-byte after UTF-8 encoding)
+    /// matching, without materializing the dictionary. Entry `i` is the
+    /// ID of `labels[i]`, or None when the label is not in the file.
+    fn label_ids(&self, labels: Vec<String>) -> PyResult<Vec<Option<u32>>> {
+        let core = self.core()?;
+        let encoded: Vec<Vec<u8>> = labels.iter().map(|l| l.as_bytes().to_vec()).collect();
+        let refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
+        let matches = core.lookup_labels(&refs).map_err(to_py_err)?;
+        let mut out = Vec::with_capacity(labels.len());
+        for ordinal in 0..matches.len() {
+            let id = matches
+                .get(ordinal)
+                .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing lookup result"))?
+                .id;
+            out.push(id.map(UelId::get));
+        }
+        Ok(out)
+    }
+
     /// Read one symbol as an Arrow RecordBatch, mirroring the legacy
-    /// backend's `read_arrow`. Key columns are Arrow dictionary arrays
-    /// over the full UEL table with 0-based raw UEL indices; the value
-    /// column is Float64 with the deliberate projection documented in the
-    /// adapter contract. `key_filter` labels match exactly; an empty
-    /// resolved ID set yields zero rows. `n_rows` is a global accepted-row
-    /// limit. Parallel reads are not implemented for this backend yet
-    /// (task 046); `threads` must be None/0/1.
+    /// backend's `read_arrow`. `key_mode="enum"` (default) emits Arrow
+    /// dictionary key arrays over the full UEL table with 0-based raw UEL
+    /// indices, admitted against `dictionary_budget_bytes` before any
+    /// decoding; `key_mode="uel_id"` emits the original one-based UEL IDs
+    /// as plain UInt32 key columns and never decodes or materializes any
+    /// label. The value column is Float64 with the deliberate projection
+    /// documented in the adapter contract. `key_filter` labels match
+    /// exactly (UTF-8 encoded, byte-for-byte) in either mode; an empty
+    /// resolved ID set yields zero rows with the planned schema. `n_rows`
+    /// is a global accepted-row limit. Parallel reads are not implemented
+    /// for this backend yet (task 046); `threads` must be None/0/1.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None))]
+    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None))]
     fn read_arrow(
         &self,
         name: &str,
@@ -423,6 +526,7 @@ impl GdxrsReader {
         key_filter: Option<Vec<(usize, Vec<String>)>>,
         n_rows: Option<usize>,
         threads: Option<usize>,
+        key_mode: Option<String>,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let core = self.core()?;
@@ -454,12 +558,24 @@ impl GdxrsReader {
             }
             filters.push((dim_idx, labels));
         }
+        let id_mode = match key_mode.as_deref() {
+            None | Some("enum") => false,
+            Some("uel_id") => true,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "key_mode must be 'enum' or 'uel_id', got {other:?}"
+                )))
+            }
+        };
         // Reset the per-scan counters, then admit the mode A dictionary
         // before decoding or accumulating any record: a rejected admission
         // must not have done the work first (rejected reads report zero
-        // decoded rows).
+        // decoded rows). The bounded ID mode decodes no labels and needs
+        // no dictionary admission.
         *self.statistics.lock().unwrap() = ProjectionStats::default();
-        self.uel_strings()?;
+        if !id_mode {
+            self.uel_strings()?;
+        }
         let resolved = self.resolve_filters(&filters)?;
         // A conjunction containing an empty allowed set cannot match a
         // record; a zero limit likewise reads nothing. Both still return
@@ -524,7 +640,11 @@ impl GdxrsReader {
             *self.statistics.lock().unwrap() = stats;
         }
         drop(handle);
-        let n_uels = self.uel_strings()?.len();
+        let n_uels = if id_mode {
+            0
+        } else {
+            self.uel_strings()?.len()
+        };
         let batch = to_record_batch(
             self,
             kind,
@@ -534,6 +654,7 @@ impl GdxrsReader {
             key_names,
             field,
             n_uels,
+            id_mode,
         )?;
         Ok(batch.into_pyarrow(py)?.into_any())
     }
@@ -596,6 +717,7 @@ fn to_record_batch(
     key_names: Option<Vec<String>>,
     field: ValueField,
     n_uels: usize,
+    id_mode: bool,
 ) -> PyResult<RecordBatch> {
     let mut names: Vec<String> = match &key_names {
         Some(names) if names.len() == dim => names.clone(),
@@ -612,10 +734,29 @@ fn to_record_batch(
     }
     names.push(value_name.clone());
 
-    let dict_values = reader.uel_array()?;
+    let dict_values = if id_mode {
+        None
+    } else {
+        Some(reader.uel_array()?)
+    };
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for key_column in keys.iter_mut().take(dim) {
         let column = std::mem::take(key_column);
+        if id_mode {
+            // Bounded ID mode: the original one-based UEL IDs as plain
+            // UInt32. No labels are decoded and no dictionary exists, so
+            // batch-local category codes can never be reinterpreted.
+            columns.push(Arc::new(UInt32Array::from(
+                column
+                    .into_iter()
+                    .map(|k| u32::try_from(k).ok())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef);
+            continue;
+        }
+        let dict_values = dict_values.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("gdxrs backend: dictionary missing in enum mode")
+        })?;
         let dict: ArrayRef = if n_uels > 0 && n_uels <= i16::MAX as usize + 1 {
             let indices = Int16Array::from(
                 column

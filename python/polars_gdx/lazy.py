@@ -185,6 +185,7 @@ def read_gdx(
     key_filter: dict[int, Sequence[str]] | None = None,
     threads: int | str | None = None,
     backend: str | None = None,
+    key_mode: str = "enum",
 ) -> pl.DataFrame:
     """Eagerly read one symbol of a GDX file into a DataFrame.
 
@@ -199,6 +200,7 @@ def read_gdx(
         key_filter=key_filter,
         threads=threads,
         backend=backend,
+        key_mode=key_mode,
     ).collect()
 
 
@@ -210,6 +212,7 @@ def scan_gdx(
     key_filter: dict[int, Sequence[str]] | None = None,
     threads: int | str | None = None,
     backend: str | None = None,
+    key_mode: str = "enum",
 ) -> pl.LazyFrame:
     """Lazily scan one symbol of a GDX file.
 
@@ -248,6 +251,27 @@ def scan_gdx(
         ``"legacy"`` when compiled in. Backend selection is explicit and
         final: a gdxrs source, decode or resource failure is raised, never
         retried through the legacy backend.
+    key_mode
+        Key column representation (gdxrs backend only, M7 task 043).
+        ``"enum"`` (default) declares key columns as ``pl.Enum`` over the
+        full UEL table in file order, admitted against the adapter's
+        dictionary budget before any output; insufficient admission is
+        rejected clearly, never by silently changing the schema. Labels
+        are strictly UTF-8; invalid bytes are rejected before output.
+        ``"uel_id"`` emits the original one-based UEL IDs as plain
+        ``UInt32`` key columns and never decodes or materializes any
+        label — the bounded mode for files whose dictionary exceeds the
+        budget. String filters (``key_filter`` and ``==``/``is_in``
+        predicates) still match exactly by encoding as UTF-8 and
+        resolving to IDs. Batch-local category codes are never
+        reinterpreted as global IDs; the schema is chosen before
+        execution and preserved across empty batches, partitions and
+        repeated scans. Use ``Reader.resolve_labels(ids)`` to resolve
+        original IDs to exact label bytes. In ``"uel_id"`` mode, string
+        ``key_filter`` labels and ``col(key) == "label"`` predicates match
+        exactly (labels are encoded as UTF-8 and resolved to their IDs);
+        ``is_in`` predicates must use the integer IDs, since Polars does
+        not plan String lists against UInt32 columns.
 
     Notes
     -----
@@ -268,6 +292,12 @@ def scan_gdx(
     """
     reader_cls = _reader_class(backend)
     backend_is_gdxrs = reader_cls is GdxrsReader
+    if key_mode not in ("enum", "uel_id"):
+        raise ValueError(f"key_mode must be 'enum' or 'uel_id', got {key_mode!r}")
+    if key_mode == "uel_id" and not backend_is_gdxrs:
+        raise ValueError(
+            "key_mode='uel_id' is only supported by the gdxrs backend"
+        )
     reader = reader_cls(str(path))
     info = {r[0]: r for r in reader.symbols()}
     if symbol not in info:
@@ -288,15 +318,25 @@ def scan_gdx(
     # set literally named ``value`` would otherwise overwrite it in the
     # schema dict and break the Arrow record batch).
     key_names = _key_names(domains, dim, reserved={value_name})
-    # Key columns are declared as Polars Enums over the file's UEL table.
-    # The Rust layer emits Arrow dictionary arrays whose values are exactly
-    # the UEL table (file order) and whose indices are the raw 0-based UEL
-    # numbers, so Polars reinterprets the buffers zero-copy: no string
-    # materialisation, and `==`/`is_in`/join/group-by on keys run as integer
-    # category comparisons. Polars 2.0 maps Arrow dictionaries to Categorical
-    # when no schema is given and enforces the schema declared to
-    # register_io_source, so this must be declared explicitly.
-    key_dtype = pl.Enum(reader.uel_table())
+    # The schema is chosen now, before execution, and preserved across
+    # empty batches, partitions and repeated scans.
+    if key_mode == "uel_id":
+        # Bounded ID mode: original one-based UEL IDs as plain UInt32.
+        # No labels are decoded and no dictionary is materialized, so
+        # files whose dictionary exceeds the budget still stream.
+        key_dtype = pl.UInt32
+    else:
+        # Key columns are declared as Polars Enums over the file's UEL
+        # table. The Rust layer emits Arrow dictionary arrays whose values
+        # are exactly the UEL table (file order) and whose indices are the
+        # raw 0-based UEL numbers, so Polars reinterprets the buffers
+        # zero-copy: no string materialisation, and `==`/`is_in`/join/
+        # group-by on keys run as integer category comparisons. Polars 2.0
+        # maps Arrow dictionaries to Categorical when no schema is given
+        # and enforces the schema declared to register_io_source, so this
+        # must be declared explicitly. The full dictionary is admitted
+        # against the adapter budget before any output.
+        key_dtype = pl.Enum(reader.uel_table())
     schema = {name: key_dtype for name in key_names} | {value_name: pl.Float64}
 
     explicit_filters = None
@@ -315,7 +355,9 @@ def scan_gdx(
         native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
-            native = _predicate_key_filter(pred_expr, key_names, reader)
+            native = _predicate_key_filter(
+                pred_expr, key_names, reader, id_mode=(key_mode == "uel_id")
+            )
             if native is None:
                 # Predicate not fully translatable: a native row limit could
                 # under-fill head(n), so read unlimited and let Polars-side
@@ -325,7 +367,12 @@ def scan_gdx(
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
                 # the raw read, and re-apply it exactly on the produced frame.
-                pred_expr = _exact_expr(native, key_names)
+                pred_expr = _exact_expr(
+                    native,
+                    key_names,
+                    reader=reader,
+                    id_mode=(key_mode == "uel_id"),
+                )
                 merged = {d: list(labels) for d, labels in explicit_filters or []}
                 for d, labels in native:
                     if d in merged:
@@ -335,6 +382,9 @@ def scan_gdx(
                         merged[d] = list(labels)
                 filters = list(merged.items())
 
+        kwargs = {}
+        if backend_is_gdxrs:
+            kwargs["key_mode"] = key_mode
         batch = reader.read_arrow(
             symbol,
             key_names=list(key_names),
@@ -342,6 +392,7 @@ def scan_gdx(
             key_filter=filters,
             n_rows=(n_rows if native_limit_safe else None),
             threads=threads,
+            **kwargs,
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         # Passing the Enum schema makes Polars reinterpret the dictionary
@@ -361,7 +412,10 @@ def scan_gdx(
 
 
 def _predicate_key_filter(
-    pred: pl.Expr, key_names: list[str], reader: Reader
+    pred: pl.Expr,
+    key_names: list[str],
+    reader: Reader,
+    id_mode: bool = False,
 ) -> list[tuple[int, list[str]]] | None:
     """Extract a native key filter from a predicate, if possible.
 
@@ -384,6 +438,27 @@ def _predicate_key_filter(
         return None
     if not filters:
         return None
+    if id_mode:
+        # Bounded ID mode: no dictionary may be materialized, so label
+        # existence is checked through the bounded lookup instead of the
+        # full UEL table. Filters stay in label space; the IDs are
+        # resolved when the exact predicate is re-applied.
+        known = set()
+        batch = []
+        for d, labels in filters:
+            batch.extend(labels)
+        ids = reader.label_ids(batch)
+        for label, id_ in zip(batch, ids):
+            if id_ is not None:
+                known.add(label)
+        resolved = []
+        for d, labels in filters:
+            existing = [l for l in labels if l in known]
+            if not existing:
+                # Label never used in this dimension: no record can match.
+                return [(d, [])]
+            resolved.append((d, existing))
+        return resolved
     uels = set(reader.uel_table())
     resolved = []
     for d, labels in filters:
@@ -395,7 +470,12 @@ def _predicate_key_filter(
     return resolved
 
 
-def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
+def _exact_expr(
+    filters: list[tuple[int, list[str]]],
+    key_names: list[str],
+    reader: Reader | None = None,
+    id_mode: bool = False,
+) -> pl.Expr:
     """Rebuild the predicate with exact (stored) labels.
 
     Within a dimension, labels are alternatives (OR) — a dimension's
@@ -408,10 +488,23 @@ def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> p
     for d, labels in filters:
         if not labels:
             return pl.lit(False)
-        # No `.cast(pl.String)`: key columns are Enums, so `==`/`is_in` on
-        # the stored labels resolve to integer category comparisons.
         col = pl.col(key_names[d])
-        dim_expr = col == labels[0] if len(labels) == 1 else col.is_in(labels)
+        if id_mode:
+            # Bounded ID mode: key columns hold the original one-based
+            # UEL IDs, so resolve the exact labels to their IDs through
+            # the bounded lookup and compare integers. The full dictionary
+            # is never materialized.
+            ids = reader.label_ids(list(dict.fromkeys(labels)))
+            resolved = sorted({i for i in ids if i is not None})
+            if not resolved:
+                return pl.lit(False)
+            dim_expr = (
+                col == resolved[0] if len(resolved) == 1 else col.is_in(resolved)
+            )
+        else:
+            # No `.cast(pl.String)`: key columns are Enums, so `==`/`is_in`
+            # on the stored labels resolve to integer category comparisons.
+            dim_expr = col == labels[0] if len(labels) == 1 else col.is_in(labels)
         expr = dim_expr if expr is None else expr & dim_expr
     return expr if expr is not None else pl.lit(False)
 
