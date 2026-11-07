@@ -10,17 +10,81 @@ materialised.
 from __future__ import annotations
 
 import json
+import os
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import polars as pl
 from polars.io.plugins import register_io_source
 
-from polars_gdx._core import Reader
+from polars_gdx import _core
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+Reader = getattr(_core, "Reader", None)
+GdxrsReader = getattr(_core, "GdxrsReader", None)
+
 _VALUE_FIELDS = ("level", "marginal", "lower", "upper", "scale")
+
+
+def _validate_backend_name(backend: str) -> str:
+    """Validate a backend name against the compiled backends and return it.
+
+    ``"legacy"`` selects the vendored native GDX C library backend (default
+    in 0.6.x); ``"gdxrs"`` selects the pinned pure-Rust gdxrs core (M7 task
+    042). Selection is explicit and final: a gdxrs source, decode or
+    resource failure is raised, never retried through the legacy backend.
+    """
+    if backend == "legacy":
+        if Reader is None:
+            raise RuntimeError(
+                "the legacy backend is not compiled into this build "
+                "(cargo feature 'legacy')"
+            )
+        return "legacy"
+    if backend == "gdxrs":
+        if GdxrsReader is None:
+            raise RuntimeError(
+                "the gdxrs backend is not compiled into this build "
+                "(cargo feature 'gdxrs')"
+            )
+        return "gdxrs"
+    raise ValueError(f"backend must be 'legacy' or 'gdxrs', got {backend!r}")
+
+
+def _default_backend() -> str:
+    """The default backend: ``POLARS_GDX_BACKEND`` when it names an
+    available backend, else ``"legacy"`` when compiled in, else
+    ``"gdxrs"``."""
+    override = os.environ.get("POLARS_GDX_BACKEND")
+    if override is not None:
+        return _validate_backend_name(override)
+    if Reader is not None:
+        return "legacy"
+    if GdxrsReader is not None:
+        return "gdxrs"
+    raise RuntimeError(
+        "no GDX backend is compiled in; build with the 'legacy' and/or "
+        "'gdxrs' cargo features"
+    )
+
+
+def _reader_class(backend: str | None):
+    """Resolve a backend name (or the default) to its reader class."""
+    name = backend if backend is not None else _default_backend()
+    return Reader if _validate_backend_name(name) == "legacy" else GdxrsReader
+
+
+#: Backends compiled into this extension.
+AVAILABLE_BACKENDS = tuple(
+    name
+    for name, cls in (("legacy", Reader), ("gdxrs", GdxrsReader))
+    if cls is not None
+)
+
+#: Default backend (docs/m7-adapter-contract.md §4: legacy stays the 0.6.x
+#: default; ``POLARS_GDX_BACKEND`` overrides it for differential test runs).
+DEFAULT_BACKEND = _default_backend()
 
 #: Smallest symbol (in records) for which ``threads="auto"`` parallelises
 #: the raw read. Below this, open/coordination overhead outweighs the gain.
@@ -43,7 +107,9 @@ def _resolve_threads(threads: int | str | None, n_records: int) -> int | None:
     return threads
 
 
-def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
+def read_domains(
+    path: str | Path, *, symbol: str, backend: str | None = None
+) -> pl.DataFrame:
     """List the labels actually used per index dimension of a symbol.
 
     Returns a DataFrame with one column per dimension (named like
@@ -55,8 +121,13 @@ def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
     bulk callback — no records are materialised and no value column is read —
     so it costs one pass over the raw indices regardless of the number of
     records. (Columns are padded to equal length with ``null``.)
+
+    ``backend`` selects the reader implementation: ``"legacy"`` (vendored
+    native GDX C library, default in 0.6.x) or ``"gdxrs"`` (pinned pure-Rust
+    core, M7 task 042). The default is ``POLARS_GDX_BACKEND`` when set,
+    else ``"legacy"`` when compiled in.
     """
-    with Reader(str(path)) as reader:
+    with _reader_class(backend)(str(path)) as reader:
         info = {r[0]: r for r in reader.symbols()}
         if symbol not in info:
             raise ValueError(
@@ -79,9 +150,12 @@ def read_domains(path: str | Path, *, symbol: str) -> pl.DataFrame:
     )
 
 
-def list_symbols(path: str | Path) -> pl.DataFrame:
-    """List the symbols in a GDX file as a DataFrame."""
-    with Reader(str(path)) as reader:
+def list_symbols(path: str | Path, backend: str | None = None) -> pl.DataFrame:
+    """List the symbols in a GDX file as a DataFrame.
+
+    ``backend`` selects the reader implementation (see :func:`scan_gdx`).
+    """
+    with _reader_class(backend)(str(path)) as reader:
         rows = reader.symbols()
     return pl.DataFrame(
         {
@@ -110,6 +184,7 @@ def read_gdx(
     value_field: str | None = None,
     key_filter: dict[int, Sequence[str]] | None = None,
     threads: int | str | None = None,
+    backend: str | None = None,
 ) -> pl.DataFrame:
     """Eagerly read one symbol of a GDX file into a DataFrame.
 
@@ -123,6 +198,7 @@ def read_gdx(
         value_field=value_field,
         key_filter=key_filter,
         threads=threads,
+        backend=backend,
     ).collect()
 
 
@@ -133,6 +209,7 @@ def scan_gdx(
     value_field: str | None = None,
     key_filter: dict[int, Sequence[str]] | None = None,
     threads: int | str | None = None,
+    backend: str | None = None,
 ) -> pl.LazyFrame:
     """Lazily scan one symbol of a GDX file.
 
@@ -162,6 +239,15 @@ def scan_gdx(
         parallelises reads of symbols with at least
         ``_AUTO_THREADS_MIN_RECORDS`` records using all available cores;
         smaller symbols stay serial. ``None``/0/1 means serial.
+        The ``gdxrs`` backend is serial only in 0.6.x; an explicit parallel
+        request raises (parallel admission arrives with M7 task 046).
+    backend
+        ``"legacy"`` (vendored native GDX C library; default in 0.6.x) or
+        ``"gdxrs"`` (pinned pure-Rust core; M7 task 042). The default is
+        ``POLARS_GDX_BACKEND`` when set to an available backend, else
+        ``"legacy"`` when compiled in. Backend selection is explicit and
+        final: a gdxrs source, decode or resource failure is raised, never
+        retried through the legacy backend.
 
     Notes
     -----
@@ -180,7 +266,9 @@ def scan_gdx(
     >>> lf = scan_gdx("trnsport.gdx", symbol="x")  # doctest: +SKIP
     >>> lf.filter(pl.col("dim_0") == "seattle").collect()  # doctest: +SKIP
     """
-    reader = Reader(str(path))
+    reader_cls = _reader_class(backend)
+    backend_is_gdxrs = reader_cls is GdxrsReader
+    reader = reader_cls(str(path))
     info = {r[0]: r for r in reader.symbols()}
     if symbol not in info:
         raise ValueError(
@@ -190,6 +278,11 @@ def scan_gdx(
     if value_field is not None and value_field not in _VALUE_FIELDS:
         raise ValueError(f"value_field must be one of {_VALUE_FIELDS}, got {value_field!r}")
     threads = _resolve_threads(threads, _n)
+    if backend_is_gdxrs and threads is not None:
+        raise ValueError(
+            "gdxrs backend: parallel reads are not implemented yet "
+            "(task 046); use threads=None"
+        )
     value_name = "value" if type_str in ("Set", "Parameter", "Alias") else (value_field or "level")
     # Key column names must never collide with the value column (a domain
     # set literally named ``value`` would otherwise overwrite it in the

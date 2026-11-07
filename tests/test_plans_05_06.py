@@ -7,6 +7,8 @@ import pytest
 from polars_gdx import Reader, read_gdx, scan_gdx
 from polars_gdx.lazy import _key_names
 
+from conftest import legacy_backend_only
+
 GDX = "tests/data/trnsport.gdx"
 EDGE = "tests/data/edgecase.gdx"
 
@@ -54,6 +56,7 @@ def test_predicate_wrong_case_yields_no_rows():
 # ---------------------------------------------------------------------------
 
 
+@legacy_backend_only
 def test_reader_close_raises_on_use():
     r = Reader(GDX)
     r.close()
@@ -62,6 +65,7 @@ def test_reader_close_raises_on_use():
     r.close()  # idempotent
 
 
+@legacy_backend_only
 def test_reader_context_manager():
     with Reader(GDX) as r:
         assert r.uel_table()
@@ -69,6 +73,7 @@ def test_reader_context_manager():
         r.uel_table()
 
 
+@legacy_backend_only
 def test_reader_reopen_after_close(tmp_path, edge_available):
     import shutil
 
@@ -118,6 +123,7 @@ def test_key_names_handles_suffix_collisions(domains, reserved, expected):
     assert _key_names(domains, len(domains), reserved) == expected
 
 
+@legacy_backend_only
 def test_scan_symbol_with_value_domain(edge_available):
     if not edge_available:
         pytest.skip("edgecase fixture not present")
@@ -128,6 +134,7 @@ def test_scan_symbol_with_value_domain(edge_available):
     assert sorted(df["value"].to_list()) == [1.0, 2.0, 3.0, 4.0]
 
 
+@legacy_backend_only
 def test_rust_rejects_colliding_key_names(edge_available):
     if not edge_available:
         pytest.skip("edgecase fixture not present")

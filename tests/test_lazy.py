@@ -3,6 +3,8 @@ import pytest
 
 from polars_gdx import Reader, list_symbols, read_domains, read_gdx, scan_gdx
 
+from conftest import legacy_backend_only
+
 GDX = "tests/data/trnsport.gdx"
 
 pytestmark = pytest.mark.skipif(
@@ -18,6 +20,7 @@ def test_list_symbols():
 
 @pytest.mark.parametrize("helper", [list_symbols, read_domains])
 @pytest.mark.parametrize("fail", [False, True])
+@legacy_backend_only
 def test_metadata_helpers_close_reader(monkeypatch, helper, fail):
     readers = []
     original = Reader.symbols
@@ -65,6 +68,7 @@ def test_no_early_read():
     scan_gdx(GDX, symbol="x")  # constructing the LazyFrame reads nothing
 
 
+@legacy_backend_only
 def test_predicate_uses_native_prefilter(monkeypatch):
     """pl.col(key) == label must fold into the native GDX prefilter."""
     import polars_gdx.lazy as lazy
@@ -92,6 +96,7 @@ def test_predicate_unknown_label_yields_no_rows():
     assert df.height == 0
 
 
+@legacy_backend_only
 def test_predicate_conjunction_prefilter(monkeypatch):
     import polars_gdx.lazy as lazy
 
@@ -216,6 +221,7 @@ def test_key_filter_multiple_labels_dim0():
     assert set(df["dim_0"]) == {"seattle", "san-diego"}
 
 
+@legacy_backend_only
 def test_parallel_read_parity():
     # threads>1 partitions dim-0 UEL space across workers; concatenated in
     # range order the result must equal the serial read exactly.
@@ -224,6 +230,7 @@ def test_parallel_read_parity():
     assert serial.equals(parallel)
 
 
+@legacy_backend_only
 def test_parallel_read_all_symbols_parity():
     for sym in ("x", "d", "i", "j", "a", "b", "cost", "supply", "demand"):
         serial = read_gdx(GDX, symbol=sym)
@@ -231,6 +238,7 @@ def test_parallel_read_all_symbols_parity():
         assert serial.equals(parallel), sym
 
 
+@legacy_backend_only
 def test_parallel_filtered_read_parity():
     serial = read_gdx(GDX, symbol="x", key_filter={0: ["seattle", "san-diego"]})
     parallel = read_gdx(
@@ -240,10 +248,12 @@ def test_parallel_filtered_read_parity():
     assert set(parallel["dim_0"]) == {"seattle", "san-diego"}
 
 
+@legacy_backend_only
 def test_parallel_single_thread_falls_back_to_serial():
     assert read_gdx(GDX, symbol="x", threads=1).equals(read_gdx(GDX, symbol="x"))
 
 
+@legacy_backend_only
 def test_parallel_dim0_filter_span_seek_parity():
     # With a warm restart index (built by the unfiltered parallel read
     # above), a dim-0 filtered parallel read takes the span-seek path:
@@ -259,6 +269,7 @@ def test_parallel_dim0_filter_span_seek_parity():
     assert serial.equals(pred)
 
 
+@legacy_backend_only
 def test_is_in_uses_native_prefilter(monkeypatch):
     """pl.col(key).is_in([...]) must fold into the native GDX prefilter."""
     import polars_gdx.lazy as lazy
@@ -333,6 +344,7 @@ def test_threads_auto_resolves_to_cpu_count_for_large_symbols(monkeypatch):
 COMPRESSED = "tests/data/compressed.gdx"
 
 
+@legacy_backend_only
 def test_compressed_read_parity():
     if not __import__("pathlib").Path(COMPRESSED).exists():
         pytest.skip("compressed fixture not present")
@@ -343,6 +355,7 @@ def test_compressed_read_parity():
         assert serial.equals(parallel), threads
 
 
+@legacy_backend_only
 def test_compressed_filtered_read_parity():
     if not __import__("pathlib").Path(COMPRESSED).exists():
         pytest.skip("compressed fixture not present")
@@ -363,6 +376,7 @@ def test_compressed_filtered_read_parity():
 # Polars 2.0: key columns are dictionary-encoded Categoricals
 # ---------------------------------------------------------------------------
 
+@legacy_backend_only
 def test_key_columns_are_enum_over_uel_table():
     df = read_gdx(GDX, symbol="x")
     uels = Reader(GDX).uel_table()
