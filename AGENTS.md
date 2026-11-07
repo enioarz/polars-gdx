@@ -4,6 +4,18 @@ Polars IO plugin for reading GAMS GDX files lazily, with native key-prefiltering
 Extracted from [lolow/gdxcomp](https://github.com/lolow/gdxcomp) (`gdx-sys` + `gdx` crates),
 building on the vendored, MIT-licensed [GAMS-dev/gdx](https://github.com/GAMS-dev/gdx) C++ library.
 
+## M7 integration workflow
+
+M7 work targets **`develop/m7`**, potentially across multiple PRs per task. Read
+[the integration tracker](docs/m7-development.md),
+[adapter contract](docs/m7-adapter-contract.md) and
+[independent expectations](docs/m7-fixture-expectations.md) before M7 changes.
+Do not merge or fast-forward this branch into `main` until tasks 041–047 are all
+complete, their required acceptance gates pass, blocking reviews are resolved,
+and a maintainer explicitly approves the final milestone merge. Task PR merges
+authorize progress on the integration branch only. The merging note below does
+not override this gate. Keep Arrow/PyO3/Polars dependencies out of the gdxrs core.
+
 ## Layout
 
 ```

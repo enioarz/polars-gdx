@@ -1,5 +1,10 @@
 # polars-gdx
 
+M7 integration work targets **`develop/m7`** across multiple task PRs. Merge that
+branch into `main` only after every task 041–047 and its required acceptance gates
+is complete and a maintainer approves the final merge. See the
+[M7 tracker](docs/m7-development.md) for progress and the full merge gate.
+
 Lazy, prefiltered Polars access to [GAMS GDX](https://github.com/GAMS-dev/gdx) files — no GAMS installation required.
 
 - `scan_gdx(path, symbol=...)` returns a `pl.LazyFrame`; nothing is read until `collect()`, and column projection is pushed down via Polars' IO-source interface. `read_gdx(...)` is the eager convenience wrapper (`scan_gdx(...).collect()`, same arguments).
