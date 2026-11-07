@@ -44,6 +44,23 @@ fn not_found(name: &str) -> PyErr {
     PyRuntimeError::new_err(format!("symbol {name:?} not found"))
 }
 
+/// Adapter-side admission for the mode A full-dictionary materialization
+/// (UEL strings plus the shared Arrow dictionary values array), charged
+/// against the combined adapter envelope of the adapter contract §6
+/// (256 MiB). The gdxrs core's own budget does not cover adapter
+/// conversions, so this is checked before any allocation: a dictionary
+/// that does not fit is rejected clearly instead of silently changing the
+/// planned schema or ballooning process memory.
+const DEFAULT_DICTIONARY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+fn dictionary_admission_err(labels: usize, estimate: usize, budget: usize) -> PyErr {
+    PyRuntimeError::new_err(format!(
+        "gdxrs backend: full-dictionary admission of {labels} labels needs ~{estimate} \
+         bytes, exceeding the adapter dictionary budget of {budget} bytes; raise \
+         dictionary_budget_bytes or use the bounded ID mode (task 043)"
+    ))
+}
+
 /// Per-scan projection counters surfaced through `scan_statistics`.
 #[derive(Clone, Copy, Debug, Default)]
 struct ProjectionStats {
@@ -60,6 +77,8 @@ struct ProjectionStats {
 #[pyclass]
 pub struct GdxrsReader {
     core: Option<Core>,
+    /// Adapter envelope share admitted for the full UEL dictionary.
+    dictionary_budget_bytes: usize,
     /// Full UEL table (mode A dictionary admission), decoded once per file.
     uel_strings: Mutex<Option<Arc<Vec<String>>>>,
     uel_array: Mutex<Option<Arc<StringArray>>>,
@@ -98,7 +117,34 @@ impl GdxrsReader {
             return Ok(Arc::clone(t));
         }
         let core = self.core()?;
-        let mut table: Vec<String> = Vec::new();
+        // Admission pass: count labels and bytes before allocating anything.
+        let mut labels = 0usize;
+        let mut label_bytes = 0usize;
+        {
+            let mut cursor = core.uels().map_err(to_py_err)?;
+            while let Some(entry) = cursor.next().map_err(to_py_err)? {
+                labels += 1;
+                label_bytes = label_bytes.saturating_add(entry.label.len() + 1);
+            }
+        }
+        // Vec<String> payload plus the shared Arrow StringArray
+        // (i32 offsets + values + validity bitmap).
+        let estimate = labels
+            .checked_mul(std::mem::size_of::<String>())
+            .and_then(|n| n.checked_add(label_bytes))
+            .and_then(|n| n.checked_add(4 * labels.saturating_add(1)))
+            .and_then(|n| n.checked_add(labels.saturating_add(7) / 8))
+            .ok_or_else(|| {
+                dictionary_admission_err(labels, usize::MAX, self.dictionary_budget_bytes)
+            })?;
+        if estimate > self.dictionary_budget_bytes {
+            return Err(dictionary_admission_err(
+                labels,
+                estimate,
+                self.dictionary_budget_bytes,
+            ));
+        }
+        let mut table: Vec<String> = Vec::with_capacity(labels);
         let mut cursor = core.uels().map_err(to_py_err)?;
         while let Some(entry) = cursor.next().map_err(to_py_err)? {
             let index = entry.id.get() as usize;
@@ -207,10 +253,18 @@ impl GdxrsReader {
 #[pymethods]
 impl GdxrsReader {
     #[new]
-    fn new(path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (path, dictionary_budget_bytes=None))]
+    fn new(path: &str, dictionary_budget_bytes: Option<usize>) -> PyResult<Self> {
         let core = Core::open(path, OpenOptions::default()).map_err(to_py_err)?;
+        let budget = dictionary_budget_bytes.unwrap_or(DEFAULT_DICTIONARY_BUDGET_BYTES);
+        if budget == 0 {
+            return Err(PyValueError::new_err(
+                "gdxrs backend: dictionary_budget_bytes must be positive",
+            ));
+        }
         Ok(Self {
             core: Some(core),
+            dictionary_budget_bytes: budget,
             uel_strings: Mutex::new(None),
             uel_array: Mutex::new(None),
             statistics: Mutex::new(ProjectionStats::default()),
@@ -392,6 +446,11 @@ impl GdxrsReader {
         // record; a zero limit likewise reads nothing. Both still return
         // the planned schema.
         let empty = n_rows == Some(0) || resolved.iter().any(|(_, ids)| ids.is_empty());
+        // Sets, parameters and aliases store only the level field; a
+        // non-level request reads the records and projects zero values,
+        // matching the legacy backend's field defaults.
+        let fieldless = !matches!(kind, SymbolType::Variable | SymbolType::Equation)
+            && field != ValueField::Level;
         let mut keys: Vec<Vec<i32>> = vec![Vec::new(); dim];
         let mut values: Vec<Option<f64>> = Vec::new();
         if !empty {
@@ -428,7 +487,10 @@ impl GdxrsReader {
                     })?;
                     key_column.extend(column.iter().map(|id| id.get() as i32));
                 }
-                if let Some(column) = batch.value_column(field) {
+                if fieldless {
+                    // Zero-valued projection; do not touch the level column.
+                    values.resize(values.len() + batch.len(), Some(0.0));
+                } else if let Some(column) = batch.value_column(field) {
                     for value in column {
                         values.push(project_value(*value, &mut stats)?);
                     }

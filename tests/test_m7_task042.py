@@ -385,3 +385,70 @@ def test_gdxrs_resolve_uel_indices_used():
         assert reader.resolve_uel_indices_used([(0, ["seattle"])], "C") == [(0, [])]
         # Unknown labels resolve to nothing.
         assert reader.resolve_uel_indices_used([(0, ["nope"])], "I") == [(0, [])]
+
+
+# ---------------------------------------------------------------------------
+# Review findings on the task-042 PR (dd79a3c) — regression coverage
+# ---------------------------------------------------------------------------
+
+
+def test_default_backend_env_names_resolve_to_themselves(monkeypatch):
+    """Finding 2: POLARS_GDX_BACKEND=legacy must resolve to "legacy" (not
+    "" derived from the class name); unknown names still raise."""
+    from polars_gdx.lazy import _default_backend
+
+    monkeypatch.setenv("POLARS_GDX_BACKEND", "gdxrs")
+    assert _default_backend() == "gdxrs"
+    if Reader is not None:
+        monkeypatch.setenv("POLARS_GDX_BACKEND", "legacy")
+        assert _default_backend() == "legacy"
+    monkeypatch.setenv("POLARS_GDX_BACKEND", "bogus")
+    with pytest.raises(ValueError, match="backend must be"):
+        _default_backend()
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_non_level_fields_project_zeros_for_set_parameter_alias(backend):
+    """Finding 3: sets, parameters and aliases store only the level field;
+    a non-level request reads the records and projects zero values,
+    matching the legacy backend's field defaults."""
+    cls = GdxrsReader if backend == "gdxrs" else Reader
+    if cls is None:
+        pytest.skip(f"{backend} backend not compiled")
+    with cls(M7) as reader:
+        for symbol in ("C", "I", "J", "P"):
+            for field in ("marginal", "lower", "upper", "scale"):
+                batch = reader.read_arrow(symbol, value_field=field)
+                values = batch.column(batch.num_columns - 1).to_pylist()
+                n = batch.num_rows
+                if symbol == "P":
+                    # P stores UNDEF/NA/±INF/acronyms; the non-level fields
+                    # are zero for every record regardless.
+                    assert values == [0.0] * n, (symbol, field)
+                else:
+                    assert values == [0.0] * n, (symbol, field)
+        # Scalars keep the same default.
+        batch = reader.read_arrow("S", value_field="upper")
+        assert batch.column(0).to_pylist() == [0.0]
+
+
+def test_dictionary_budget_admission_rejects_before_allocation():
+    """Finding 1: the mode A full-dictionary materialization is admitted
+    against an explicit adapter budget before any allocation; insufficient
+    admission is rejected clearly, never by silently changing the schema."""
+    if GdxrsReader is None:
+        pytest.skip("gdxrs backend not compiled")
+    # Seven labels need ~200 bytes; a 128-byte budget must reject.
+    with pytest.raises(RuntimeError, match="dictionary budget"):
+        GdxrsReader(M7, dictionary_budget_bytes=128).uel_table()
+    # The default budget admits the fixture dictionary.
+    with GdxrsReader(M7) as reader:
+        assert reader.uel_table() == UEL_TABLE
+    # A zero budget is invalid configuration.
+    with pytest.raises(ValueError, match="positive"):
+        GdxrsReader(M7, dictionary_budget_bytes=0).uel_table()
+    # Rejection happens before output: a rejected dictionary never yields
+    # a partially materialized table on a later call.
+    reader = GdxrsReader(M7, dictionary_budget_bytes=128)
+    with pytest.raises(RuntimeError, match="dictionary budget"):
+        reader.read_arrow("C")

@@ -27,12 +27,38 @@ GdxrsReader = getattr(_core, "GdxrsReader", None)
 _VALUE_FIELDS = ("level", "marginal", "lower", "upper", "scale")
 
 
+def _validate_backend_name(backend: str) -> str:
+    """Validate a backend name against the compiled backends and return it.
+
+    ``"legacy"`` selects the vendored native GDX C library backend (default
+    in 0.6.x); ``"gdxrs"`` selects the pinned pure-Rust gdxrs core (M7 task
+    042). Selection is explicit and final: a gdxrs source, decode or
+    resource failure is raised, never retried through the legacy backend.
+    """
+    if backend == "legacy":
+        if Reader is None:
+            raise RuntimeError(
+                "the legacy backend is not compiled into this build "
+                "(cargo feature 'legacy')"
+            )
+        return "legacy"
+    if backend == "gdxrs":
+        if GdxrsReader is None:
+            raise RuntimeError(
+                "the gdxrs backend is not compiled into this build "
+                "(cargo feature 'gdxrs')"
+            )
+        return "gdxrs"
+    raise ValueError(f"backend must be 'legacy' or 'gdxrs', got {backend!r}")
+
+
 def _default_backend() -> str:
-    """The default backend: ``POLARS_GDX_BACKEND`` if it names an available
-    backend, else ``"legacy"`` when compiled in, else ``"gdxrs"``."""
+    """The default backend: ``POLARS_GDX_BACKEND`` when it names an
+    available backend, else ``"legacy"`` when compiled in, else
+    ``"gdxrs"``."""
     override = os.environ.get("POLARS_GDX_BACKEND")
     if override is not None:
-        return _reader_class(override).__name__.removesuffix("Reader").lower()
+        return _validate_backend_name(override)
     if Reader is not None:
         return "legacy"
     if GdxrsReader is not None:
@@ -44,31 +70,9 @@ def _default_backend() -> str:
 
 
 def _reader_class(backend: str | None):
-    """Resolve a backend name to its reader class.
-
-    ``"legacy"`` selects the vendored native GDX C library backend (default
-    in 0.6.x); ``"gdxrs"`` selects the pinned pure-Rust gdxrs core (M7 task
-    042). Selection is explicit and final: a gdxrs source, decode or
-    resource failure is raised, never retried through the legacy backend.
-    """
+    """Resolve a backend name (or the default) to its reader class."""
     name = backend if backend is not None else _default_backend()
-    if name == "legacy":
-        if Reader is None:
-            raise RuntimeError(
-                "the legacy backend is not compiled into this build "
-                "(cargo feature 'legacy')"
-            )
-        return Reader
-    if name == "gdxrs":
-        if GdxrsReader is None:
-            raise RuntimeError(
-                "the gdxrs backend is not compiled into this build "
-                "(cargo feature 'gdxrs')"
-            )
-        return GdxrsReader
-    raise ValueError(
-        f"backend must be 'legacy' or 'gdxrs', got {backend!r}"
-    )
+    return Reader if _validate_backend_name(name) == "legacy" else GdxrsReader
 
 
 #: Backends compiled into this extension.
