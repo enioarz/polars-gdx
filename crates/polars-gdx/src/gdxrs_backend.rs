@@ -16,10 +16,13 @@
 //! A gdxrs source/decode/resource failure is an error; this module never
 //! falls back to the legacy backend.
 
-use std::sync::{Arc, Mutex};
+mod layout;
+
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::array::{
-    ArrayRef, DictionaryArray, Float64Array, Int16Array, Int32Array, StringArray, UInt32Array,
+    ArrayRef, BinaryBuilder, DictionaryArray, Float64Array, Int16Array, Int32Array, StringArray,
+    StringBuilder, UInt32Array,
 };
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -30,7 +33,7 @@ use gdxrs::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict, PyList, PySequence, PyString};
 
 fn to_py_err(e: gdxrs::Error) -> PyErr {
     PyRuntimeError::new_err(format!("gdxrs backend: {e}"))
@@ -42,6 +45,73 @@ fn closed_err() -> PyErr {
 
 fn not_found(name: &str) -> PyErr {
     PyRuntimeError::new_err(format!("symbol {name:?} not found"))
+}
+
+fn checked_layout(parts: &[(usize, usize)]) -> PyResult<usize> {
+    layout::allocation_bytes(parts)
+        .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: adapter layout overflow"))
+}
+
+fn check_arrow_payload(bytes: usize) -> PyResult<()> {
+    i32::try_from(bytes).map(|_| ()).map_err(|_| {
+        PyRuntimeError::new_err("gdxrs backend: label payload exceeds Arrow's 32-bit offset limit; use ID mode or a smaller label request")
+    })
+}
+
+fn reserved_vec<T>(len: usize) -> PyResult<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|error| {
+        PyRuntimeError::new_err(format!(
+            "gdxrs backend: allocation admission failed: {error}"
+        ))
+    })?;
+    Ok(values)
+}
+
+fn lock<T>(state: &Mutex<T>) -> PyResult<MutexGuard<'_, T>> {
+    state
+        .lock()
+        .map_err(|_| PyRuntimeError::new_err("gdxrs backend: reader state poisoned"))
+}
+
+fn cleanup_result<T, E: std::fmt::Display>(
+    result: PyResult<T>,
+    cleanup: Result<(), E>,
+    context: &str,
+) -> PyResult<T> {
+    match (result, cleanup) {
+        (result, Ok(())) => result,
+        (Ok(_), Err(error)) => Err(PyRuntimeError::new_err(format!(
+            "gdxrs backend: {context}: {error}"
+        ))),
+        (Err(primary), Err(error)) => Err(PyRuntimeError::new_err(format!(
+            "{primary}; {context}: {error}"
+        ))),
+    }
+}
+
+fn create_scratch() -> PyResult<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let path = std::env::temp_dir().join(format!(
+            "polars-gdx-gdxrs-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(PyRuntimeError::new_err(format!(
+                    "gdxrs backend: scratch directory: {error}"
+                )))
+            }
+        }
+    }
+    Err(PyRuntimeError::new_err(
+        "gdxrs backend: cannot create exclusive scratch directory",
+    ))
 }
 
 /// Adapter-side admission for the mode A full-dictionary materialization
@@ -73,7 +143,8 @@ struct ProjectionStats {
 /// root memory budget (`OpenOptions`, default 64 MiB); metadata is paged
 /// lazily and records are decoded in core-sized batches. The handle is
 /// released on drop or earlier via `close()`; every method raises
-/// `RuntimeError("reader is closed")` afterwards.
+/// `RuntimeError("reader is closed")` afterwards, except `scan_statistics`
+/// which retains the final counters without using the source.
 #[pyclass]
 pub struct GdxrsReader {
     core: Option<Core>,
@@ -98,7 +169,7 @@ fn kind_str(kind: SymbolType) -> &'static str {
 }
 
 fn utf8(bytes: &[u8], what: &str) -> PyResult<String> {
-    String::from_utf8(bytes.to_vec()).map_err(|_| {
+    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| {
         PyRuntimeError::new_err(format!(
             "gdxrs backend: {what} is not valid UTF-8; mode A requires valid UTF-8 labels"
         ))
@@ -113,7 +184,7 @@ impl GdxrsReader {
     /// The file's UEL table (cached), strictly UTF-8; entry `i` is the label
     /// of 1-based UEL number `i + 1`.
     fn uel_strings(&self) -> PyResult<Arc<Vec<String>>> {
-        if let Some(t) = self.uel_strings.lock().unwrap().as_ref() {
+        if let Some(t) = lock(&self.uel_strings)?.as_ref() {
             return Ok(Arc::clone(t));
         }
         let core = self.core()?;
@@ -123,8 +194,8 @@ impl GdxrsReader {
         {
             let mut cursor = core.uels().map_err(to_py_err)?;
             while let Some(entry) = cursor.next().map_err(to_py_err)? {
-                labels += 1;
-                label_bytes = label_bytes.saturating_add(entry.label.len() + 1);
+                labels = checked_layout(&[(labels, 1), (1, 1)])?;
+                label_bytes = checked_layout(&[(label_bytes, 1), (entry.label.len(), 1)])?;
             }
         }
         // The dictionary is retained in two simultaneous copies — the
@@ -135,22 +206,16 @@ impl GdxrsReader {
         //   strings cache: labels * sizeof(String) + label payload
         //   Arrow array:   i32 offsets + values payload + validity bitmap
         //   temporaries:   labels * sizeof(&str) + one values-buffer copy
-        let estimate = labels
-            .checked_mul(std::mem::size_of::<String>())
-            // String cache payload.
-            .and_then(|n| n.checked_add(label_bytes))
-            // Arrow i32 offsets and validity bitmap.
-            .and_then(|n| n.checked_add(4 * labels.saturating_add(1)))
-            .and_then(|n| n.checked_add(labels.saturating_add(7) / 8))
-            // Arrow values payload (second live copy of the labels).
-            .and_then(|n| n.checked_add(label_bytes))
-            // Conversion temporaries: borrowed-slice vector + one more
-            // transient values-buffer copy while the array is built.
-            .and_then(|n| n.checked_add(labels * std::mem::size_of::<&str>()))
-            .and_then(|n| n.checked_add(label_bytes))
-            .ok_or_else(|| {
-                dictionary_admission_err(labels, usize::MAX, self.dictionary_budget_bytes)
-            })?;
+        check_arrow_payload(label_bytes)?;
+        let estimate = checked_layout(&[
+            (labels, std::mem::size_of::<String>()),
+            (labels, 16),     // conservative per-string allocation granularity
+            (label_bytes, 3), // cache, Arrow values and conversion peak
+            (labels, 4),
+            (1, 4), // Arrow offsets
+            (labels.div_ceil(8), 1),
+            (labels, std::mem::size_of::<&str>()),
+        ])?;
         if estimate > self.dictionary_budget_bytes {
             return Err(dictionary_admission_err(
                 labels,
@@ -158,7 +223,7 @@ impl GdxrsReader {
                 self.dictionary_budget_bytes,
             ));
         }
-        let mut table: Vec<String> = Vec::with_capacity(labels);
+        let mut table: Vec<String> = reserved_vec(labels)?;
         let mut cursor = core.uels().map_err(to_py_err)?;
         while let Some(entry) = cursor.next().map_err(to_py_err)? {
             let index = entry.id.get() as usize;
@@ -173,19 +238,25 @@ impl GdxrsReader {
             table[index - 1] = utf8(entry.label, "UEL label")?;
         }
         let arc = Arc::new(table);
-        *self.uel_strings.lock().unwrap() = Some(Arc::clone(&arc));
+        *lock(&self.uel_strings)? = Some(Arc::clone(&arc));
         Ok(arc)
     }
 
     fn uel_array(&self) -> PyResult<Arc<StringArray>> {
-        if let Some(a) = self.uel_array.lock().unwrap().as_ref() {
+        if let Some(a) = lock(&self.uel_array)?.as_ref() {
             return Ok(Arc::clone(a));
         }
         let table = self.uel_strings()?;
-        let array = Arc::new(StringArray::from(
-            table.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        ));
-        *self.uel_array.lock().unwrap() = Some(Arc::clone(&array));
+        let bytes = table.iter().try_fold(0usize, |total, text| {
+            checked_layout(&[(total, 1), (text.len(), 1)])
+        })?;
+        check_arrow_payload(bytes)?;
+        let mut builder = StringBuilder::with_capacity(table.len(), bytes);
+        for text in table.iter() {
+            builder.append_value(text);
+        }
+        let array = Arc::new(builder.finish());
+        *lock(&self.uel_array)? = Some(Arc::clone(&array));
         Ok(array)
     }
 
@@ -200,8 +271,14 @@ impl GdxrsReader {
         let core = self.core()?;
         let mut out = Vec::with_capacity(filters.len());
         for (dim, labels) in filters {
-            let encoded: Vec<Vec<u8>> = labels.iter().map(|l| l.as_bytes().to_vec()).collect();
-            let refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
+            // GDX stores at most 255 bytes per label, so longer labels can
+            // never match; they are treated as unmatched rather than
+            // passed to the core lookup, which rejects them.
+            let refs: Vec<&[u8]> = labels
+                .iter()
+                .map(|label| label.as_bytes())
+                .filter(|bytes| bytes.len() <= 255)
+                .collect();
             let matches = core.lookup_labels(&refs).map_err(to_py_err)?;
             let mut ids = Vec::with_capacity(labels.len());
             for ordinal in 0..matches.len() {
@@ -221,7 +298,13 @@ impl GdxrsReader {
     /// Unique UEL IDs used by one dimension of a symbol, in UEL order, via
     /// the core's spill-backed bounded domain enumeration. No records are
     /// materialized and no full dictionary is retained.
-    fn used_uels(&self, core: &Core, name: &str, dim: usize) -> PyResult<Vec<i32>> {
+    fn used_uels(
+        &self,
+        core: &Core,
+        name: &str,
+        dim: usize,
+        allowed: Option<&[UelId]>,
+    ) -> PyResult<Vec<i32>> {
         let handle = core
             .find_symbol(name.as_bytes())
             .map_err(to_py_err)?
@@ -233,34 +316,43 @@ impl GdxrsReader {
                 metadata.dimension
             )));
         }
-        let base = core.selection(&handle, &[]).map_err(to_py_err)?;
-        let scratch = std::env::temp_dir().join(format!(
-            "polars-gdx-gdxrs-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&scratch).map_err(|e| {
-            PyRuntimeError::new_err(format!("gdxrs backend: scratch directory: {e}"))
-        })?;
+        let clauses = allowed.map(|ids| {
+            [DimensionSelection {
+                dimension: dim as u8,
+                keys: KeySelection::AnyOf(ids),
+            }]
+        });
+        let base = core
+            .selection(&handle, clauses.as_ref().map_or(&[], |c| c.as_slice()))
+            .map_err(to_py_err)?;
+        let scratch = create_scratch()?;
         let result = (|| {
             let spill = gdxrs::SpillOptions::new(&scratch);
             let mut cursor = core
                 .unique_domains(&handle, &base, &[dim as u8], core.scan_options(), &spill)
                 .map_err(to_py_err)?;
-            let mut ids = Vec::new();
-            while let Some(entry) = cursor.next().map_err(to_py_err)? {
-                if entry.dimension == dim as u8 {
-                    ids.push(entry.id.get() as i32);
+            let collected = (|| {
+                let mut ids = Vec::new();
+                while let Some(entry) = cursor.next().map_err(to_py_err)? {
+                    if entry.dimension == dim as u8 {
+                        ids.try_reserve(1).map_err(|e| {
+                            PyRuntimeError::new_err(format!(
+                                "gdxrs backend: domain allocation: {e}"
+                            ))
+                        })?;
+                        ids.push(entry.id.get() as i32);
+                    }
                 }
-            }
-            Ok(ids)
+                Ok(ids)
+            })();
+            cleanup_result(
+                collected,
+                cursor.close().map(|_| ()),
+                "domain cursor cleanup",
+            )
         })();
         drop(handle);
-        let _ = std::fs::remove_dir_all(&scratch);
-        result
+        cleanup_result(result, std::fs::remove_dir_all(&scratch), "scratch cleanup")
     }
 }
 
@@ -289,6 +381,10 @@ impl GdxrsReader {
     /// later use of this reader raises `RuntimeError`.
     fn close(&mut self) {
         self.core = None;
+        // Returned Arrow arrays keep their own Arc; the reader need not retain
+        // a second owner after close.
+        self.uel_array = Mutex::new(None);
+        self.uel_strings = Mutex::new(None);
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
@@ -308,9 +404,7 @@ impl GdxrsReader {
     /// The file's UEL table: entry `i` is the label of 1-based UEL number
     /// `i + 1`. Labels are strictly UTF-8; invalid bytes are rejected.
     fn uel_table(&self) -> PyResult<Vec<String>> {
-        if self.core.is_none() {
-            return Err(closed_err());
-        }
+        self.core()?;
         Ok(self.uel_strings()?.iter().cloned().collect())
     }
 
@@ -351,11 +445,8 @@ impl GdxrsReader {
     /// The unique UEL numbers (1-based) used by one dimension of a symbol,
     /// in UEL order — the raw-index equivalent of `unique(dim)`.
     fn domain_elements(&self, name: &str, dim_pos: usize) -> PyResult<Vec<i32>> {
-        if self.core.is_none() {
-            return Err(closed_err());
-        }
         let core = self.core()?;
-        self.used_uels(core, name, dim_pos)
+        self.used_uels(core, name, dim_pos, None)
     }
 
     /// Resolve key-filter labels to UEL IDs (exact match), then restrict
@@ -368,27 +459,29 @@ impl GdxrsReader {
         filters: Vec<(usize, Vec<String>)>,
         symbol: &str,
     ) -> PyResult<Vec<(usize, Vec<i32>)>> {
-        if self.core.is_none() {
-            return Err(closed_err());
-        }
         let core = self.core()?;
+        let handle = core
+            .find_symbol(symbol.as_bytes())
+            .map_err(to_py_err)?
+            .ok_or_else(|| not_found(symbol))?;
+        let dimension = usize::from(handle.metadata().map_err(to_py_err)?.dimension);
+        for (dim, _) in &filters {
+            if *dim >= dimension {
+                return Err(PyValueError::new_err(format!(
+                    "gdxrs backend: dimension {dim} out of range (symbol has {dimension} dimensions)"
+                )));
+            }
+        }
+        drop(handle);
         let resolved = self.resolve_filters(&filters)?;
         let mut out = Vec::with_capacity(resolved.len());
         for (dim, ids) in resolved {
-            if ids.is_empty() {
-                out.push((dim, Vec::new()));
-                continue;
-            }
-            let used = self.used_uels(core, symbol, dim)?;
-            let used: std::collections::HashSet<i32> = used.into_iter().collect();
-            let mut retained: Vec<i32> = ids
-                .iter()
-                .map(|id| id.get() as i32)
-                .filter(|id| used.contains(id))
-                .collect();
-            retained.sort_unstable();
-            retained.dedup();
-            out.push((dim, retained));
+            let used = if ids.is_empty() {
+                Vec::new()
+            } else {
+                self.used_uels(core, symbol, dim, Some(&ids))?
+            };
+            out.push((dim, used));
         }
         Ok(out)
     }
@@ -397,7 +490,7 @@ impl GdxrsReader {
     /// core decoded rows plus the deliberate EPS-to-zero and
     /// acronym-to-null projections (contract §3).
     fn scan_statistics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let stats = *self.statistics.lock().unwrap();
+        let stats = *lock(&self.statistics)?;
         let dict = PyDict::new(py);
         dict.set_item("decoded_rows", stats.decoded_rows)?;
         dict.set_item("eps_to_zero", stats.eps_to_zero)?;
@@ -405,16 +498,211 @@ impl GdxrsReader {
         Ok(dict)
     }
 
+    /// Resolve original UEL IDs to their exact label bytes (bounded mode
+    /// B resolver, adapter contract §5). Returns an Arrow RecordBatch
+    /// with columns `uel_id: UInt32` and `label: Binary`, preserving
+    /// request order and duplicate requests and returning the original
+    /// bytes without any decoding. Zero or out-of-range IDs reject the
+    /// whole request with ValueError before any result; a request whose
+    /// conversion allocation exceeds `dictionary_budget_bytes` raises a
+    /// resource error before returning a partial table. Labels are
+    /// fetched through the core's paged label cursor — no full
+    /// dictionary is materialized.
+    fn resolve_labels(&self, ids: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyObject> {
+        let core = self.core()?;
+        let uel_count = core.information().map_err(to_py_err)?.uel_count;
+        // Preflight from the BORROWED sequence before PyO3 extracts it:
+        // accepting `Vec<u32>` would materialize the whole request
+        // (4 bytes per ID) before admission. The fixed cursor costs plus
+        // the output ID column, the validation vector (one UelId per
+        // request) and the collected buffer's Vec headers must fit the
+        // budget first, so a huge request against a tiny budget is
+        // rejected before any request-sized allocation exists.
+        const RESOLVER_FIXED_BYTES: usize = 64 * 1024;
+        let sequence = ids.downcast::<PySequence>().map_err(|_| {
+            PyValueError::new_err(
+                "gdxrs backend: resolve_labels expects a sized sequence of UEL IDs",
+            )
+        })?;
+        let len = sequence.len()?;
+        let request_sized = checked_layout(&[
+            (1, RESOLVER_FIXED_BYTES),
+            (len, std::mem::size_of::<u32>()),
+            (len, std::mem::size_of::<UelId>()),
+            (len, std::mem::size_of::<Vec<u8>>()),
+        ])?;
+        if request_sized > self.dictionary_budget_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label resolution of {len} IDs needs at least ~{request_sized} \
+                 bytes of fixed and request-sized storage, exceeding the adapter \
+                 dictionary budget of {} bytes",
+                self.dictionary_budget_bytes
+            )));
+        }
+        // Extract only the admitted number of items. A custom sequence cannot
+        // make an unbounded iterator grow the request after the length check.
+        let mut validated: Vec<UelId> = reserved_vec(len)?;
+        for at in 0..len {
+            let id = sequence.get_item(at)?.extract::<u32>()?;
+            if id == 0 || id > uel_count {
+                return Err(PyValueError::new_err(format!(
+                    "gdxrs backend: UEL ID {id} is zero or outside the file table (1..={uel_count})"
+                )));
+            }
+            validated.push(UelId::new(id).map_err(to_py_err)?);
+        }
+        // Admission pass: sum the label bytes before building anything.
+        let mut label_bytes = 0usize;
+        {
+            let mut cursor = core.uel_labels().map_err(to_py_err)?;
+            for id in &validated {
+                let label = cursor.get(*id).map_err(to_py_err)?;
+                label_bytes = checked_layout(&[(label_bytes, 1), (label.len(), 1)])?;
+            }
+        }
+        check_arrow_payload(label_bytes)?;
+        // Charge validation storage and payload/offset capacities, keeping
+        // conservative headroom for views and conversion temporaries.
+        // Per-label heap allocations carry allocator granularity.
+        let estimate = checked_layout(&[
+            (1, RESOLVER_FIXED_BYTES),
+            (len, std::mem::size_of::<UelId>()),
+            (len, std::mem::size_of::<Vec<u8>>()),
+            (label_bytes, 3),
+            (len, 3 * 16), // payloads and allocation granularity
+            (len, 4),
+            (1, 4), // Arrow offsets
+            (len.div_ceil(8), 1),
+            (len, std::mem::size_of::<&[u8]>()),
+            (len, 4), // returned ID column
+        ])?;
+        if estimate > self.dictionary_budget_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label resolution of {} IDs needs ~{estimate} bytes, \
+                 exceeding the adapter dictionary budget of {} bytes",
+                len, self.dictionary_budget_bytes
+            )));
+        }
+        // Collection pass: exact original bytes, request order preserved.
+        let mut labels: Vec<Vec<u8>> = reserved_vec(len)?;
+        {
+            let mut cursor = core.uel_labels().map_err(to_py_err)?;
+            for id in &validated {
+                let label = cursor.get(*id).map_err(to_py_err)?;
+                labels.push(label.to_vec());
+            }
+        }
+        let mut builder = BinaryBuilder::with_capacity(len, label_bytes);
+        for label in &labels {
+            builder.append_value(label);
+        }
+        let label_column: ArrayRef = Arc::new(builder.finish());
+        let mut ids = reserved_vec(len)?;
+        ids.extend(validated.iter().map(|id| id.get()));
+        let id_column: ArrayRef = Arc::new(UInt32Array::from(ids));
+        let schema = Schema::new(vec![
+            Field::new("uel_id", arrow::datatypes::DataType::UInt32, false),
+            Field::new("label", arrow::datatypes::DataType::Binary, false),
+        ]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![id_column, label_column])
+            .map_err(|e| PyRuntimeError::new_err(format!("record batch error: {e}")))?;
+        Ok(batch.into_pyarrow(py)?.into_any())
+    }
+
+    /// Resolve label strings to their original one-based UEL IDs with
+    /// exact (case-sensitive, byte-for-byte after UTF-8 encoding)
+    /// matching, without materializing the dictionary. Entry `i` is the
+    /// ID of `labels[i]`, or None when the label is not in the file.
+    fn label_ids(&self, labels: &Bound<'_, PyAny>) -> PyResult<Vec<Option<u32>>> {
+        let core = self.core()?;
+        // Preflight from the borrowed list before extraction, mirroring
+        // resolve_labels: the UTF-8 payload bytes are counted by walking
+        // the borrowed list (no string is extracted yet), and every
+        // live view/result vectors and conservative UTF-8/core payload
+        // headroom are charged before borrowing strings for the lookup.
+        const LOOKUP_FIXED_BYTES: usize = 64 * 1024;
+        let list = labels.downcast::<PyList>().map_err(|_| {
+            PyValueError::new_err("gdxrs backend: label_ids expects a list of labels")
+        })?;
+        let len = list.len();
+        let mut payload_bytes = 0usize;
+        for item in list {
+            let string = item.downcast::<PyString>().map_err(|_| {
+                PyValueError::new_err("gdxrs backend: label_ids expects labels to be strings")
+            })?;
+            let text = string
+                .to_str()
+                .map_err(|_| {
+                    PyValueError::new_err("gdxrs backend: label_ids expects labels to be strings")
+                })?
+                .len();
+            payload_bytes = checked_layout(&[(payload_bytes, 1), (text, 1), (1, 1)])?;
+        }
+        let request_sized = checked_layout(&[
+            (1, LOOKUP_FIXED_BYTES),
+            (
+                len,
+                std::mem::size_of::<String>() + std::mem::size_of::<usize>(),
+            ),
+            (payload_bytes, 2),
+            (len, 2 * 16),
+        ])?;
+        if request_sized > self.dictionary_budget_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label lookup of {len} labels needs at least ~{request_sized} \
+                 bytes of fixed and request-sized storage, exceeding the adapter \
+                 dictionary budget of {} bytes",
+                self.dictionary_budget_bytes
+            )));
+        }
+        // Keep Python strings alive while the core borrows their UTF-8 views;
+        // do not clone them into String and then clone them again into Vec<u8>.
+        let mut strings = reserved_vec(len)?;
+        for item in list {
+            strings.push(item.downcast_into::<PyString>().map_err(|_| {
+                PyValueError::new_err("gdxrs backend: label_ids expects labels to be strings")
+            })?);
+        }
+        // GDX stores at most 255 bytes per label, so longer labels can
+        // never match: they resolve to None without being passed to the
+        // core lookup, which would reject them. Request order and
+        // duplicates are preserved.
+        let mut sized = reserved_vec(len)?;
+        for (index, string) in strings.iter().enumerate() {
+            if string.to_str()?.len() <= 255 {
+                sized.push(index);
+            }
+        }
+        let mut refs = reserved_vec(sized.len())?;
+        for &index in &sized {
+            refs.push(strings[index].to_str()?.as_bytes());
+        }
+        let matches = core.lookup_labels(&refs).map_err(to_py_err)?;
+        let mut out: Vec<Option<u32>> = vec![None; len];
+        for (ordinal, &index) in sized.iter().enumerate() {
+            let id = matches
+                .get(ordinal)
+                .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing lookup result"))?
+                .id;
+            out[index] = id.map(UelId::get);
+        }
+        Ok(out)
+    }
+
     /// Read one symbol as an Arrow RecordBatch, mirroring the legacy
-    /// backend's `read_arrow`. Key columns are Arrow dictionary arrays
-    /// over the full UEL table with 0-based raw UEL indices; the value
-    /// column is Float64 with the deliberate projection documented in the
-    /// adapter contract. `key_filter` labels match exactly; an empty
-    /// resolved ID set yields zero rows. `n_rows` is a global accepted-row
-    /// limit. Parallel reads are not implemented for this backend yet
-    /// (task 046); `threads` must be None/0/1.
+    /// backend's `read_arrow`. `key_mode="enum"` (default) emits Arrow
+    /// dictionary key arrays over the full UEL table with 0-based raw UEL
+    /// indices, admitted against `dictionary_budget_bytes` before any
+    /// decoding; `key_mode="uel_id"` emits the original one-based UEL IDs
+    /// as plain UInt32 key columns and never decodes or materializes any
+    /// label. The value column is Float64 with the deliberate projection
+    /// documented in the adapter contract. `key_filter` labels match
+    /// exactly (UTF-8 encoded, byte-for-byte) in either mode; an empty
+    /// resolved ID set yields zero rows with the planned schema. `n_rows`
+    /// is a global accepted-row limit. Parallel reads are not implemented
+    /// for this backend yet (task 046); `threads` must be None/0/1.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None))]
+    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None))]
     fn read_arrow(
         &self,
         name: &str,
@@ -423,6 +711,7 @@ impl GdxrsReader {
         key_filter: Option<Vec<(usize, Vec<String>)>>,
         n_rows: Option<usize>,
         threads: Option<usize>,
+        key_mode: Option<String>,
         py: Python<'_>,
     ) -> PyResult<PyObject> {
         let core = self.core()?;
@@ -454,12 +743,25 @@ impl GdxrsReader {
             }
             filters.push((dim_idx, labels));
         }
+        let id_mode = match key_mode.as_deref() {
+            None | Some("enum") => false,
+            Some("uel_id") => true,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "key_mode must be 'enum' or 'uel_id', got {other:?}"
+                )))
+            }
+        };
+        let names = column_names(kind, dim, key_names, field)?;
         // Reset the per-scan counters, then admit the mode A dictionary
         // before decoding or accumulating any record: a rejected admission
         // must not have done the work first (rejected reads report zero
-        // decoded rows).
-        *self.statistics.lock().unwrap() = ProjectionStats::default();
-        self.uel_strings()?;
+        // decoded rows). The bounded ID mode decodes no labels and needs
+        // no dictionary admission.
+        *lock(&self.statistics)? = ProjectionStats::default();
+        if !id_mode {
+            self.uel_strings()?;
+        }
         let resolved = self.resolve_filters(&filters)?;
         // A conjunction containing an empty allowed set cannot match a
         // record; a zero limit likewise reads nothing. Both still return
@@ -521,20 +823,15 @@ impl GdxrsReader {
             }
             stats.decoded_rows = cursor.statistics().decoded_rows;
             cursor.close().map_err(to_py_err)?;
-            *self.statistics.lock().unwrap() = stats;
+            *lock(&self.statistics)? = stats;
         }
         drop(handle);
-        let n_uels = self.uel_strings()?.len();
-        let batch = to_record_batch(
-            self,
-            kind,
-            dim,
-            &mut keys,
-            &mut values,
-            key_names,
-            field,
-            n_uels,
-        )?;
+        let n_uels = if id_mode {
+            0
+        } else {
+            self.uel_strings()?.len()
+        };
+        let batch = to_record_batch(self, dim, &mut keys, &mut values, names, n_uels, id_mode)?;
         Ok(batch.into_pyarrow(py)?.into_any())
     }
 }
@@ -586,36 +883,75 @@ fn parse_field(s: &str) -> PyResult<ValueField> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn to_record_batch(
-    reader: &GdxrsReader,
+fn column_names(
     kind: SymbolType,
     dim: usize,
-    keys: &mut [Vec<i32>],
-    values: &mut Vec<Option<f64>>,
     key_names: Option<Vec<String>>,
     field: ValueField,
-    n_uels: usize,
-) -> PyResult<RecordBatch> {
-    let mut names: Vec<String> = match &key_names {
-        Some(names) if names.len() == dim => names.clone(),
+) -> PyResult<Vec<String>> {
+    let mut names: Vec<String> = match key_names {
+        Some(names) if names.len() == dim => names,
         _ => (0..dim).map(|i| format!("dim_{i}")).collect(),
     };
     let value_name = match kind {
         SymbolType::Variable | SymbolType::Equation => field_name(field),
         _ => "value".to_string(),
     };
+    let mut unique = std::collections::HashSet::new();
+    if names.iter().any(|name| !unique.insert(name)) {
+        return Err(PyRuntimeError::new_err("duplicate key column names"));
+    }
     if names.contains(&value_name) {
         return Err(PyRuntimeError::new_err(format!(
             "column name collision: key column {value_name:?} conflicts with the value column"
         )));
     }
-    names.push(value_name.clone());
+    names.push(value_name);
 
-    let dict_values = reader.uel_array()?;
+    Ok(names)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn to_record_batch(
+    reader: &GdxrsReader,
+    dim: usize,
+    keys: &mut [Vec<i32>],
+    values: &mut Vec<Option<f64>>,
+    names: Vec<String>,
+    n_uels: usize,
+    id_mode: bool,
+) -> PyResult<RecordBatch> {
+    let dict_values = if id_mode {
+        None
+    } else {
+        Some(reader.uel_array()?)
+    };
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for key_column in keys.iter_mut().take(dim) {
         let column = std::mem::take(key_column);
+        if id_mode {
+            // Bounded ID mode: the original one-based UEL IDs as plain
+            // UInt32. No labels are decoded and no dictionary exists, so
+            // batch-local category codes can never be reinterpreted.
+            columns.push(Arc::new(UInt32Array::from(
+                column
+                    .into_iter()
+                    .map(|key| {
+                        if key <= 0 {
+                            Err(PyRuntimeError::new_err(
+                                "gdxrs backend: invalid original UEL ID",
+                            ))
+                        } else {
+                            Ok(key as u32)
+                        }
+                    })
+                    .collect::<PyResult<Vec<_>>>()?,
+            )) as ArrayRef);
+            continue;
+        }
+        let dict_values = dict_values.as_ref().ok_or_else(|| {
+            PyRuntimeError::new_err("gdxrs backend: dictionary missing in enum mode")
+        })?;
         let dict: ArrayRef = if n_uels > 0 && n_uels <= i16::MAX as usize + 1 {
             let indices = Int16Array::from(
                 column

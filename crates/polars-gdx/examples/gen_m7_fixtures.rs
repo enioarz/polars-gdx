@@ -25,18 +25,177 @@ use gdxrs::{
 fn main() {
     let mut args = std::env::args_os();
     let _ = args.next();
-    let output = args
+    let default = Path::new("tests/data/m7").to_path_buf();
+    match args
         .next()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| Path::new("tests/data/m7/m7-semantics.gdx").to_path_buf());
+        .as_deref()
+        .map(|a| a.to_string_lossy().to_string())
+    {
+        None => {
+            let semantics = default.join("m7-semantics.gdx");
+            fresh(&semantics);
+            write_semantics(&semantics);
+            let dictionary = default.join("m7-dictionary.gdx");
+            fresh(&dictionary);
+            write_dictionary(&dictionary);
+            let labelbytes = default.join("m7-labelbytes.gdx");
+            fresh(&labelbytes);
+            write_labelbytes(&labelbytes);
+            let growing = default.join("m7-labels20k.gdx");
+            fresh(&growing);
+            write_growing(&growing);
+        }
+        Some(name) => match name.as_str() {
+            "m7-semantics.gdx" => {
+                let path = default.join(&name);
+                fresh(&path);
+                write_semantics(&path)
+            }
+            "m7-dictionary.gdx" => {
+                let path = default.join(&name);
+                fresh(&path);
+                write_dictionary(&path)
+            }
+            "m7-labelbytes.gdx" => {
+                let path = default.join(&name);
+                fresh(&path);
+                write_labelbytes(&path)
+            }
+            "m7-labels20k.gdx" => {
+                let path = default.join(&name);
+                fresh(&path);
+                write_growing(&path)
+            }
+            other => panic!("unknown fixture {other:?}"),
+        },
+    }
+}
+
+fn fresh(output: &Path) {
+    if output.exists() {
+        std::fs::remove_file(output).expect("remove existing fixture");
+    }
+}
+
+fn scratch_dir() -> std::path::PathBuf {
+    let scratch = std::env::temp_dir().join("gen-m7-fixtures");
+    std::fs::create_dir_all(&scratch).expect("create scratch directory");
+    scratch
+}
+
+/// Dictionary-identity fixture (docs/m7-fixture-expectations.md): UELs
+/// registered in order aa, bb, cc, dd (IDs 1-4); parameter P with ordered
+/// records (1,10), (2,20), (3,30), (4,40); parameter ZEROS with +0.0 and
+/// -0.0 records for the adapter conversion expectation (the writer's
+/// Preserve policy keeps the signed-zero bits on disk).
+fn write_dictionary(output: &Path) {
+    let scratch = scratch_dir();
+    let mut writer = Writer::create(output, WriteOptions::default()).expect("create writer");
+    writer
+        .begin_metadata(&MetadataOptions::new(&scratch))
+        .expect("begin metadata");
+    let aa = writer.register_uel(b"aa").expect("register aa");
+    let bb = writer.register_uel(b"bb").expect("register bb");
+    let cc = writer.register_uel(b"cc").expect("register cc");
+    let dd = writer.register_uel(b"dd").expect("register dd");
+    assert_eq!((aa.get(), bb.get(), cc.get(), dd.get()), (1, 2, 3, 4));
+    let p = writer
+        .register_symbol(&WriteSymbol::new(b"P", SymbolType::Parameter, 1))
+        .expect("register P");
+    let zeros = writer
+        .register_symbol(&WriteSymbol::new(b"ZEROS", SymbolType::Parameter, 1))
+        .expect("register ZEROS");
+    let mut rows = writer.begin_symbol(p, None).expect("write P");
+    for (id, value) in [(aa, 10.0f64), (bb, 20.0), (cc, 30.0), (dd, 40.0)] {
+        rows.write(&[id], &[Value::NumberBits(value.to_bits())])
+            .expect("P record");
+    }
+    rows.finish().expect("finish P");
+    let mut rows = writer.begin_symbol(zeros, None).expect("write ZEROS");
+    rows.write(&[aa], &[Value::NumberBits(0.0f64.to_bits())])
+        .expect("ZEROS record");
+    rows.write(&[bb], &[Value::NumberBits((-0.0f64).to_bits())])
+        .expect("ZEROS record");
+    rows.finish().expect("finish ZEROS");
+    let stats = writer.finish().expect("finish writer");
+    println!("wrote {} ({} bytes)", output.display(), stats.output_bytes);
+}
+
+/// Label-bytes fixture: raw label bytes `61 61` and `ff 62` as IDs 1 and 2
+/// with values 10 and 20. `ff 62` is not valid UTF-8: mode A must reject it
+/// before output while the bounded ID mode never decodes labels.
+fn write_labelbytes(output: &Path) {
+    let scratch = scratch_dir();
+    let mut writer = Writer::create(output, WriteOptions::default()).expect("create writer");
+    writer
+        .begin_metadata(&MetadataOptions::new(&scratch))
+        .expect("begin metadata");
+    let aa = writer.register_uel(b"\x61\x61").expect("register aa bytes");
+    let raw = writer
+        .register_uel(b"\xff\x62")
+        .expect("register raw bytes");
+    assert_eq!((aa.get(), raw.get()), (1, 2));
+    let b = writer
+        .register_symbol(&WriteSymbol::new(b"B", SymbolType::Parameter, 1))
+        .expect("register B");
+    let mut rows = writer.begin_symbol(b, None).expect("write B");
+    rows.write(&[aa], &[Value::NumberBits(10.0f64.to_bits())])
+        .expect("B record");
+    rows.write(&[raw], &[Value::NumberBits(20.0f64.to_bits())])
+        .expect("B record");
+    rows.finish().expect("finish B");
+    let stats = writer.finish().expect("finish writer");
+    println!("wrote {} ({} bytes)", output.display(), stats.output_bytes);
+}
+
+/// Growing-table fixture: 20,000 six-byte labels and a 20,000-record
+/// parameter over them, for bounded-mode reads whose dictionary is far
+/// larger than a tiny admission would allow.
+fn write_growing(output: &Path) {
+    const COUNT: u64 = 20_000;
+    let scratch = scratch_dir();
+    let mut writer = Writer::create(output, WriteOptions::default()).expect("create writer");
+    writer
+        .begin_metadata(&MetadataOptions::new(&scratch))
+        .expect("begin metadata");
+    let mut ids: Vec<gdxrs::WriterUelId> = Vec::with_capacity(COUNT as usize);
+    writer
+        .register_uels_fresh(
+            (0..COUNT).map(|i| Ok::<Vec<u8>, gdxrs::Error>(format!("u{i:05}").into_bytes())),
+            |_ordinal, id| {
+                ids.push(id);
+                Ok(())
+            },
+        )
+        .expect("bulk register labels");
+    let big = writer
+        .register_symbol(&WriteSymbol::new(b"BIG", SymbolType::Parameter, 1))
+        .expect("register BIG");
+    let mut rows = writer.begin_symbol(big, None).expect("write BIG");
+    for (i, id) in ids.iter().enumerate() {
+        rows.write(
+            std::slice::from_ref(id),
+            &[Value::NumberBits(((i % 1000) as f64).to_bits())],
+        )
+        .expect("BIG record");
+    }
+    rows.finish().expect("finish BIG");
+    let stats = writer.finish().expect("finish writer");
+    println!(
+        "wrote {} ({} bytes, {COUNT} labels)",
+        output.display(),
+        stats.output_bytes
+    );
+}
+
+fn write_semantics(output: &Path) {
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).expect("create output directory");
         }
     }
-    let scratch = std::env::temp_dir().join("gen-m7-fixtures");
-    std::fs::create_dir_all(&scratch).expect("create scratch directory");
-    let mut writer = Writer::create(&output, WriteOptions::default()).expect("create writer");
+    let scratch = scratch_dir();
+    let mut writer = Writer::create(output, WriteOptions::default()).expect("create writer");
     writer
         .begin_metadata(&MetadataOptions::new(&scratch))
         .expect("begin metadata");

@@ -16,8 +16,8 @@ specifications, not evidence that the later tasks are implemented. Core revision
 | Task | Scope | Implementation status / evidence |
 | --- | --- | --- |
 | 041 | Contract, resource envelope and independent expectations | Documentation complete; [evidence](evidence/041.md), PR #39 |
-| 042 | Explicit gdxrs backend and legacy differential path | Implementation complete; [evidence](evidence/042.md); task PR pending review/merge |
-| 043 | Stable schemas, admitted enums and bounded ID mode | Pending |
+| 042 | Explicit gdxrs backend and legacy differential path | Merged in PR #41 at `b008b57`; [evidence](evidence/042.md) |
+| 043 | Stable schemas, admitted enums and bounded ID mode | Implementation complete; [evidence](evidence/043.md), [quality follow-up](evidence/043-quality.md); PR #42 pending review/merge |
 | 044 | Cursor-backed owned batch source with backpressure | Pending |
 | 045 | Exact predicate/projection/global-limit behavior | Pending |
 | 046 | Scan ownership, repeated scans, threads and cancellation | Pending |

@@ -1,0 +1,184 @@
+{
+  "schema": 1,
+  "task": "043-quality",
+  "code_revision": "4aaaebb2258043586e9113ff6ac7514750cb130d",
+  "reviewed_revision": "65eaa55b78a91ef2b89c6ddb2b839007e4cc9201",
+  "source_hashes": {
+    "crates/polars-gdx/src/gdxrs_backend.rs": "b08fd760ff511e1cc14a15f3adcb2af6967a5465c0c6bfd1476397ec24a20cd7",
+    "crates/polars-gdx/src/gdxrs_backend/layout.rs": "651a1a6f247e2bf9f3a487f025f174d829bad16e05d6b64cb7017973fe84bc39",
+    "python/polars_gdx/lazy.py": "8731f7aeab280ce5dbc532974b5fc6335634faad7bc80df820222429998ec866",
+    "tests/test_m7_quality.py": "b3ca90dbca159febac79a2ead9a410166552cd59d7b9a9fc5cea56a273d02877",
+    "Cargo.toml": "1c9caa8d332307fd2d9073059593793311ebb61a68018758668366f664dd9fca",
+    "Cargo.lock": "f6661409d8f4e9860f1bea087dd3f7781997cb093fe21d28e1d02f167416695b",
+    "crates/polars-gdx/Cargo.toml": "0f2e4ca9a75646b72566f5cd55648426403bcb32352f6a139c970a309c0d1fb3"
+  },
+  "checks": {
+    "default_python": {
+      "passed": 145,
+      "skipped": 0
+    },
+    "gdxrs_default": {
+      "passed": 111,
+      "skipped": 34
+    },
+    "gdxrs_only": {
+      "passed": 93,
+      "skipped": 40
+    },
+    "rust_groups": [
+      {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 3
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    ],
+    "rust_total_passed": 16,
+    "rust_ignored": 4,
+    "clippy": [
+      {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "--workspace"
+        ],
+        "exit_code": 0
+      },
+      {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-p",
+          "polars-gdx",
+          "--no-default-features",
+          "--features",
+          "gdxrs",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit_code": 0
+      }
+    ],
+    "format": true,
+    "diff_whitespace": true
+  },
+  "reports": {
+    "python_default": {
+      "path": "/workspace/.work/m7/quality42-final-pytest.log",
+      "sha256": "1db67a77398ee13398c1b106b937e4d96cf747bbfd95e87a8c826c9d7b7a1e3c"
+    },
+    "python_gdxrs_default": {
+      "path": "/workspace/.work/m7/quality42-final-pytest-gdxrs.log",
+      "sha256": "8091fbc6629db26961ec89de7f43ea4a154fee8e8dd60c30c419e2777cc4efe3"
+    },
+    "python_gdxrs_only": {
+      "path": "/workspace/.work/m7/quality42-pure-pytest.log",
+      "sha256": "1be882604272b9cf0ce166d40702749baed4960bf2336a8c8e1e5de950c82644"
+    },
+    "rust_workspace": {
+      "path": "/workspace/.work/m7/quality42-final-rust-tests.log",
+      "sha256": "890e0bfd8cb38ec9b4f8312fa30d1c2ee66f0b021d88b07a1ab404498b7965c8"
+    },
+    "clippy_default": {
+      "path": "/workspace/.work/m7/quality42-final-clippy.log",
+      "sha256": "0e5244831979dc47f1846fd901ba467c810e589553b796798e12b102f9bbd6ea"
+    },
+    "clippy_gdxrs_only": {
+      "path": "/workspace/.work/m7/quality42-final-pure-clippy.log",
+      "sha256": "b722e73090330cad8b45a28626ac93b9eb6ddac26770b7cc5091574a26abd4db"
+    },
+    "release_build": {
+      "path": "/workspace/.work/m7/quality42-final-build.log",
+      "sha256": "bdbcf1a36f06a90fc4c7a1b2c1f154b180f560b87e90037dee1fba0457a6fba3"
+    },
+    "pure_wheel_build": {
+      "path": "/workspace/.work/m7/quality42-pure-build.log",
+      "sha256": "ee21aee5e248f010efcf1d000b09baaa417a28a3a5a65a149089410ee0ccfaab"
+    }
+  },
+  "pure_wheel": {
+    "path": "/workspace/.work/m7/quality42-wheels/polars_gdx-0.6.0-cp310-abi3-manylinux_2_34_x86_64.whl",
+    "sha256": "08e4c5950a1e8053183fbbd5f169a3190ed0aef3a50ed2e8b032e7a32b73f26c"
+  },
+  "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "python": "3.12.14",
+  "ci": {
+    "workflow": "https://github.com/enioarz/polars-gdx/actions/runs/42474079052",
+    "test": "passed",
+    "benchmark": "passed",
+    "gdxrs_only": "passed",
+    "wheels": "https://github.com/enioarz/polars-gdx/actions/runs/42474079050",
+    "wheel_state": "ARM Linux and both macOS builds passed; x86 Linux and Windows pending at documentation time"
+  },
+  "limitations": [
+    "No task-044 streaming implementation or task-047 OS-capped acceptance is claimed.",
+    "Cleanup-denial injection and fresh macOS/Windows execution were not run locally. Native CI remains the cross-platform gate.",
+    "Four default-ignored Rust tests include external GAMS sample checks; the baseline fixture mismatch is documented in setup notes."
+  ]
+}

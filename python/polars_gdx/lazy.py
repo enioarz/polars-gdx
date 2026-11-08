@@ -9,6 +9,7 @@ materialised.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from typing import TYPE_CHECKING, Iterator, Sequence
@@ -185,6 +186,7 @@ def read_gdx(
     key_filter: dict[int, Sequence[str]] | None = None,
     threads: int | str | None = None,
     backend: str | None = None,
+    key_mode: str = "enum",
 ) -> pl.DataFrame:
     """Eagerly read one symbol of a GDX file into a DataFrame.
 
@@ -199,6 +201,7 @@ def read_gdx(
         key_filter=key_filter,
         threads=threads,
         backend=backend,
+        key_mode=key_mode,
     ).collect()
 
 
@@ -210,6 +213,7 @@ def scan_gdx(
     key_filter: dict[int, Sequence[str]] | None = None,
     threads: int | str | None = None,
     backend: str | None = None,
+    key_mode: str = "enum",
 ) -> pl.LazyFrame:
     """Lazily scan one symbol of a GDX file.
 
@@ -248,6 +252,30 @@ def scan_gdx(
         ``"legacy"`` when compiled in. Backend selection is explicit and
         final: a gdxrs source, decode or resource failure is raised, never
         retried through the legacy backend.
+    key_mode
+        Key column representation (gdxrs backend only, M7 task 043).
+        ``"enum"`` (default) declares key columns as ``pl.Enum`` over the
+        full UEL table in file order, admitted against the adapter's
+        dictionary budget before any output; insufficient admission is
+        rejected clearly, never by silently changing the schema. Labels
+        are strictly UTF-8; invalid bytes are rejected before output.
+        ``"uel_id"`` emits the original one-based UEL IDs as plain
+        ``UInt32`` key columns and never decodes or materializes any
+        label — the bounded mode for files whose dictionary exceeds the
+        budget. String filters (``key_filter`` and ``==``/``is_in``
+        predicates) still match exactly by encoding as UTF-8 and
+        resolving to IDs. Batch-local category codes are never
+        reinterpreted as global IDs; the schema is chosen before
+        execution and preserved across empty batches, partitions and
+        repeated scans. Use ``Reader.resolve_labels(ids)`` to resolve
+        original IDs to exact label bytes. In ``"uel_id"`` mode, string
+        ``key_filter`` labels and ``col(key) == "label"`` predicates match
+        exactly (labels are encoded as UTF-8 and resolved to their IDs);
+        ``is_in`` predicates must use the integer IDs, since Polars does
+        not plan String lists against UInt32 columns. Label-equality translation
+        requires predicate pushdown; when disabled, use integer ID predicates or
+        explicit string ``key_filter``. Mixing label and numeric predicates on
+        the same key column is rejected; use integer IDs consistently there.
 
     Notes
     -----
@@ -268,6 +296,12 @@ def scan_gdx(
     """
     reader_cls = _reader_class(backend)
     backend_is_gdxrs = reader_cls is GdxrsReader
+    if key_mode not in ("enum", "uel_id"):
+        raise ValueError(f"key_mode must be 'enum' or 'uel_id', got {key_mode!r}")
+    if key_mode == "uel_id" and not backend_is_gdxrs:
+        raise ValueError(
+            "key_mode='uel_id' is only supported by the gdxrs backend"
+        )
     reader = reader_cls(str(path))
     info = {r[0]: r for r in reader.symbols()}
     if symbol not in info:
@@ -288,15 +322,25 @@ def scan_gdx(
     # set literally named ``value`` would otherwise overwrite it in the
     # schema dict and break the Arrow record batch).
     key_names = _key_names(domains, dim, reserved={value_name})
-    # Key columns are declared as Polars Enums over the file's UEL table.
-    # The Rust layer emits Arrow dictionary arrays whose values are exactly
-    # the UEL table (file order) and whose indices are the raw 0-based UEL
-    # numbers, so Polars reinterprets the buffers zero-copy: no string
-    # materialisation, and `==`/`is_in`/join/group-by on keys run as integer
-    # category comparisons. Polars 2.0 maps Arrow dictionaries to Categorical
-    # when no schema is given and enforces the schema declared to
-    # register_io_source, so this must be declared explicitly.
-    key_dtype = pl.Enum(reader.uel_table())
+    # The schema is chosen now, before execution, and preserved across
+    # empty batches, partitions and repeated scans.
+    if key_mode == "uel_id":
+        # Bounded ID mode: original one-based UEL IDs as plain UInt32.
+        # No labels are decoded and no dictionary is materialized, so
+        # files whose dictionary exceeds the budget still stream.
+        key_dtype = pl.UInt32
+    else:
+        # Key columns are declared as Polars Enums over the file's UEL
+        # table. The Rust layer emits Arrow dictionary arrays whose values
+        # are exactly the UEL table (file order) and whose indices are the
+        # raw 0-based UEL numbers, so Polars reinterprets the buffers
+        # zero-copy: no string materialisation, and `==`/`is_in`/join/
+        # group-by on keys run as integer category comparisons. Polars 2.0
+        # maps Arrow dictionaries to Categorical when no schema is given
+        # and enforces the schema declared to register_io_source, so this
+        # must be declared explicitly. The full dictionary is admitted
+        # against the adapter budget before any output.
+        key_dtype = pl.Enum(reader.uel_table())
     schema = {name: key_dtype for name in key_names} | {value_name: pl.Float64}
 
     explicit_filters = None
@@ -312,20 +356,45 @@ def scan_gdx(
         del batch_size
         filters = explicit_filters
         pred_expr = None
+        shadow_mask = None
         native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
-            native = _predicate_key_filter(pred_expr, key_names, reader)
+            native = _predicate_key_filter(
+                pred_expr, key_names, reader, id_mode=(key_mode == "uel_id")
+            )
             if native is None:
                 # Predicate not fully translatable: a native row limit could
                 # under-fill head(n), so read unlimited and let Polars-side
                 # filter().head(n) apply.
                 native_limit_safe = False
+                if key_mode == "uel_id" and _references_key_labels(
+                    pred_expr, key_names
+                ):
+                    # The predicate compares key columns against string
+                    # labels but also contains conditions the adapter
+                    # cannot translate (residuals). Polars cannot compare
+                    # String literals against UInt32 columns, so evaluate
+                    # the whole predicate against a shadow frame whose
+                    # key columns hold the exact label strings (resolved
+                    # through the bounded resolver); the resulting mask
+                    # filters the ID frame. This keeps the predicate's
+                    # meaning identical to the pushed-down path.
+                    pred_expr = None
+                    shadow_mask = (predicate, key_names)
+                else:
+                    shadow_mask = None
             else:
+                shadow_mask = None
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
                 # the raw read, and re-apply it exactly on the produced frame.
-                pred_expr = _exact_expr(native, key_names)
+                pred_expr = _exact_expr(
+                    native,
+                    key_names,
+                    reader=reader,
+                    id_mode=(key_mode == "uel_id"),
+                )
                 merged = {d: list(labels) for d, labels in explicit_filters or []}
                 for d, labels in native:
                     if d in merged:
@@ -335,6 +404,9 @@ def scan_gdx(
                         merged[d] = list(labels)
                 filters = list(merged.items())
 
+        kwargs = {}
+        if backend_is_gdxrs:
+            kwargs["key_mode"] = key_mode
         batch = reader.read_arrow(
             symbol,
             key_names=list(key_names),
@@ -342,12 +414,15 @@ def scan_gdx(
             key_filter=filters,
             n_rows=(n_rows if native_limit_safe else None),
             threads=threads,
+            **kwargs,
         )
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         # Passing the Enum schema makes Polars reinterpret the dictionary
         # indices as enum physicals instead of decoding to strings.
         df = pl.from_arrow(batch, schema=schema)
-        if pred_expr is not None:
+        if shadow_mask is not None:
+            df = _apply_key_label_predicate(df, reader, *shadow_mask)
+        elif pred_expr is not None:
             df = df.filter(pred_expr)
         if n_rows is not None:
             df = df.head(n_rows)
@@ -361,7 +436,10 @@ def scan_gdx(
 
 
 def _predicate_key_filter(
-    pred: pl.Expr, key_names: list[str], reader: Reader
+    pred: pl.Expr,
+    key_names: list[str],
+    reader: Reader,
+    id_mode: bool = False,
 ) -> list[tuple[int, list[str]]] | None:
     """Extract a native key filter from a predicate, if possible.
 
@@ -384,6 +462,27 @@ def _predicate_key_filter(
         return None
     if not filters:
         return None
+    if id_mode:
+        # Bounded ID mode: no dictionary may be materialized, so label
+        # existence is checked through the bounded lookup instead of the
+        # full UEL table. Filters stay in label space; the IDs are
+        # resolved when the exact predicate is re-applied.
+        known = set()
+        batch = []
+        for d, labels in filters:
+            batch.extend(labels)
+        ids = reader.label_ids(batch)
+        for label, id_ in zip(batch, ids):
+            if id_ is not None:
+                known.add(label)
+        resolved = []
+        for d, labels in filters:
+            existing = [l for l in labels if l in known]
+            if not existing:
+                # Label never used in this dimension: no record can match.
+                return [(d, [])]
+            resolved.append((d, existing))
+        return resolved
     uels = set(reader.uel_table())
     resolved = []
     for d, labels in filters:
@@ -395,7 +494,126 @@ def _predicate_key_filter(
     return resolved
 
 
-def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> pl.Expr:
+def _references_key_labels(pred: pl.Expr, key_names: list[str]) -> bool:
+    """True when the serialized predicate plan compares a key column
+    against string label literals (== either side, or is_in), which Polars
+    cannot evaluate against UInt32 ID columns."""
+    return bool(_classify_label_conjuncts(pred, key_names)[0])
+
+
+def _split_conjuncts(node: dict) -> list[dict]:
+    """Split a serialized plan into its top-level AND conjuncts."""
+    if "BinaryExpr" in node and node["BinaryExpr"]["op"] == "And":
+        b = node["BinaryExpr"]
+        return _split_conjuncts(b["left"]) + _split_conjuncts(b["right"])
+    return [node]
+
+
+def _label_comparison(node: dict, key_names: list[str]) -> dict[str, list[str]]:
+    """If the node is a recognized key-label comparison (== or is_in
+    against string literals), return {column: [labels]}; else {}."""
+    if "BinaryExpr" in node:
+        b = node["BinaryExpr"]
+        if b["op"] == "Eq":
+            for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
+                if "Column" in col_side and col_side["Column"] in key_names:
+                    label = _string_literal(lit_side)
+                    if label is not None:
+                        return {col_side["Column"]: [label]}
+            return {}
+    if "Function" in node:
+        f = node["Function"]
+        opts = f.get("function", {}).get("Boolean", {})
+        if "IsIn" in opts:
+            inputs = f.get("input", [])
+            if len(inputs) == 2 and "Column" in inputs[0] and inputs[0]["Column"] in key_names:
+                labels = _list_literal_strings(inputs[1])
+                if labels is not None:
+                    return {inputs[0]["Column"]: labels}
+    return {}
+
+
+def _referenced_columns(node: dict) -> set[str]:
+    """Every column name referenced anywhere in a serialized subtree."""
+    if not isinstance(node, dict):
+        return set()
+    if "Column" in node:
+        return {node["Column"]}
+    names: set[str] = set()
+    for value in node.values():
+        if isinstance(value, dict):
+            names |= _referenced_columns(value)
+        elif isinstance(value, list):
+            for item in value:
+                names |= _referenced_columns(item)
+    return names
+
+
+def _classify_label_conjuncts(
+    pred: pl.Expr, key_names: list[str]
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Classify the predicate's top-level AND conjuncts.
+
+    Returns ({column: [label literals]}, {key columns referenced by other
+    conjuncts}). A key column that appears in both sets mixes string-label
+    and other (e.g. numeric) comparisons and cannot be evaluated against a
+    single frame."""
+    try:
+        plan = json.loads(pred.meta.serialize(format="json"))
+    except Exception:
+        return {}, set()
+    labels: dict[str, list[str]] = {}
+    other: set[str] = set()
+    for conjunct in _split_conjuncts(plan):
+        comparison = _label_comparison(conjunct, key_names)
+        if comparison:
+            for column, literals in comparison.items():
+                labels.setdefault(column, []).extend(literals)
+        else:
+            other |= _referenced_columns(conjunct) & set(key_names)
+    return labels, other
+
+
+def _apply_key_label_predicate(
+    df: pl.DataFrame, reader, predicate: pl.Expr, key_names: list[str]
+) -> pl.DataFrame:
+    """Resolve only label literals, preserving all other expressions and ID types.
+
+    JSON round-tripping uses the same local Polars expression representation as
+    predicate extraction. No file-provided serialized expression is loaded.
+    """
+    labels, other = _classify_label_conjuncts(predicate, key_names)
+    mixed = sorted(set(labels) & other)
+    if mixed:
+        raise ValueError(
+            f"the predicate mixes string-label and numeric comparisons on the "
+            f"same uel_id key column(s) {mixed}; compare integer IDs "
+            "consistently (labels resolve to their original UEL IDs)"
+        )
+    plan = json.loads(predicate.meta.serialize(format="json"))
+    expressions = []
+    for conjunct in _split_conjuncts(plan):
+        comparison = _label_comparison(conjunct, key_names)
+        if comparison:
+            name, literals = next(iter(comparison.items()))
+            resolved = reader.label_ids(sorted(set(literals)))
+            ids = sorted({value for value in resolved if value is not None})
+            expression = pl.col(name).is_in(ids) if ids else pl.lit(False)
+        else:
+            expression = pl.Expr.deserialize(io.StringIO(json.dumps(conjunct)), format="json")
+        expressions.append(expression)
+    mask = pl.lit(True)
+    for expression in expressions:
+        mask &= expression
+    return df.filter(mask)
+
+
+def _exact_expr(
+    filters: list[tuple[int, list[str]]],
+    key_names: list[str],
+    reader: Reader | None = None,
+    id_mode: bool = False,
+) -> pl.Expr:
     """Rebuild the predicate with exact (stored) labels.
 
     Within a dimension, labels are alternatives (OR) — a dimension's
@@ -408,10 +626,23 @@ def _exact_expr(filters: list[tuple[int, list[str]]], key_names: list[str]) -> p
     for d, labels in filters:
         if not labels:
             return pl.lit(False)
-        # No `.cast(pl.String)`: key columns are Enums, so `==`/`is_in` on
-        # the stored labels resolve to integer category comparisons.
         col = pl.col(key_names[d])
-        dim_expr = col == labels[0] if len(labels) == 1 else col.is_in(labels)
+        if id_mode:
+            # Bounded ID mode: key columns hold the original one-based
+            # UEL IDs, so resolve the exact labels to their IDs through
+            # the bounded lookup and compare integers. The full dictionary
+            # is never materialized.
+            ids = reader.label_ids(list(dict.fromkeys(labels)))
+            resolved = sorted({i for i in ids if i is not None})
+            if not resolved:
+                return pl.lit(False)
+            dim_expr = (
+                col == resolved[0] if len(resolved) == 1 else col.is_in(resolved)
+            )
+        else:
+            # No `.cast(pl.String)`: key columns are Enums, so `==`/`is_in`
+            # on the stored labels resolve to integer category comparisons.
+            dim_expr = col == labels[0] if len(labels) == 1 else col.is_in(labels)
         expr = dim_expr if expr is None else expr & dim_expr
     return expr if expr is not None else pl.lit(False)
 
@@ -424,39 +655,14 @@ def _collect_eq_filters(
     Recognises `col == "label"` and `col.is_in([labels])` (plus conjunctions
     thereof). Returns True when the whole node is translatable, else False.
     """
-    if "BinaryExpr" in node:
-        b = node["BinaryExpr"]
-        if b["op"] == "And":
-            return _collect_eq_filters(b["left"], key_names, out) and (
-                _collect_eq_filters(b["right"], key_names, out)
-            )
-        if b["op"] != "Eq":
-            return False
-        for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
-            if "Column" in col_side and col_side["Column"] in key_names:
-                label = _string_literal(lit_side)
-                if label is not None:
-                    out.append((key_names.index(col_side["Column"]), [label]))
-                    return True
-                return False
-        return False
-    if "Function" in node:
-        f = node["Function"]
-        opts = f.get("function", {}).get("Boolean", {})
-        if "IsIn" not in opts:
-            return False
-        inputs = f.get("input", [])
-        if len(inputs) != 2 or "Column" not in inputs[0]:
-            return False
-        col = inputs[0]["Column"]
-        if col not in key_names:
-            return False
-        labels = _list_literal_strings(inputs[1])
-        if labels is None:
-            return False
-        out.append((key_names.index(col), labels))
-        return True
-    return False
+    if "BinaryExpr" in node and node["BinaryExpr"]["op"] == "And":
+        binary = node["BinaryExpr"]
+        return _collect_eq_filters(binary["left"], key_names, out) and _collect_eq_filters(
+            binary["right"], key_names, out
+        )
+    comparison = _label_comparison(node, key_names)
+    out.extend((key_names.index(name), labels) for name, labels in comparison.items())
+    return bool(comparison)
 
 
 def _list_literal_strings(node: dict) -> list[str] | None:
