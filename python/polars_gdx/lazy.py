@@ -438,6 +438,26 @@ def scan_gdx(
             "n_rows": (n_rows if native_limit_safe else None),
             "threads": threads,
         }
+        # Projection pushdown (task 045): the columns the plan needs. A
+        # residual predicate must find its required columns in the frame
+        # until it has been evaluated, so every predicate-referenced
+        # column is retained defensively (Polars already includes them in
+        # with_columns, but the source does not rely on that).
+        needed_columns = None
+        if backend_is_gdxrs and with_columns is not None:
+            needed = list(dict.fromkeys(with_columns))
+            if predicate is not None:
+                try:
+                    plan = json.loads(predicate.meta.serialize(format="json"))
+                    referenced = [
+                        name
+                        for name in _referenced_columns(plan)
+                        if name in schema
+                    ]
+                    needed = list(dict.fromkeys([*needed, *referenced]))
+                except Exception:
+                    needed = None
+            needed_columns = needed
         if backend_is_gdxrs:
             # M7 task 044: cursor-backed streaming batches. The source
             # emits incrementally without accumulating the whole symbol;
@@ -446,6 +466,7 @@ def scan_gdx(
             # rows). Each yielded batch owns valid data after the lending
             # core cursor advances or closes.
             read_kwargs["key_mode"] = key_mode
+            read_kwargs["columns"] = needed_columns
             cursor = reader.scan_batches(
                 symbol, batch_rows=batch_size, **read_kwargs
             )
@@ -470,7 +491,8 @@ def scan_gdx(
                     if holder is None:
                         break
                     # Polars imports a C stream as a struct series; unnest
-                    # it back into the record-batch columns.
+                    # it back into the record-batch columns (only the
+                    # needed ones when projection pushdown applied).
                     df = pl.from_arrow(holder).struct.unnest()
                     # Re-apply the declared schema: dictionary keys arrive
                     # as Categorical and are cast to the declared Enum
@@ -478,7 +500,10 @@ def scan_gdx(
                     # so the cast preserves values and physicals); other
                     # columns cast to their declared (identical) dtypes.
                     df = df.select(
-                        [pl.col(name).cast(dtype) for name, dtype in schema.items()]
+                        [
+                            pl.col(name).cast(schema[name])
+                            for name in df.columns
+                        ]
                     )
                     if shadow_mask is not None:
                         df = _apply_key_label_predicate(df, reader, *shadow_mask)
