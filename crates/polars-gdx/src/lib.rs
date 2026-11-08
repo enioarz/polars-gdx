@@ -26,5 +26,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<gdxrs_backend::GdxrsReader>()?;
     #[cfg(feature = "gdxrs")]
     m.add_class::<gdxrs_backend::GdxrsBatchCursor>()?;
+    #[cfg(feature = "gdxrs")]
+    m.add_class::<gdxrs_backend::GdxrsArrowStream>()?;
     Ok(())
 }

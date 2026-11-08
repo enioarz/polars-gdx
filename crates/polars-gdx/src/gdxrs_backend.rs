@@ -33,7 +33,7 @@ use gdxrs::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PySequence, PyString};
+use pyo3::types::{PyAny, PyCapsule, PyDict, PyList, PySequence, PyString};
 
 fn to_py_err(e: gdxrs::Error) -> PyErr {
     PyRuntimeError::new_err(format!("gdxrs backend: {e}"))
@@ -980,6 +980,40 @@ impl GdxrsReader {
     }
 }
 
+/// One record batch exported through the Arrow C Data Interface
+/// (`__arrow_c_stream__`), so Polars can consume it without creating any
+/// pyarrow object on the calling (engine) thread. The capsule's release
+/// runs pure Rust code; the stream yields exactly one batch.
+struct SendStream(#[allow(dead_code)] arrow::ffi_stream::FFI_ArrowArrayStream);
+// The C Data Interface moves the stream struct to the consumer thread by
+// design; the wrapped reader is itself Send, and the raw pointers are the
+// stream protocol's own address-based fields.
+unsafe impl Send for SendStream {}
+// The stream is consumed exactly once (single __arrow_c_stream__ call);
+// there is no concurrent access to justify real sharing, only the
+// protocol's address-based raw-pointer fields.
+unsafe impl Sync for SendStream {}
+
+#[pyclass]
+pub struct GdxrsArrowStream {
+    stream: Option<SendStream>,
+}
+
+#[pymethods]
+impl GdxrsArrowStream {
+    fn __arrow_c_stream__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+        let stream = self.stream.take().ok_or_else(|| {
+            PyRuntimeError::new_err("gdxrs backend: arrow stream already consumed")
+        })?;
+        PyCapsule::new_with_destructor(
+            py,
+            stream,
+            Some(std::ffi::CString::new("arrow_array_stream").expect("valid capsule name")),
+            |_stream: SendStream, _context| {},
+        )
+    }
+}
+
 /// Cursor-backed streaming batch source (M7 task 044).
 ///
 /// Wraps the core's lending `ScanCursor`: each `__next__` call advances
@@ -1015,6 +1049,60 @@ impl GdxrsBatchCursor {
     /// The lending core view is copied out within this call; the returned
     /// batch owns valid data after the cursor advances or closes.
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let Some(record) = self.build_batch()? else {
+            return Ok(None);
+        };
+        Ok(Some(record.into_pyarrow(py)?.into_any()))
+    }
+
+    /// The next batch as an Arrow C stream capsule holder
+    /// (`__arrow_c_stream__`), avoiding any pyarrow object creation on
+    /// the calling thread: creating pyarrow objects on Polars' streaming
+    /// engine thread can abort the interpreter at shutdown, so the
+    /// lazy source consumes this form instead of `__next__`.
+    fn next_stream(&mut self) -> PyResult<Option<GdxrsArrowStream>> {
+        let Some(record) = self.build_batch()? else {
+            return Ok(None);
+        };
+        let schema = record.schema();
+        let iterator = arrow::array::RecordBatchIterator::new(vec![Ok(record)].into_iter(), schema);
+        let stream = arrow::ffi_stream::FFI_ArrowArrayStream::new(Box::new(iterator));
+        Ok(Some(GdxrsArrowStream {
+            stream: Some(SendStream(stream)),
+        }))
+    }
+
+    /// Per-cursor projection counters plus the core's decoded rows so far.
+    fn scan_statistics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let mut stats = self.stats;
+        stats.decoded_rows = self
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.statistics().decoded_rows)
+            .unwrap_or(self.stats.decoded_rows);
+        let dict = PyDict::new(py);
+        dict.set_item("decoded_rows", stats.decoded_rows)?;
+        dict.set_item("eps_to_zero", stats.eps_to_zero)?;
+        dict.set_item("acronyms_to_null", stats.acronyms_to_null)?;
+        Ok(dict)
+    }
+
+    /// Stop at the acknowledged prefix: release the core decoder and
+    /// batch buffers; later `__next__` calls end the stream. Idempotent.
+    fn close(&mut self) -> PyResult<()> {
+        if let Some(mut cursor) = self.cursor.take() {
+            self.stats.decoded_rows = cursor.statistics().decoded_rows;
+            cursor.close().map_err(to_py_err)?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl GdxrsBatchCursor {
+    /// Copy the lending core view of the next batch into a fresh,
+    /// self-owned RecordBatch, or None at end of stream.
+    fn build_batch(&mut self) -> PyResult<Option<RecordBatch>> {
         let Some(cursor) = self.cursor.as_mut() else {
             return Ok(None);
         };
@@ -1059,33 +1147,7 @@ impl GdxrsBatchCursor {
             self.n_uels,
             self.id_mode,
         )?;
-        Ok(Some(record.into_pyarrow(py)?.into_any()))
-    }
-
-    /// Per-cursor projection counters plus the core's decoded rows so far.
-    fn scan_statistics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let mut stats = self.stats;
-        stats.decoded_rows = self
-            .cursor
-            .as_ref()
-            .map(|cursor| cursor.statistics().decoded_rows)
-            .unwrap_or(self.stats.decoded_rows);
-        let dict = PyDict::new(py);
-        dict.set_item("decoded_rows", stats.decoded_rows)?;
-        dict.set_item("eps_to_zero", stats.eps_to_zero)?;
-        dict.set_item("acronyms_to_null", stats.acronyms_to_null)?;
-        Ok(dict)
-    }
-
-    /// Stop at the acknowledged prefix: release the core decoder and
-    /// batch buffers; later `__next__` calls end the stream. Idempotent.
-    fn close(&mut self) -> PyResult<()> {
-        if let Some(mut cursor) = self.cursor.take() {
-            self.stats.decoded_rows = cursor.statistics().decoded_rows;
-            cursor.close().map_err(to_py_err)?;
-        }
-        self.finished = true;
-        Ok(())
+        Ok(Some(record))
     }
 }
 

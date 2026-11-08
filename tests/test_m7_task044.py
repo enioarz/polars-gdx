@@ -251,11 +251,16 @@ def test_zero_column_projection():
 
 
 def test_noncollecting_sink_streams_incrementally():
-    """A noncollecting sink demonstrates bounded producer buffering and
-    backpressure: consuming a prefix of the 20,000-row source at
-    chunk_size=1000 stops after the consumed batches — the producer never
-    runs ahead of the consumer, and only the current batch is buffered.
-    Caller `.collect()` remains an explicit materializing operation."""
+    """A noncollecting sink serves a consumed prefix correctly. The
+    ADAPTER's producer is pull-driven and holds one in-flight batch
+    (proven at the cursor level in
+    test_early_sink_exit_stops_the_producer); on top of that, Polars'
+    engine applies its own bounded morsel prefetch — it passes its default
+    batch_size (100000), not the sink's chunk_size, and buffers a bounded
+    number of produced batches ahead of the consumer (observed 2-5
+    batches), so production stays bounded but is not exactly
+    consumer-paced. Caller `.collect()` remains an explicit materializing
+    operation."""
     lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs")
     consumed = list(itertools.islice(lf.collect_batches(chunk_size=1000), 3))
     assert [b.height for b in consumed] == [1000, 1000, 1000]
@@ -264,6 +269,60 @@ def test_noncollecting_sink_streams_incrementally():
     whole = lf.collect()
     assert whole.height == 20_000
     assert pl.concat(consumed).equals(whole.head(3000))
+
+
+SUBPROCESS_EARLY_EXIT = """
+from polars_gdx import scan_gdx
+
+lf = scan_gdx(
+    "{path}",
+    symbol="BIG",
+    backend="gdxrs",
+)
+it = lf.collect_batches(chunk_size=1000)
+print(next(it).shape, flush=True)
+del it
+"""
+
+SUBPROCESS_RESIDUAL_HEAD = """
+import polars as pl
+from polars_gdx import scan_gdx
+
+lf = scan_gdx(
+    "{path}",
+    symbol="BIG",
+    backend="gdxrs",
+)
+print(lf.filter(pl.col("value") > 995.0).head(3).collect().shape, flush=True)
+it = lf.collect_batches(chunk_size=1000)
+print(next(it).shape, flush=True)
+del it
+"""
+
+
+@pytest.mark.parametrize("script", [
+    SUBPROCESS_EARLY_EXIT,
+    SUBPROCESS_RESIDUAL_HEAD,
+])
+def test_early_consumer_exit_terminates_cleanly(script):
+    """Review finding: disposing a noncollecting-sink consumer after a
+    partial consumption must stop and join streaming production before
+    interpreter shutdown — the generator's finally closes the cursor on
+    GeneratorExit, so the process exits 0 (no SIGABRT), across repeated
+    trials."""
+    import subprocess
+    import sys as _sys
+
+    program = script.format(path=GROW)
+    for _ in range(3):
+        result = subprocess.run(
+            [_sys.executable, "-c", program],
+            capture_output=True,
+            text=True,
+            cwd=".",
+        )
+        assert result.returncode == 0, (result.returncode, result.stderr)
+        assert "(1000, 2)" in result.stdout
 
 
 def test_early_sink_exit_stops_the_producer():
