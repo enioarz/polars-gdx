@@ -695,3 +695,54 @@ def test_preamble_cancellation_releases_registration_once(monkeypatch):
         .height
         == 1
     )
+
+
+def test_cancellation_after_publication_cleans_up_cursor(monkeypatch):
+    """Review finding: a cancellation landing immediately after the
+    registration release left the counter at zero but RETAINED the
+    published cursor (four admitted workers, zero joined) — the
+    cursor-cleanup finally had not been entered yet. Cursor cleanup is
+    now an OUTER finally covering setup, the registration release, the
+    handoff and the streaming loop, so the cancellation after
+    publication discards and closes the cursor."""
+    import polars_gdx.lazy as lazy
+
+    lazy._SHUTTING_DOWN.clear()
+    assert lazy._IN_FLIGHT == 0
+    released = []
+    orig_exit = lazy._exit_callback
+
+    def exit_or_cancel():
+        # The registration is released first (the counter drops to
+        # zero), THEN the cancellation lands — exactly the reviewer's
+        # injection point immediately after the release.
+        orig_exit()
+        released.append(1)
+        if len(released) == 1:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(lazy, "_exit_callback", exit_or_cancel)
+    try:
+        try:
+            scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4).filter(
+                pl.col("dim_0") == "u00000"
+            ).collect()
+        except BaseException:
+            pass
+        # The cancellation happened AFTER publication (setup ran) and
+        # after the release...
+        assert released == [1]
+        assert lazy._IN_FLIGHT == 0
+        # ...and the published cursor was cleaned up, not retained with
+        # unjoined workers.
+        assert not lazy._OPEN_CURSORS
+    finally:
+        monkeypatch.undo()
+    # Normal operation restored.
+    assert (
+        scan_gdx(GROW, symbol="BIG", backend="gdxrs")
+        .filter(pl.col("dim_0") == "u00000")
+        .collect()
+        .height
+        == 1
+    )
