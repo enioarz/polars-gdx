@@ -1,6 +1,6 @@
 """Lazy GDX scanning via Polars' IO source interface.
 
-Polars drives reading through `register_io_source`. The gdxrs backend streams
+Polars drives reading through its Python IO-source interface. The gdxrs backend streams
 owned Arrow batches with projection and key-filter pushdown; the legacy backend
 returns one batch per symbol. Residual predicates run before the final projection
 and global accepted-row limit.
@@ -18,9 +18,9 @@ import time
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import polars as pl
-from polars.io.plugins import register_io_source
 
 from polars_gdx import _core
+from polars_gdx._batches import register_source
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -385,6 +385,13 @@ def scan_gdx(
     ``Reader`` plus its ``close()``/context-manager support) if you need the
     handle released eagerly.
 
+    **Batch consumer ownership (gdxrs)**: ``collect_batches()`` on this frame
+    or its derived plans returns an iterator with ``close()`` and context-manager
+    support. Disposal cancels that execution and joins its workers. For a plain
+    Polars frame produced by functions such as ``pl.concat``, use
+    ``polars_gdx.collect_batches(plan)``. Owned collection requires a locally
+    serializable Polars plan; GDX readers and records are not serialized.
+
     Example
     -------
     >>> lf = scan_gdx("trnsport.gdx", symbol="x")  # doctest: +SKIP
@@ -459,6 +466,8 @@ def scan_gdx(
         predicate: pl.Expr | None,
         n_rows: int | None,
         batch_size: int | None,
+        *,
+        _execution=None,
     ) -> Iterator[pl.DataFrame]:
         if not backend_is_gdxrs:
             # Only the gdxrs backend streams batches (task 044); the legacy
@@ -470,9 +479,8 @@ def scan_gdx(
         # must not be able to complete while a paused preamble resumes
         # into it. A shutdown that has already begun ends the source
         # before any extension call.
-        if backend_is_gdxrs and not _enter_callback():
-            return
-        registered = backend_is_gdxrs
+        registered = False
+        execution_registered = False
         cursor = None
         try:
             # CURSOR CLEANUP (the outer finally below) owns everything
@@ -482,6 +490,14 @@ def scan_gdx(
             # the published cursor instead of retaining it with unjoined
             # workers.
             try:
+                if _execution is not None:
+                    if not _execution.enter_setup():
+                        return
+                    execution_registered = True
+                if backend_is_gdxrs:
+                    if not _enter_callback():
+                        return
+                    registered = True
                 filters = explicit_filters
                 pred_expr = None
                 shadow_mask = None
@@ -587,6 +603,8 @@ def scan_gdx(
                     # source is finalized on the main thread, not on a
                     # Polars engine thread during interpreter shutdown.
                     _OPEN_CURSORS.add(cursor)
+                    if _execution is not None:
+                        _execution.attach(cursor, _OPEN_CURSORS)
                 else:
                     batch = reader.read_arrow(symbol, **read_kwargs)
                     # pyarrow RecordBatch -> polars: zero-copy over the
@@ -602,21 +620,28 @@ def scan_gdx(
                         df = df.head(n_rows)
                     if with_columns is not None:
                         df = df.select(with_columns)
-                    yield df
-                    return
             finally:
                 # The single registration cleanup path: runs exactly once
                 # on every exit from the registered preamble (normal end,
                 # exception, cancellation), so the in-flight counter can
                 # never be double-decremented.
-                if registered:
-                    _exit_callback()
+                try:
+                    if registered:
+                        _exit_callback()
+                finally:
+                    if execution_registered:
+                        _execution.leave_setup()
+            if not backend_is_gdxrs:
+                yield df
+                return
             if cursor is not None:
                 # Global accepted-row limit for residual predicates that
                 # the core could not apply: track the remainder across
                 # batches.
                 remaining = n_rows if not native_limit_safe else None
                 while True:
+                    if _execution is not None and _execution.closed:
+                        break
                     if not _enter_callback():
                         # Shutdown has begun: no extension call may
                         # happen; end the source immediately.
@@ -686,10 +711,12 @@ def scan_gdx(
                 if not sys.is_finalizing():
                     cursor.close()
                 _OPEN_CURSORS.discard(cursor)
+                if _execution is not None:
+                    _execution.detach(cursor)
 
     # `is_pure` lets the optimizer de-duplicate repeated occurrences of the
     # same scan within one plan (the source is a deterministic file read).
-    return register_io_source(_read, schema=schema, is_pure=True)
+    return register_source(_read, schema, owned_batches=backend_is_gdxrs)
 
 
 def _predicate_key_filter(

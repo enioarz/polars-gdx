@@ -82,6 +82,28 @@ once per reader and symbol, so their first scan includes the index-build cost.
 `GdxrsReader.read_arrow()` remains serial; use `GdxrsReader.scan_batches()` for
 parallel batches.
 
+Gdxrs scan frames provide an owned `collect_batches()` iterator. Dropping it
+cancels that execution's cursors and joins their workers, even when Polars retains
+the source generator. Prefer a context manager or explicit `close()` to surface
+cleanup errors:
+
+```python
+lf = scan_gdx("huge.gdx", symbol="x", backend="gdxrs", threads=4)
+with lf.filter(pl.col("level") > 0).collect_batches(chunk_size=1000) as batches:
+    for batch in batches:
+        process(batch)
+        if enough_data():
+            break  # workers join on context exit; lf remains reusable
+```
+
+For operations that return a plain Polars LazyFrame, such as `pl.concat` or
+group-by aggregation, use
+`polars_gdx.collect_batches(plan, chunk_size=1000)` for the same ownership behavior.
+Ordinary Polars `collect_batches()` on a plain LazyFrame has Polars' own disposal
+semantics. Owned collection binds sources by cloning the local Polars plan; custom
+UDF captures must be serializable. The clone includes plan metadata and any
+in-memory inputs, while GDX records remain incremental. `collect()` is unchanged.
+
 ## Free-threaded Python
 
 GIL-disabled Python is **not currently supported**. The PyO3 module requires

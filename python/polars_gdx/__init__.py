@@ -1,5 +1,6 @@
 """Polars IO plugin for reading GAMS GDX files lazily with prefiltering."""
 from polars_gdx import _core
+from polars_gdx._batches import collect_batches
 from polars_gdx.lazy import (  # noqa: F401
     scan_gdx,
     read_gdx,
@@ -25,6 +26,7 @@ __all__ = [
     "GdxrsReader",
     "GdxrsBatchCursor",
     "scan_gdx",
+    "collect_batches",
     "read_gdx",
     "read_domains",
     "list_symbols",

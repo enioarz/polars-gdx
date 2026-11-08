@@ -18,7 +18,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from polars_gdx import GdxrsReader, read_gdx, scan_gdx
+from polars_gdx import GdxrsReader, collect_batches, read_gdx, scan_gdx
 
 GDX = "tests/data/trnsport.gdx"
 DICT = "tests/data/m7/m7-dictionary.gdx"
@@ -245,18 +245,182 @@ def test_parallel_early_exit_terminates_cleanly(script):
         assert "(1000, 2)" in result.stdout
 
 
-def test_python_cancellation_via_generator_close():
-    """Python cancellation (KeyboardInterrupt-style: closing the source
-    generator mid-scan) joins the parallel workers and ends the stream."""
+@pytest.mark.parametrize("drop_plan", [False, True])
+def test_python_cancellation_via_generator_close(drop_plan):
+    """Consumer disposal joins workers even if Polars retains the source."""
+    import gc
+
+    import polars_gdx.lazy as lazy
+
+    before = set(lazy._OPEN_CURSORS)
     lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4)
     batches = lf.collect_batches(chunk_size=100)
     first = next(batches)
+    snapshot = first.to_dict(as_series=False)
     assert first.height == 100
-    # Closing a suspended source is the cancellation path.
+    owned = set(lazy._OPEN_CURSORS) - before
+    assert owned
     del batches
-    import gc
-
+    if drop_plan:
+        del lf
     gc.collect()
+    assert not owned & lazy._OPEN_CURSORS
+    assert all(c.scan_statistics()["joined_workers"] == 4 for c in owned)
+    assert first.to_dict(as_series=False) == snapshot
+    if not drop_plan:
+        assert lf.collect().height == 20_000
+
+
+def test_concurrent_batch_consumers_cancel_independently():
+    import polars_gdx.lazy as lazy
+
+    before = set(lazy._OPEN_CURSORS)
+    lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4)
+    a = lf.collect_batches(chunk_size=100)
+    b = None
+    try:
+        next(a)
+        owned_a = set(lazy._OPEN_CURSORS) - before
+        b = lf.collect_batches(chunk_size=100)
+        first_b = next(b)
+        owned_b = set(lazy._OPEN_CURSORS) - before - owned_a
+        assert owned_a and owned_b
+        a.close()
+        assert all(c.scan_statistics()["joined_workers"] == 4 for c in owned_a)
+        assert not owned_a & lazy._OPEN_CURSORS
+        frames = [first_b, *b]
+        assert pl.concat(frames).equals(lf.collect())
+        assert all(c.scan_statistics()["joined_workers"] == 4 for c in owned_b)
+    finally:
+        a.close()
+        if b is not None:
+            b.close()
+
+
+def test_owned_batch_context_closes_on_sink_exception():
+    import polars_gdx.lazy as lazy
+
+    before = set(lazy._OPEN_CURSORS)
+    lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=3)
+    with pytest.raises(RuntimeError, match="sink failed"):
+        with lf.collect_batches(chunk_size=100) as batches:
+            next(batches)
+            owned = set(lazy._OPEN_CURSORS) - before
+            raise RuntimeError("sink failed")
+    assert owned
+    assert not owned & lazy._OPEN_CURSORS
+    assert all(c.scan_statistics()["joined_workers"] == 3 for c in owned)
+
+
+def test_owned_batches_close_before_lazy_source_starts():
+    import polars_gdx.lazy as lazy
+
+    before = set(lazy._OPEN_CURSORS)
+    lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4)
+    batches = lf.collect_batches(chunk_size=100, lazy=True)
+    batches.close()
+    assert list(batches) == []
+    assert set(lazy._OPEN_CURSORS) == before
+
+
+def test_owned_batches_cover_composed_plans():
+    import polars_gdx.lazy as lazy
+
+    a = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=2)
+    b = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=3)
+    plan = pl.concat([a, b])
+    before = set(lazy._OPEN_CURSORS)
+    with collect_batches(plan, chunk_size=100) as batches:
+        next(batches)
+        owned = set(lazy._OPEN_CURSORS) - before
+    assert owned
+    assert not owned & lazy._OPEN_CURSORS
+    assert all(c.scan_statistics()["joined_workers"] in (2, 3) for c in owned)
+    assert pl.concat(list(collect_batches(plan, chunk_size=1000))).equals(plan.collect())
+
+
+def test_consumer_close_waits_for_source_publication(monkeypatch):
+    import time
+
+    import polars_gdx.lazy as lazy
+    from polars_gdx._batches import _Execution
+
+    entered = threading.Event()
+    proceed = threading.Event()
+    captured = []
+    errors = []
+    attach = _Execution.attach
+
+    def paused_attach(self, cursor, registry):
+        captured.append(cursor)
+        entered.set()
+        assert proceed.wait(10)
+        attach(self, cursor, registry)
+
+    monkeypatch.setattr(_Execution, "attach", paused_attach)
+    lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4)
+    batches = lf.collect_batches(chunk_size=100)
+
+    def close():
+        try:
+            batches.close()
+        except BaseException as exc:
+            errors.append(exc)
+
+    closer = threading.Thread(target=close)
+    try:
+        assert entered.wait(10)
+        closer.start()
+        deadline = time.monotonic() + 5
+        while not batches._execution.closed and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert batches._execution.closed
+        assert closer.is_alive()
+    finally:
+        proceed.set()
+        if closer.ident is not None:
+            closer.join(10)
+        batches.close()
+    assert not closer.is_alive()
+    assert errors == []
+    assert captured
+    assert not set(captured) & lazy._OPEN_CURSORS
+    assert all(c.scan_statistics()["joined_workers"] == 4 for c in captured)
+
+
+def test_owned_batch_source_error_releases_setup(tmp_path):
+    import polars_gdx.lazy as lazy
+
+    path = tmp_path / "changed.gdx"
+    path.write_bytes(Path(GROW).read_bytes())
+    before = set(lazy._OPEN_CURSORS)
+    lf = scan_gdx(path, symbol="BIG", backend="gdxrs", threads=4)
+    with path.open("ab") as file:
+        file.write(b"changed after opening")
+    with pytest.raises(Exception, match="[Ss]ource|changed"):
+        list(lf.collect_batches(chunk_size=100))
+    assert set(lazy._OPEN_CURSORS) == before
+    assert lazy._IN_FLIGHT == 0
+
+
+def test_owned_batches_need_no_cloudpickle():
+    program = '''
+import importlib.abc
+import sys
+class BlockCloudpickle(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, *args):
+        if fullname == "cloudpickle":
+            raise ImportError("cloudpickle intentionally unavailable")
+sys.meta_path.insert(0, BlockCloudpickle())
+from polars_gdx import scan_gdx
+lf = scan_gdx("tests/data/m7/m7-labels20k.gdx", symbol="BIG", backend="gdxrs", threads=4)
+with lf.select("value").collect_batches(chunk_size=100) as batches:
+    assert next(batches).shape == (100, 1)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +514,12 @@ def test_index_sidecars_released_on_reader_close():
     cursor.close()
     after = _index_directories()
     # A new directory exists while the reader is open...
-    assert len(after - before) == 1
+    owned = after - before
+    assert len(owned) == 1
     reader.close()
     # ...and is removed (with its sidecar) once the reader closes.
     final = _index_directories()
-    assert final == before
+    assert not owned & final
 
 
 def test_cancel_from_another_thread_during_production():
@@ -409,16 +574,18 @@ def test_reader_drop_releases_index_sidecars():
     reader = GdxrsReader(GROW)
     cursor = reader.scan_batches("BIG", threads=2, batch_rows=100)
     next(iter(cursor))
+    owned = _index_directories() - before
+    assert len(owned) == 1
     del reader
     gc.collect()
-    assert _index_directories() == before
+    assert not owned & _index_directories()
     # A cursor that outlives its reader still completes its scan and
     # releases its own handle on close/drop.
     remaining = sum(b.num_rows for b in iter(cursor))
     assert remaining >= 0
     del cursor
     gc.collect()
-    assert _index_directories() == before
+    assert not owned & _index_directories()
 
 
 def test_shutdown_gate_refuses_new_callbacks():
@@ -543,7 +710,7 @@ def test_shutdown_gate_covers_source_setup():
         assert df.height == 0
         # The setup extension call never ran: no NEW index directory was
         # created (the parallel path builds one inside scan_batches).
-        assert _index_directories() == before
+        assert not _index_directories() - before
     finally:
         lazy._SHUTTING_DOWN.clear()
 
