@@ -348,3 +348,29 @@ def test_residual_predicate_head_is_global_across_batches():
     # The same query batched at chunk_size=1 agrees.
     batches = _batches(lf.filter(pl.col("value") > 995.0).head(3), 1)
     assert _concat(batches).equals(df)
+
+
+def test_arrow_stream_pyarrow_interop():
+    """Review finding: the Arrow PyCapsule interface passes the optional
+    `requested_schema` argument, so `__arrow_c_stream__` must accept it.
+    pyarrow consumes the exported stream and sees exactly the batch that
+    `__next__` produces; a concrete requested schema is rejected clearly."""
+    import pyarrow as pa
+
+    with GdxrsReader(DICT) as reader:
+        cursor = reader.scan_batches("P", batch_rows=2)
+        holder = cursor.next_stream()
+        # pyarrow passes requested_schema (None here) — must not TypeError.
+        table = pa.RecordBatchReader.from_stream(holder).read_all()
+        # The stream exports exactly the first batch; compare it with the
+        # corresponding slice of the eager single-batch read.
+        expected = reader.read_arrow("P").slice(0, 2)
+        assert table.num_rows == 2
+        assert table.column("dim_0").to_pylist() == expected.column(0).to_pylist()
+        assert table.column("value").to_pylist() == expected.column(1).to_pylist()
+        # A concrete requested schema is rejected clearly, not silently
+        # ignored.
+        cursor2 = reader.scan_batches("P", batch_rows=2)
+        holder2 = cursor2.next_stream()
+        with pytest.raises(ValueError, match="requested_schema"):
+            holder2.__arrow_c_stream__(pa.schema([("x", pa.int32())]))

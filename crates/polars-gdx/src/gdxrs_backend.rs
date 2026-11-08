@@ -1006,7 +1006,24 @@ pub struct GdxrsArrowStream {
 
 #[pymethods]
 impl GdxrsArrowStream {
-    fn __arrow_c_stream__<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyCapsule>> {
+    #[pyo3(signature = (requested_schema=None))]
+    fn __arrow_c_stream__<'py>(
+        &mut self,
+        requested_schema: Option<&Bound<'_, PyAny>>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyCapsule>> {
+        // The Arrow PyCapsule interface passes the optional
+        // `requested_schema` argument; the stream's schema is fixed, so a
+        // concrete request is rejected clearly rather than silently
+        // ignored.
+        if let Some(requested) = requested_schema {
+            if !requested.is_none() {
+                return Err(PyValueError::new_err(
+                    "gdxrs backend: requested_schema is not supported; \
+                     the exported stream's schema is fixed",
+                ));
+            }
+        }
         let stream = self.stream.take().ok_or_else(|| {
             PyRuntimeError::new_err("gdxrs backend: arrow stream already consumed")
         })?;
