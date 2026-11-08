@@ -984,6 +984,11 @@ impl GdxrsReader {
 /// (`__arrow_c_stream__`), so Polars can consume it without creating any
 /// pyarrow object on the calling (engine) thread. The capsule's release
 /// runs pure Rust code; the stream yields exactly one batch.
+/// The capsule payload must be layout-identical to the wrapped
+/// `FFI_ArrowArrayStream`: Arrow consumers interpret the capsule's
+/// pointer as `*const FFI_ArrowArrayStream`, and `repr(transparent)`
+/// guarantees that ABI equivalence (Rust's default repr does not).
+#[repr(transparent)]
 struct SendStream(#[allow(dead_code)] arrow::ffi_stream::FFI_ArrowArrayStream);
 // The C Data Interface moves the stream struct to the consumer thread by
 // design; the wrapped reader is itself Send, and the raw pointers are the
