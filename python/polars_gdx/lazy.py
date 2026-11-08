@@ -688,9 +688,14 @@ def scan_gdx(
             # hook already stopped production, and extension calls during
             # finalization can abort.
             if cursor is not None:
-                _OPEN_CURSORS.discard(cursor)
+                # Close BEFORE unregistering: the cursor stays in the
+                # registry until close() completes, so a concurrent
+                # shutdown cannot observe an empty registry while this
+                # cursor's workers are still unjoined — it waits for the
+                # in-flight close instead of returning.
                 if not sys.is_finalizing():
                     cursor.close()
+                _OPEN_CURSORS.discard(cursor)
 
     # `is_pure` lets the optimizer de-duplicate repeated occurrences of the
     # same scan within one plan (the source is a deterministic file read).

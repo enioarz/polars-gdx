@@ -746,3 +746,58 @@ def test_cancellation_after_publication_cleans_up_cursor(monkeypatch):
         .height
         == 1
     )
+
+
+def test_shutdown_waits_through_cleanup_handoff():
+    """Review finding: the generator's cleanup unregistered the cursor
+    BEFORE joining its workers, so a pause between the discard and the
+    close let shutdown return with zero callbacks, an empty registry and
+    zero joined workers. Cleanup now closes first and discards only
+    after close() completes, so the cursor stays registered while its
+    workers join — a concurrent shutdown waits for the in-flight close
+    instead of returning early."""
+    import time as _time
+
+    import polars_gdx.lazy as lazy
+
+    close_started = threading.Event()
+    close_finished = threading.Event()
+
+    class Stub:
+        def close(self):
+            close_started.set()
+            # The worker "join" pauses mid-close; the cursor is still
+            # registered at this point (closed before discarded).
+            deadline = _time.monotonic() + 10
+            while not close_finished.is_set() and _time.monotonic() < deadline:
+                _time.sleep(0.001)
+
+    lazy._SHUTTING_DOWN.clear()
+    stub = Stub()
+    lazy._OPEN_CURSORS.add(stub)
+    # A generator-style cleanup runs concurrently with shutdown:
+    # close() first (pausing mid-join), discard only after it completes.
+    def generator_cleanup():
+        stub.close()
+        lazy._OPEN_CURSORS.discard(stub)
+
+    gen = threading.Thread(target=generator_cleanup)
+    gen.start()
+    close_started.wait(timeout=10)
+    # The close is paused mid-join and the cursor is still registered:
+    # shutdown must wait for it rather than returning with unjoined
+    # workers. (With the old discard-before-close order, the registry
+    # would already be empty and shutdown would return immediately.)
+    hook = threading.Thread(target=lazy._close_open_cursors)
+    hook.start()
+    _time.sleep(0.3)
+    assert hook.is_alive()
+    close_finished.set()
+    gen.join(timeout=10)
+    hook.join(timeout=30)
+    assert not gen.is_alive()
+    assert not hook.is_alive()
+    assert not lazy._OPEN_CURSORS
+    assert lazy._IN_FLIGHT == 0
+    # Restore the module for the rest of the process.
+    lazy._SHUTTING_DOWN.clear()
