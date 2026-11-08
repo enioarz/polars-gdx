@@ -9,6 +9,7 @@ materialised.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 from typing import TYPE_CHECKING, Iterator, Sequence
@@ -271,7 +272,10 @@ def scan_gdx(
         ``key_filter`` labels and ``col(key) == "label"`` predicates match
         exactly (labels are encoded as UTF-8 and resolved to their IDs);
         ``is_in`` predicates must use the integer IDs, since Polars does
-        not plan String lists against UInt32 columns.
+        not plan String lists against UInt32 columns. Label-equality translation
+        requires predicate pushdown; when disabled, use integer ID predicates or
+        explicit string ``key_filter``. Mixing label and numeric predicates on
+        the same key column is rejected; use integer IDs consistently there.
 
     Notes
     -----
@@ -522,7 +526,7 @@ def _label_comparison(node: dict, key_names: list[str]) -> dict[str, list[str]]:
         opts = f.get("function", {}).get("Boolean", {})
         if "IsIn" in opts:
             inputs = f.get("input", [])
-            if inputs and "Column" in inputs[0] and inputs[0]["Column"] in key_names:
+            if len(inputs) == 2 and "Column" in inputs[0] and inputs[0]["Column"] in key_names:
                 labels = _list_literal_strings(inputs[1])
                 if labels is not None:
                     return {inputs[0]["Column"]: labels}
@@ -573,18 +577,11 @@ def _classify_label_conjuncts(
 def _apply_key_label_predicate(
     df: pl.DataFrame, reader, predicate: pl.Expr, key_names: list[str]
 ) -> pl.DataFrame:
-    """Evaluate a predicate that compares key columns against string labels
-    on a frame whose key columns are original UEL IDs (UInt32).
+    """Resolve only label literals, preserving all other expressions and ID types.
 
-    The predicate's label literals are resolved to their IDs through the
-    bounded lookup, and only those key columns are temporarily replaced by
-    sparse label strings: a row's cell holds the label string when the
-    row's ID is one of the resolved literal IDs, else null — exactly the
-    rows that could match the literal. No dictionary-scale resolution ever
-    happens, so a bounded reader budget survives residual conditions.
-    Other key columns keep their UInt32 IDs, so numeric ID predicates in
-    the same predicate keep working. The resulting boolean mask filters
-    the ID frame; the meaning is identical to the pushed-down path."""
+    JSON round-tripping uses the same local Polars expression representation as
+    predicate extraction. No file-provided serialized expression is loaded.
+    """
     labels, other = _classify_label_conjuncts(predicate, key_names)
     mixed = sorted(set(labels) & other)
     if mixed:
@@ -593,18 +590,21 @@ def _apply_key_label_predicate(
             f"same uel_id key column(s) {mixed}; compare integer IDs "
             "consistently (labels resolve to their original UEL IDs)"
         )
-    shadow = df
-    for name, literals in labels.items():
-        unique = sorted(set(literals))
-        ids = reader.label_ids(unique)
-        id_to_label = {
-            i: label for i, label in zip(ids, unique) if i is not None
-        }
-        cells = [id_to_label.get(i) for i in shadow[name].to_list()]
-        shadow = shadow.with_columns(pl.Series(name, cells, dtype=pl.String))
-    mask = shadow.select(predicate.alias("__polars_gdx_mask"))[
-        "__polars_gdx_mask"
-    ]
+    plan = json.loads(predicate.meta.serialize(format="json"))
+    expressions = []
+    for conjunct in _split_conjuncts(plan):
+        comparison = _label_comparison(conjunct, key_names)
+        if comparison:
+            name, literals = next(iter(comparison.items()))
+            resolved = reader.label_ids(sorted(set(literals)))
+            ids = sorted({value for value in resolved if value is not None})
+            expression = pl.col(name).is_in(ids) if ids else pl.lit(False)
+        else:
+            expression = pl.Expr.deserialize(io.StringIO(json.dumps(conjunct)), format="json")
+        expressions.append(expression)
+    mask = pl.lit(True)
+    for expression in expressions:
+        mask &= expression
     return df.filter(mask)
 
 
@@ -655,39 +655,14 @@ def _collect_eq_filters(
     Recognises `col == "label"` and `col.is_in([labels])` (plus conjunctions
     thereof). Returns True when the whole node is translatable, else False.
     """
-    if "BinaryExpr" in node:
-        b = node["BinaryExpr"]
-        if b["op"] == "And":
-            return _collect_eq_filters(b["left"], key_names, out) and (
-                _collect_eq_filters(b["right"], key_names, out)
-            )
-        if b["op"] != "Eq":
-            return False
-        for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
-            if "Column" in col_side and col_side["Column"] in key_names:
-                label = _string_literal(lit_side)
-                if label is not None:
-                    out.append((key_names.index(col_side["Column"]), [label]))
-                    return True
-                return False
-        return False
-    if "Function" in node:
-        f = node["Function"]
-        opts = f.get("function", {}).get("Boolean", {})
-        if "IsIn" not in opts:
-            return False
-        inputs = f.get("input", [])
-        if len(inputs) != 2 or "Column" not in inputs[0]:
-            return False
-        col = inputs[0]["Column"]
-        if col not in key_names:
-            return False
-        labels = _list_literal_strings(inputs[1])
-        if labels is None:
-            return False
-        out.append((key_names.index(col), labels))
-        return True
-    return False
+    if "BinaryExpr" in node and node["BinaryExpr"]["op"] == "And":
+        binary = node["BinaryExpr"]
+        return _collect_eq_filters(binary["left"], key_names, out) and _collect_eq_filters(
+            binary["right"], key_names, out
+        )
+    comparison = _label_comparison(node, key_names)
+    out.extend((key_names.index(name), labels) for name, labels in comparison.items())
+    return bool(comparison)
 
 
 def _list_literal_strings(node: dict) -> list[str] | None:
