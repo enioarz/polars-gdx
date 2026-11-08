@@ -34,7 +34,7 @@ tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
 
 ## Key design facts (do not rediscover these)
 
-- **Read path**: `scan_gdx()` → `pl.register_io_source` → Rust `read_arrow()` →
+- **Legacy read path**: `scan_gdx()` → `pl.register_io_source` → Rust `read_arrow()` →
   raw UEL indices via `gdxDataReadRawFastEx` (bulk C callback with user-data pointer and
   early-termination return, ONE FFI crossing per symbol — used for unfiltered, filtered
   AND limited reads alike)

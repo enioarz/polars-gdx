@@ -76,6 +76,12 @@ scan statistics). A gdxrs-only wheel builds with
 [docs/m7-adapter-contract.md](docs/m7-adapter-contract.md) and
 [docs/m7-development.md](docs/m7-development.md).
 
+The gdxrs backend streams through `scan_gdx` and admits up to four workers;
+`threads="auto"` stays within that cap. Parallel scans build a checkpoint index
+once per reader and symbol, so their first scan includes the index-build cost.
+`GdxrsReader.read_arrow()` remains serial; use `GdxrsReader.scan_batches()` for
+parallel batches.
+
 ## Free-threaded Python
 
 GIL-disabled Python is **not currently supported**. The PyO3 module requires

@@ -930,7 +930,10 @@ impl GdxrsReader {
             // get fewer rows per batch automatically.
             let batch_bytes = match batch_rows {
                 None => maximum_bytes,
-                Some(rows) => (rows.max(1) * payload.max(1)).clamp(payload.max(1), maximum_bytes),
+                Some(rows) => rows
+                    .max(1)
+                    .saturating_mul(payload.max(1))
+                    .clamp(payload.max(1), maximum_bytes),
             };
             let key_mask = emit_dims.iter().fold(0u32, |mask, &d| mask | 1u32 << d);
             let options = ScanOptions {
@@ -960,10 +963,9 @@ impl GdxrsReader {
             };
             cursor = Some(if let Some(workers) = workers {
                 // Parallel execution over the explicit checkpoint index.
-                // The adapter never nests worker pools: the core workers
-                // spawn inside this call and join before it returns, so
-                // a Polars engine thread driving the source never runs
-                // unbudgeted nested pools.
+                // Workers persist across batches and join on completion,
+                // close or cancellation. Their stacks and bounded batch
+                // slots are charged to the shared core budget.
                 let index = self.parallel_index(core, &handle, name)?;
                 let parallel_options = gdxrs::ParallelOptions {
                     workers,
@@ -1024,8 +1026,8 @@ impl GdxrsReader {
     /// documented in the adapter contract. `key_filter` labels match
     /// exactly (UTF-8 encoded, byte-for-byte) in either mode; an empty
     /// resolved ID set yields zero rows with the planned schema. `n_rows`
-    /// is a global accepted-row limit. Parallel reads are not implemented
-    /// for this backend yet (task 046); `threads` must be None/0/1.
+    /// is a global accepted-row limit. This materializing method is serial;
+    /// use `scan_batches` with `threads=2..=4` for parallel production.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None))]
     fn read_arrow(
@@ -1043,8 +1045,8 @@ impl GdxrsReader {
         if let Some(n) = threads {
             if n > 1 {
                 return Err(PyValueError::new_err(
-                    "gdxrs backend: parallel reads are not implemented yet (task 046); \
-                     use threads=None",
+                    "gdxrs backend: read_arrow is serial; use scan_batches \
+                     for parallel reads",
                 ));
             }
         }
@@ -1242,26 +1244,31 @@ impl GdxrsArrowStream {
     }
 }
 
-/// Cursor-backed streaming batch source (M7 task 044).
-///
-/// Wraps the core's lending `ScanCursor`: each `__next__` call advances
-/// the core cursor, copies the decoded rows into a fresh, self-owned
-/// Arrow RecordBatch and returns it — no full symbol is ever accumulated,
-/// and a previously yielded batch stays valid after the cursor advances
-/// or closes. Batches are bounded both by the requested `batch_rows`
-/// (the agreed maximum rows per emitted batch) and by the core's separate
-/// byte budget (`maximum_batch_bytes`), so wide rows yield fewer rows per
-/// batch automatically. The schema is fixed at creation and identical for
-/// every batch, including empty results.
-/// The core cursor driving a scan: the serial lending cursor, or the
-/// parallel cursor over an explicit checkpoint index (task 046). Both
-/// join all owned workers on close/cancel and yield batches in record
-/// order.
+/// Core scan variants. Parallel workers join on completion, close or cancellation.
 enum CursorKind {
     Serial(Box<gdxrs::ScanCursor>),
     Parallel(Box<gdxrs::ParallelScanCursor>),
 }
 
+impl CursorKind {
+    fn next_batch(&mut self) -> gdxrs::Result<Option<gdxrs::BatchView<'_>>> {
+        match self {
+            Self::Serial(cursor) => cursor.next_batch(),
+            Self::Parallel(cursor) => cursor.next_batch(),
+        }
+    }
+
+    fn decoded_rows(&self) -> u64 {
+        match self {
+            Self::Serial(cursor) => cursor.statistics().decoded_rows,
+            Self::Parallel(cursor) => cursor.statistics().decoded_rows,
+        }
+    }
+}
+
+/// Incremental batches with a fixed schema and row/byte caps. Every returned
+/// batch owns its converted buffers and survives cursor advancement or closure;
+/// enum batches share the admitted dictionary by reference.
 #[pyclass]
 pub struct GdxrsBatchCursor {
     /// Interior-mutable scan state behind a mutex: production runs with
@@ -1380,33 +1387,9 @@ impl GdxrsBatchCursor {
     /// release the core decoder and batch buffers and join all owned
     /// workers; later `__next__` calls end the stream. Idempotent.
     fn close(&self) -> PyResult<()> {
-        // Wake in-flight production first (lock-free), so the state lock
-        // below is released promptly and the join happens now.
-        if let Some(signal) = &self.cancel_signal {
-            signal.request_cancel();
-        }
-        let mut state = lock(&self.state)?;
-        if let Some(mut cursor) = state.cursor.take() {
-            match &mut cursor {
-                CursorKind::Serial(cursor) => {
-                    state.stats.decoded_rows = cursor.statistics().decoded_rows;
-                    cursor.close().map_err(to_py_err)?;
-                }
-                CursorKind::Parallel(cursor) => {
-                    let before = cursor.statistics();
-                    cursor.close().map_err(to_py_err)?;
-                    // close() joins all owned workers; snapshot the final
-                    // lifecycle counters afterwards.
-                    state.final_parallel = Some(cursor.statistics());
-                    state.stats.decoded_rows = state
-                        .final_parallel
-                        .map(|p| p.decoded_rows)
-                        .unwrap_or(before.decoded_rows);
-                }
-            }
-        }
-        state.finished = true;
-        Ok(())
+        // The core's parallel close delegates to cancel as well. Keep one
+        // adapter path for signalling, joining and retaining final statistics.
+        self.cancel()
     }
 
     /// Request cancellation and join all owned workers: in-flight
@@ -1456,25 +1439,19 @@ fn produce_batch(state: &mut CursorState) -> PyResult<Option<RecordBatch>> {
     if state.finished {
         return Ok(None);
     }
-    let batch = match cursor {
-        CursorKind::Serial(cursor) => match cursor.next_batch().map_err(to_py_err)? {
-            Some(batch) => batch,
-            None => {
-                state.finished = true;
-                return Ok(None);
-            }
-        },
-        CursorKind::Parallel(cursor) => match cursor.next_batch().map_err(to_py_err)? {
-            Some(batch) => batch,
-            None => {
-                state.finished = true;
-                return Ok(None);
-            }
-        },
+    let Some(batch) = cursor.next_batch().map_err(to_py_err)? else {
+        state.finished = true;
+        return Ok(None);
     };
     let rows = batch.len();
-    let mut keys: Vec<Vec<i32>> = vec![Vec::with_capacity(rows); state.dim];
-    let mut values: Vec<Option<f64>> = Vec::with_capacity(rows);
+    let mut keys: Vec<Vec<i32>> = (0..state.dim)
+        .map(|_| reserved_vec(rows))
+        .collect::<PyResult<_>>()?;
+    let mut values: Vec<Option<f64>> = if state.emit_value {
+        reserved_vec(rows)?
+    } else {
+        Vec::new()
+    };
     for (slot, &d) in state.emit_dims.iter().enumerate() {
         let column = batch
             .key_column(d as u8)
@@ -1495,10 +1472,7 @@ fn produce_batch(state: &mut CursorState) -> PyResult<Option<RecordBatch>> {
             ));
         }
     }
-    state.stats.decoded_rows = match cursor {
-        CursorKind::Serial(cursor) => cursor.statistics().decoded_rows,
-        CursorKind::Parallel(cursor) => cursor.statistics().decoded_rows,
-    };
+    state.stats.decoded_rows = cursor.decoded_rows();
     let record = to_record_batch(
         state.dictionary.clone(),
         state.dim,

@@ -17,10 +17,10 @@ specifications, not evidence that the later tasks are implemented. Core revision
 | --- | --- | --- |
 | 041 | Contract, resource envelope and independent expectations | Documentation complete; [evidence](evidence/041.md), PR #39 |
 | 042 | Explicit gdxrs backend and legacy differential path | Merged in PR #41 at `b008b57`; [evidence](evidence/042.md) |
-| 043 | Stable schemas, admitted enums and bounded ID mode | Implementation complete; [evidence](evidence/043.md), [quality follow-up](evidence/043-quality.md); PR #42 pending review/merge |
-| 044 | Cursor-backed owned batch source with backpressure | Implementation complete; [evidence](evidence/044.md); task PR pending review/merge |
-| 045 | Exact predicate/projection/global-limit behavior | Implementation complete; [evidence](evidence/045.md); task PR pending review/merge |
-| 046 | Scan ownership, repeated scans, threads and cancellation | Implementation complete; [evidence](evidence/046.md); task PR pending review/merge |
+| 043 | Stable schemas, admitted enums and bounded ID mode | Merged in PR #42 at `57a105e`; [evidence](evidence/043.md), [quality follow-up](evidence/043-quality.md) |
+| 044 | Cursor-backed owned batch source with backpressure | Merged in PR #43 at `3248dc8`; [evidence](evidence/044.md) |
+| 045 | Exact predicate/projection/global-limit behavior | Merged in PR #44 at `ccdf7ff`; [evidence](evidence/045.md) |
+| 046 | Scan ownership, repeated scans, threads and cancellation | Implementation complete; [evidence](evidence/046.md), [quality follow-up](evidence/046-quality.md); task PR pending review/merge |
 | 047 | Four-platform functionality, capped streaming and migration review | Pending |
 
 For every implementation PR, state its task(s), base `develop/m7`, checks actually

@@ -1,22 +1,20 @@
 """Lazy GDX scanning via Polars' IO source interface.
 
-The Rust extension returns an Arrow RecordBatch per symbol; Polars drives reading
-through `pl.register_io_source`, so column projection is pushed down and only
-the columns actually selected are materialised by Polars. Key prefiltering is
-additionally applied inside the native GDX read loop, before any record is
-materialised.
+Polars drives reading through `register_io_source`. The gdxrs backend streams
+owned Arrow batches with projection and key-filter pushdown; the legacy backend
+returns one batch per symbol. Residual predicates run before the final projection
+and global accepted-row limit.
 """
 
 from __future__ import annotations
 
-import io
 import atexit
+import io
 import json
 import os
 import sys
 import threading
 import time
-import weakref
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import polars as pl
@@ -96,9 +94,8 @@ DEFAULT_BACKEND = _default_backend()
 #: drop a suspended source without closing it, and Polars may finalize the
 #: suspended generator on an engine thread during interpreter shutdown,
 #: where destroying extension objects can abort the process. The registry
-#: keeps a reference so final destruction happens on the main thread, and
-#: the atexit hook stops and joins all remaining production explicitly
-#: before interpreter shutdown. Completed scans remove their entry.
+#: retains cursors until their workers have joined. The atexit hook closes
+#: remaining cursors and drains registered callbacks before teardown.
 _OPEN_CURSORS: set = set()
 
 
@@ -108,11 +105,9 @@ _OPEN_CURSORS: set = set()
 #: Python and never touches the finalizing interpreter through PyO3.
 _SHUTTING_DOWN = threading.Event()
 
-#: Number of source callbacks currently inside ``cursor.next_stream()``
-#: (the GIL is released there, so the callback can be in flight while the
-#: main thread shuts down). The atexit hook drains this to zero so no
-#: callback is suspended between the GIL release and its reacquisition
-#: when interpreter teardown starts.
+#: Registered setup and production steps, including predicate planning,
+#: Arrow conversion and residual evaluation. Yielded batches hold no registration;
+#: their cursor stays in the registry until close completes.
 _IN_FLIGHT_LOCK = threading.Lock()
 _IN_FLIGHT = 0
 
@@ -194,8 +189,6 @@ def _resolve_threads(threads: int | str | None, n_records: int) -> int | None:
     if threads == "auto":
         if n_records < _AUTO_THREADS_MIN_RECORDS:
             return None
-        import os
-
         try:
             return len(os.sched_getaffinity(0))
         except AttributeError:  # pragma: no cover - non-Linux
@@ -510,12 +503,9 @@ def scan_gdx(
                             # string labels but also contains conditions the
                             # adapter cannot translate (residuals). Polars
                             # cannot compare String literals against UInt32
-                            # columns, so evaluate the whole predicate against
-                            # a shadow frame whose key columns hold the exact
-                            # label strings (resolved through the bounded
-                            # resolver); the resulting mask filters the ID
-                            # frame. This keeps the predicate's meaning
-                            # identical to the pushed-down path.
+                            # columns. Translate label comparisons to exact
+                            # original IDs and evaluate the residual on the ID
+                            # frame, preserving other expressions and types.
                             pred_expr = None
                             shadow_mask = (predicate, key_names)
                         else:

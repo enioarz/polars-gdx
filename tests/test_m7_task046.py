@@ -8,10 +8,12 @@ pressure, error propagation without replaying acknowledged rows,
 concurrent and repeated scans, and file/scratch release.
 """
 
-import glob
+import os
 import subprocess
 import sys
+import tempfile
 import threading
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -20,15 +22,21 @@ from polars_gdx import GdxrsReader, read_gdx, scan_gdx
 
 GDX = "tests/data/trnsport.gdx"
 DICT = "tests/data/m7/m7-dictionary.gdx"
-SEM = "tests/data/m7/m7-semantics.gdx"
 GROW = "tests/data/m7/m7-labels20k.gdx"
 
 pytestmark = pytest.mark.skipif(
-    not __import__("pathlib").Path(DICT).exists(), reason="m7 fixtures not present"
+    not Path(DICT).exists(), reason="m7 fixtures not present"
 )
 
 if GdxrsReader is None:
     pytest.skip("gdxrs backend not compiled", allow_module_level=True)
+
+
+def _index_directories():
+    """Only this process's scratch; other scans may run beside pytest."""
+    return set(
+        Path(tempfile.gettempdir()).glob(f"polars-gdx-gdxrs-index-{os.getpid()}-*")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +172,7 @@ def test_sink_exception_propagates_and_joins():
 def test_error_propagation_from_parallel_scan(tmp_path):
     """Source/decode errors propagate as clear errors — never a silent
     retry through the legacy backend and never a wrong result."""
-    data = open(GROW, "rb").read()
+    data = Path(GROW).read_bytes()
     truncated = tmp_path / "truncated.gdx"
     truncated.write_bytes(data[: len(data) // 2])
     with pytest.raises(RuntimeError):
@@ -231,6 +239,7 @@ def test_parallel_early_exit_terminates_cleanly(script):
             capture_output=True,
             text=True,
             cwd=".",
+            timeout=60,
         )
         assert result.returncode == 0, (result.returncode, result.stderr)
         assert "(1000, 2)" in result.stdout
@@ -292,22 +301,38 @@ def test_repeated_parallel_execution_is_deterministic():
 
 
 def test_gil_released_during_parallel_production():
-    """The GIL is released during core production, so a background
-    Python thread makes progress while a parallel scan runs on the main
-    thread."""
-    counter = []
+    """Observe progress during production, before join can release the GIL."""
+    ready = threading.Event()
+    start = threading.Event()
+    progressed = threading.Event()
 
     def spin():
-        for _ in range(200):
-            counter.append(1)
+        ready.set()
+        start.wait()
+        progressed.set()
 
-    thread = threading.Thread(target=spin)
-    thread.start()
-    df = read_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4)
-    thread.join(timeout=30)
-    assert df.height == 20_000
-    assert not thread.is_alive()
-    assert len(counter) == 200
+    with GdxrsReader(GROW) as reader:
+        cursor = reader.scan_batches("BIG", threads=4, batch_rows=100)
+        thread = threading.Thread(target=spin)
+        thread.start()
+        previous_interval = sys.getswitchinterval()
+        try:
+            assert ready.wait(timeout=10)
+            # Prevent ordinary Python bytecode switching from satisfying
+            # the assertion. No Arrow/Polars conversion or thread join
+            # runs until after progress has been checked.
+            sys.setswitchinterval(10)
+            start.set()
+            while cursor.next_stream() is not None:
+                pass
+            assert progressed.is_set()
+            assert cursor.scan_statistics()["decoded_rows"] == 20_000
+        finally:
+            sys.setswitchinterval(previous_interval)
+            start.set()
+            cursor.close()
+            thread.join(timeout=10)
+        assert not thread.is_alive()
 
 
 # ---------------------------------------------------------------------------
@@ -318,21 +343,17 @@ def test_gil_released_during_parallel_production():
 def test_index_sidecars_released_on_reader_close():
     """The checkpoint-index sidecars are removed when the reader closes:
     no scratch files remain under the adapter's index directory."""
-    import glob as _glob
-    import os
-    import tempfile
-
-    before = set(_glob.glob(os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")))
+    before = _index_directories()
     reader = GdxrsReader(GROW)
     cursor = reader.scan_batches("BIG", threads=2, batch_rows=100)
     next(iter(cursor))
     cursor.close()
-    after = set(_glob.glob(os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")))
+    after = _index_directories()
     # A new directory exists while the reader is open...
     assert len(after - before) == 1
     reader.close()
     # ...and is removed (with its sidecar) once the reader closes.
-    final = set(_glob.glob(os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")))
+    final = _index_directories()
     assert final == before
 
 
@@ -344,8 +365,6 @@ def test_cancel_from_another_thread_during_production():
     may complete before the cancel lands — either terminal state is
     accepted; the regression is the borrow failure, captured and
     re-raised from the producer thread."""
-    import time
-
     errors = []
 
     with GdxrsReader(GROW) as reader:
@@ -386,29 +405,20 @@ def test_reader_drop_releases_index_sidecars():
     must release the index sidecars and directory (owned cleanup in
     Drop), including when a cursor outlives the reader."""
     import gc
-    import glob as _glob
-    import os
-    import tempfile
-
-    pattern = os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")
-
-    def current():
-        return set(_glob.glob(pattern))
-
-    before = current()
+    before = _index_directories()
     reader = GdxrsReader(GROW)
     cursor = reader.scan_batches("BIG", threads=2, batch_rows=100)
     next(iter(cursor))
     del reader
     gc.collect()
-    assert current() == before
+    assert _index_directories() == before
     # A cursor that outlives its reader still completes its scan and
     # releases its own handle on close/drop.
     remaining = sum(b.num_rows for b in iter(cursor))
     assert remaining >= 0
     del cursor
     gc.collect()
-    assert current() == before
+    assert _index_directories() == before
 
 
 def test_shutdown_gate_refuses_new_callbacks():
@@ -523,14 +533,9 @@ def test_shutdown_gate_covers_source_setup():
     extension after shutdown. The gate now covers setup: with shutdown
     begun, a parallel scan yields nothing and no index sidecar is ever
     built."""
-    import glob as _glob
-    import os
-    import tempfile
-
     import polars_gdx.lazy as lazy
 
-    pattern = os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")
-    before = set(_glob.glob(pattern))
+    before = _index_directories()
 
     lazy._SHUTTING_DOWN.set()
     try:
@@ -538,7 +543,7 @@ def test_shutdown_gate_covers_source_setup():
         assert df.height == 0
         # The setup extension call never ran: no NEW index directory was
         # created (the parallel path builds one inside scan_batches).
-        assert set(_glob.glob(pattern)) == before
+        assert _index_directories() == before
     finally:
         lazy._SHUTTING_DOWN.clear()
 
