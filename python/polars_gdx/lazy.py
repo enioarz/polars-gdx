@@ -115,6 +115,10 @@ atexit.register(_close_open_cursors)
 #: the raw read. Below this, open/coordination overhead outweighs the gain.
 _AUTO_THREADS_MIN_RECORDS = 5_000_000
 
+#: Admitted core-worker concurrency for the gdxrs backend (adapter
+#: contract §6: at most four core workers).
+_GDXRS_MAX_WORKERS = 4
+
 
 def _resolve_threads(threads: int | str | None, n_records: int) -> int | None:
     """``"auto"`` -> CPU count for large symbols, else the given value."""
@@ -267,8 +271,14 @@ def scan_gdx(
         parallelises reads of symbols with at least
         ``_AUTO_THREADS_MIN_RECORDS`` records using all available cores;
         smaller symbols stay serial. ``None``/0/1 means serial.
-        The ``gdxrs`` backend is serial only in 0.6.x; an explicit parallel
-        request raises (parallel admission arrives with M7 task 046).
+        The ``gdxrs`` backend admits 2..=4 workers (M7 task 046): the read
+        runs on the core's parallel scan over an explicit checkpoint
+        index, built once per reader and symbol at a one-pass build cost
+        and reused for repeated scans; results are byte-identical to the
+        serial read. Requests above the admission raise ``ValueError``,
+        and ``"auto"`` never exceeds it. Blocked synchronous OS reads
+        inside an in-flight worker step cannot be forcibly interrupted;
+        cancellation joins the current step.
     backend
         ``"legacy"`` (vendored native GDX C library; default in 0.6.x) or
         ``"gdxrs"`` (pinned pure-Rust core; M7 task 042). The default is
@@ -335,12 +345,23 @@ def scan_gdx(
     _, type_str, dim, _n, domains, _text = info[symbol]
     if value_field is not None and value_field not in _VALUE_FIELDS:
         raise ValueError(f"value_field must be one of {_VALUE_FIELDS}, got {value_field!r}")
-    threads = _resolve_threads(threads, _n)
-    if backend_is_gdxrs and threads is not None:
-        raise ValueError(
-            "gdxrs backend: parallel reads are not implemented yet "
-            "(task 046); use threads=None"
-        )
+    if backend_is_gdxrs:
+        if threads == "auto":
+            # ``"auto"`` never exceeds the worker admission (contract §6);
+            # small symbols stay serial.
+            auto = _resolve_threads("auto", _n)
+            threads = auto if auto is None else min(auto, _GDXRS_MAX_WORKERS)
+        else:
+            threads = _resolve_threads(threads, _n)
+        if threads is not None and threads > _GDXRS_MAX_WORKERS:
+            # Explicit requests above the configured worker admission are
+            # rejected, never silently clamped (contract §6).
+            raise ValueError(
+                f"gdxrs backend: threads={threads} exceeds the configured "
+                f"worker admission of {_GDXRS_MAX_WORKERS}"
+            )
+    else:
+        threads = _resolve_threads(threads, _n)
     value_name = "value" if type_str in ("Set", "Parameter", "Alias") else (value_field or "level")
     # Key column names must never collide with the value column (a domain
     # set literally named ``value`` would otherwise overwrite it in the

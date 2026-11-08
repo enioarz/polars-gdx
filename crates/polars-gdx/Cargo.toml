@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 gdx = { path = "../gdx", optional = true }
 # M7 task 042: pinned core revision from docs/m7-adapter-contract.md §1;
 # bump only via a reviewed change that reruns the affected gates.
-gdxrs = { git = "https://github.com/enioarz/gdxrs", rev = "9a7411764f176adb613185fa1e45d64b06123683", optional = true }
+gdxrs = { git = "https://github.com/enioarz/gdxrs", rev = "9a7411764f176adb613185fa1e45d64b06123683", optional = true, features = ["index"] }
 arrow = { version = "56", default-features = false, features = ["pyarrow", "ipc"] }
 arrow-pyarrow = "56"
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }

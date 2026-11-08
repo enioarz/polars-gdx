@@ -20,7 +20,7 @@ specifications, not evidence that the later tasks are implemented. Core revision
 | 043 | Stable schemas, admitted enums and bounded ID mode | Implementation complete; [evidence](evidence/043.md), [quality follow-up](evidence/043-quality.md); PR #42 pending review/merge |
 | 044 | Cursor-backed owned batch source with backpressure | Implementation complete; [evidence](evidence/044.md); task PR pending review/merge |
 | 045 | Exact predicate/projection/global-limit behavior | Implementation complete; [evidence](evidence/045.md); task PR pending review/merge |
-| 046 | Scan ownership, repeated scans, threads and cancellation | Pending |
+| 046 | Scan ownership, repeated scans, threads and cancellation | Implementation complete; [evidence](evidence/046.md); task PR pending review/merge |
 | 047 | Four-platform functionality, capped streaming and migration review | Pending |
 
 For every implementation PR, state its task(s), base `develop/m7`, checks actually
