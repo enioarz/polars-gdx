@@ -164,11 +164,23 @@ def _close_open_cursors() -> None:
     #    abort the process. The wait has no deadline — blocked
     #    synchronous OS reads cannot be forcibly interrupted (documented),
     #    so shutdown waits for them by design. Sleeping releases the GIL
-    #    so the callbacks can finish.
+    #    so the callbacks can finish. Cursors published while a
+    #    registered callback was draining (setup stays registered
+    #    through publication) are closed here too: shutdown can never
+    #    miss a published cursor with unjoined workers.
     while True:
         with _IN_FLIGHT_LOCK:
-            if _IN_FLIGHT == 0:
+            pending = list(_OPEN_CURSORS)
+            if _IN_FLIGHT == 0 and not pending:
                 break
+        for cursor in pending:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if pending:
+            with _IN_FLIGHT_LOCK:
+                _OPEN_CURSORS.difference_update(pending)
         time.sleep(0.001)
 
 
@@ -465,205 +477,216 @@ def scan_gdx(
             # Only the gdxrs backend streams batches (task 044); the legacy
             # backend still ignores batch_size and emits one batch.
             del batch_size
-        filters = explicit_filters
-        pred_expr = None
-        shadow_mask = None
-        native_limit_safe = True
-        if predicate is not None:
-            pred_expr = predicate
-            native = _predicate_key_filter(
-                pred_expr, key_names, reader, id_mode=(key_mode == "uel_id")
-            )
-            if native is None:
-                # Predicate not fully translatable: a native row limit could
-                # under-fill head(n), so read unlimited and let Polars-side
-                # filter().head(n) apply.
-                native_limit_safe = False
-                if key_mode == "uel_id" and _references_key_labels(
-                    pred_expr, key_names
-                ):
-                    # The predicate compares key columns against string
-                    # labels but also contains conditions the adapter
-                    # cannot translate (residuals). Polars cannot compare
-                    # String literals against UInt32 columns, so evaluate
-                    # the whole predicate against a shadow frame whose
-                    # key columns hold the exact label strings (resolved
-                    # through the bounded resolver); the resulting mask
-                    # filters the ID frame. This keeps the predicate's
-                    # meaning identical to the pushed-down path.
-                    pred_expr = None
-                    shadow_mask = (predicate, key_names)
+        # The gdxrs callback is gated and registered BEFORE its first
+        # extension call: predicate planning itself calls the extension
+        # (reader.label_ids() for ID-mode label predicates), so shutdown
+        # must not be able to complete while a paused preamble resumes
+        # into it. The registration is held through predicate planning,
+        # source setup and cursor publication, then released before the
+        # streaming loop (suspension points must carry zero
+        # registrations). A shutdown that has already begun ends the
+        # source before any extension call.
+        setup_registered = False
+        if backend_is_gdxrs and not _enter_callback():
+            return
+        if backend_is_gdxrs:
+            setup_registered = True
+        try:
+            filters = explicit_filters
+            pred_expr = None
+            shadow_mask = None
+            native_limit_safe = True
+            if predicate is not None:
+                pred_expr = predicate
+                native = _predicate_key_filter(
+                    pred_expr, key_names, reader, id_mode=(key_mode == "uel_id")
+                )
+                if native is None:
+                    # Predicate not fully translatable: a native row limit could
+                    # under-fill head(n), so read unlimited and let Polars-side
+                    # filter().head(n) apply.
+                    native_limit_safe = False
+                    if key_mode == "uel_id" and _references_key_labels(
+                        pred_expr, key_names
+                    ):
+                        # The predicate compares key columns against string
+                        # labels but also contains conditions the adapter
+                        # cannot translate (residuals). Polars cannot compare
+                        # String literals against UInt32 columns, so evaluate
+                        # the whole predicate against a shadow frame whose
+                        # key columns hold the exact label strings (resolved
+                        # through the bounded resolver); the resulting mask
+                        # filters the ID frame. This keeps the predicate's
+                        # meaning identical to the pushed-down path.
+                        pred_expr = None
+                        shadow_mask = (predicate, key_names)
+                    else:
+                        shadow_mask = None
                 else:
                     shadow_mask = None
-            else:
-                shadow_mask = None
-                # The predicate depends only on key columns: fold it into the
-                # native prefilter so non-matching records are skipped during
-                # the raw read, and re-apply it exactly on the produced frame.
-                pred_expr = _exact_expr(
-                    native,
-                    key_names,
-                    reader=reader,
-                    id_mode=(key_mode == "uel_id"),
-                )
-                merged = {d: list(labels) for d, labels in explicit_filters or []}
-                for d, labels in native:
-                    if d in merged:
-                        allowed = set(labels)
-                        merged[d] = [l for l in merged[d] if l in allowed]
-                    else:
-                        merged[d] = list(labels)
-                filters = list(merged.items())
+                    # The predicate depends only on key columns: fold it into the
+                    # native prefilter so non-matching records are skipped during
+                    # the raw read, and re-apply it exactly on the produced frame.
+                    pred_expr = _exact_expr(
+                        native,
+                        key_names,
+                        reader=reader,
+                        id_mode=(key_mode == "uel_id"),
+                    )
+                    merged = {d: list(labels) for d, labels in explicit_filters or []}
+                    for d, labels in native:
+                        if d in merged:
+                            allowed = set(labels)
+                            merged[d] = [l for l in merged[d] if l in allowed]
+                        else:
+                            merged[d] = list(labels)
+                    filters = list(merged.items())
 
-        read_kwargs = {
-            "key_names": list(key_names),
-            "value_field": (None if value_name == "value" else value_name),
-            "key_filter": filters,
-            "n_rows": (n_rows if native_limit_safe else None),
-            "threads": threads,
-        }
-        # Projection pushdown (task 045): the columns the plan needs. A
-        # residual predicate must find its required columns in the frame
-        # until it has been evaluated, so every predicate-referenced
-        # column is retained defensively (Polars already includes them in
-        # with_columns, but the source does not rely on that).
-        needed_columns = None
-        if backend_is_gdxrs and with_columns is not None:
-            needed = list(dict.fromkeys(with_columns))
-            if predicate is not None:
-                try:
-                    plan = json.loads(predicate.meta.serialize(format="json"))
-                    referenced = [
-                        name
-                        for name in _referenced_columns(plan)
-                        if name in schema
-                    ]
-                    needed = list(dict.fromkeys([*needed, *referenced]))
-                except Exception:
-                    needed = None
-            needed_columns = needed
-        if backend_is_gdxrs:
-            # M7 task 044: cursor-backed streaming batches. The source
-            # emits incrementally without accumulating the whole symbol;
-            # `batch_size` is honored as the maximum rows per emitted
-            # batch (subject to the core's separate byte budget for wide
-            # rows). Each yielded batch owns valid data after the lending
-            # core cursor advances or closes.
-            read_kwargs["key_mode"] = key_mode
-            read_kwargs["columns"] = needed_columns
-            # Source setup is itself an extension call (index build,
-            # worker spawn, admission): gate and register it exactly
-            # like a production step, so shutdown cannot drain to zero
-            # while a paused setup resumes into the extension after
-            # shutdown. A shutdown that has already begun ends the
-            # source before any extension call.
-            if not _enter_callback():
-                return
-            try:
+            read_kwargs = {
+                "key_names": list(key_names),
+                "value_field": (None if value_name == "value" else value_name),
+                "key_filter": filters,
+                "n_rows": (n_rows if native_limit_safe else None),
+                "threads": threads,
+            }
+            # Projection pushdown (task 045): the columns the plan needs. A
+            # residual predicate must find its required columns in the frame
+            # until it has been evaluated, so every predicate-referenced
+            # column is retained defensively (Polars already includes them in
+            # with_columns, but the source does not rely on that).
+            needed_columns = None
+            if backend_is_gdxrs and with_columns is not None:
+                needed = list(dict.fromkeys(with_columns))
+                if predicate is not None:
+                    try:
+                        plan = json.loads(predicate.meta.serialize(format="json"))
+                        referenced = [
+                            name
+                            for name in _referenced_columns(plan)
+                            if name in schema
+                        ]
+                        needed = list(dict.fromkeys([*needed, *referenced]))
+                    except Exception:
+                        needed = None
+                needed_columns = needed
+            if backend_is_gdxrs:
+                # M7 task 044: cursor-backed streaming batches. The source
+                # emits incrementally without accumulating the whole symbol;
+                # `batch_size` is honored as the maximum rows per emitted
+                # batch (subject to the core's separate byte budget for wide
+                # rows). Each yielded batch owns valid data after the lending
+                # core cursor advances or closes.
+                read_kwargs["key_mode"] = key_mode
+                read_kwargs["columns"] = needed_columns
+                # Source setup is itself an extension call (index build,
+                # worker spawn, admission) and stays REGISTERED through
+                # cursor publication: the cursor joins the registry
+                # before the registration is released, so shutdown either
+                # closes it in its sweep or picks it up during the drain
+                # — it can never miss a published cursor with unjoined
+                # workers.
                 cursor = reader.scan_batches(
                     symbol, batch_rows=batch_size, **read_kwargs
                 )
-            finally:
+                # Keep a registry reference so a disposed-but-unclosed
+                # source is finalized on the main thread, not on a Polars
+                # engine thread during interpreter shutdown.
+                _OPEN_CURSORS.add(cursor)
+                # Publication complete: release the setup registration.
+                # The loop below re-registers per step, and suspension
+                # points (yields) carry zero registrations.
                 _exit_callback()
-            # Keep a registry reference so a disposed-but-unclosed source
-            # is finalized on the main thread, not on a Polars engine
-            # thread during interpreter shutdown.
-            _OPEN_CURSORS.add(cursor)
-            # Global accepted-row limit for residual predicates that the
-            # core could not apply: track the remainder across batches.
-            remaining = n_rows if not native_limit_safe else None
-            try:
-                while True:
-                    if not _enter_callback():
-                        # Shutdown has begun: no extension call may
-                        # happen; end the source immediately.
-                        break
-                    # Consume the Arrow C Data Interface stream capsule:
-                    # no pyarrow object is created on this (possibly
-                    # Polars engine) thread — pyarrow objects created
-                    # there can abort the interpreter at shutdown.
-                    # Polars maps the dictionary keys to Categorical, so
-                    # the declared schema (Enum keys) is re-applied by an
-                    # exact cast; the dictionary is the full UEL table in
-                    # file order, so the cast preserves the values.
-                    try:
-                        # The in-flight count covers the WHOLE callback
-                        # body — next_stream plus the Arrow/Polars
-                        # conversion, residual predicates and projection
-                        # — so the atexit drain waits until the callback
-                        # is fully back at its suspension point before
-                        # interpreter teardown begins. The decrement runs
-                        # before the yield, so a generator suspended at
-                        # the yield is never counted and its teardown-time
-                        # resumption executes only the pure-Python flag
-                        # check.
-                        holder = cursor.next_stream()
-                        if holder is None:
+                setup_registered = False
+                # Global accepted-row limit for residual predicates that
+                # the core could not apply: track the remainder across
+                # batches.
+                remaining = n_rows if not native_limit_safe else None
+                try:
+                    while True:
+                        if not _enter_callback():
+                            # Shutdown has begun: no extension call may
+                            # happen; end the source immediately.
                             break
-                        # Polars imports a C stream as a struct series;
-                        # unnest it back into the record-batch columns
-                        # (only the needed ones when projection pushdown
-                        # applied).
-                        df = pl.from_arrow(holder).struct.unnest()
-                        # Re-apply the declared schema: dictionary keys
-                        # arrive as Categorical and are cast to the
-                        # declared Enum (the dictionary is the full UEL
-                        # table in file order, so the cast preserves
-                        # values and physicals); other columns cast to
-                        # their declared (identical) dtypes.
-                        df = df.select(
-                            [
-                                pl.col(name).cast(schema[name])
-                                for name in df.columns
-                            ]
-                        )
-                        if shadow_mask is not None:
-                            df = _apply_key_label_predicate(df, reader, *shadow_mask)
-                        elif pred_expr is not None:
-                            df = df.filter(pred_expr)
-                        if remaining is not None:
-                            df = df.head(remaining)
-                            remaining -= df.height
-                        elif n_rows is not None:
-                            # The core already enforced the global limit;
-                            # per-batch head is a no-op except on the
-                            # final batch.
-                            df = df.head(n_rows)
-                        if with_columns is not None:
-                            df = df.select(with_columns)
-                    finally:
-                        _exit_callback()
-                    yield df
-                    if remaining is not None and remaining <= 0:
-                        break
-            finally:
-                # Explicit cursor cleanup on every exit path — normal end
-                # of stream, early break, exception, or consumer disposal
-                # (GeneratorExit when the sink drops a suspended source).
-                # Closing the cursor stops and joins core production
-                # while the interpreter is still alive. If the generator
-                # is only finalized during interpreter shutdown (a sink
-                # that dropped it without closing), skip the extension
-                # call: the atexit hook already stopped production, and
-                # extension calls during finalization can abort.
-                _OPEN_CURSORS.discard(cursor)
-                if not sys.is_finalizing():
-                    cursor.close()
-            return
-        batch = reader.read_arrow(symbol, **read_kwargs)
-        # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
-        # Passing the Enum schema makes Polars reinterpret the dictionary
-        # indices as enum physicals instead of decoding to strings.
-        df = pl.from_arrow(batch, schema=schema)
-        if shadow_mask is not None:
-            df = _apply_key_label_predicate(df, reader, *shadow_mask)
-        elif pred_expr is not None:
-            df = df.filter(pred_expr)
-        if n_rows is not None:
-            df = df.head(n_rows)
-        if with_columns is not None:
-            df = df.select(with_columns)
-        yield df
+                        try:
+                            # Consume the Arrow C Data Interface stream
+                            # capsule: no pyarrow object is created on
+                            # this (possibly Polars engine) thread —
+                            # pyarrow objects created there can abort the
+                            # interpreter at shutdown. Polars maps the
+                            # dictionary keys to Categorical, so the
+                            # declared schema (Enum keys) is re-applied
+                            # by an exact cast; the dictionary is the full
+                            # UEL table in file order, so the cast
+                            # preserves the values. The in-flight count
+                            # covers the WHOLE callback body so the
+                            # shutdown drain waits until the callback is
+                            # fully back at its suspension point.
+                            holder = cursor.next_stream()
+                            if holder is None:
+                                break
+                            df = pl.from_arrow(holder).struct.unnest()
+                            df = df.select(
+                                [
+                                    pl.col(name).cast(schema[name])
+                                    for name in df.columns
+                                ]
+                            )
+                            if shadow_mask is not None:
+                                df = _apply_key_label_predicate(
+                                    df, reader, *shadow_mask
+                                )
+                            elif pred_expr is not None:
+                                df = df.filter(pred_expr)
+                            if remaining is not None:
+                                df = df.head(remaining)
+                                remaining -= df.height
+                            elif n_rows is not None:
+                                # The core already enforced the global
+                                # limit; per-batch head is a no-op except
+                                # on the final batch.
+                                df = df.head(n_rows)
+                            if with_columns is not None:
+                                df = df.select(with_columns)
+                        finally:
+                            _exit_callback()
+                        yield df
+                        if remaining is not None and remaining <= 0:
+                            break
+                finally:
+                    # Explicit cursor cleanup on every exit path — normal
+                    # end of stream, early break, exception, or consumer
+                    # disposal (GeneratorExit when the sink drops a
+                    # suspended source). Closing the cursor stops and
+                    # joins core production while the interpreter is still
+                    # alive. If the generator is only finalized during
+                    # interpreter shutdown (a sink that dropped it without
+                    # closing), skip the extension call: the atexit hook
+                    # already stopped production, and extension calls
+                    # during finalization can abort.
+                    _OPEN_CURSORS.discard(cursor)
+                    if not sys.is_finalizing():
+                        cursor.close()
+                return
+            batch = reader.read_arrow(symbol, **read_kwargs)
+            # pyarrow RecordBatch -> polars: zero-copy over the Arrow
+            # buffers. Passing the Enum schema makes Polars reinterpret
+            # the dictionary indices as enum physicals instead of decoding
+            # to strings.
+            df = pl.from_arrow(batch, schema=schema)
+            if shadow_mask is not None:
+                df = _apply_key_label_predicate(df, reader, *shadow_mask)
+            elif pred_expr is not None:
+                df = df.filter(pred_expr)
+            if n_rows is not None:
+                df = df.head(n_rows)
+            if with_columns is not None:
+                df = df.select(with_columns)
+            yield df
+        finally:
+            if setup_registered:
+                # Predicate planning or setup failed before publication:
+                # release the setup registration on every exit path.
+                _exit_callback()
 
     # `is_pure` lets the optimizer de-duplicate repeated occurrences of the
     # same scan within one plan (the source is a deterministic file read).

@@ -541,3 +541,88 @@ def test_shutdown_gate_covers_source_setup():
         assert set(_glob.glob(pattern)) == before
     finally:
         lazy._SHUTTING_DOWN.clear()
+
+
+def test_shutdown_gate_precedes_predicate_planning(monkeypatch):
+    """Review finding: ID-mode label predicates called
+    reader.label_ids() during predicate planning BEFORE the shutdown
+    gate. The gate now precedes the whole preamble: with shutdown
+    begun, an ID-mode label-predicate scan yields nothing and predicate
+    planning never runs."""
+    import polars_gdx.lazy as lazy
+
+    calls = []
+    orig = lazy._predicate_key_filter
+
+    def spy(pred, key_names, reader, id_mode=False):
+        calls.append(1)
+        return orig(pred, key_names, reader, id_mode=id_mode)
+
+    monkeypatch.setattr(lazy, "_predicate_key_filter", spy)
+    lazy._SHUTTING_DOWN.set()
+    try:
+        df = (
+            scan_gdx(GROW, symbol="BIG", backend="gdxrs", key_mode="uel_id")
+            .filter(pl.col("dim_0") == "u00000")
+            .collect()
+        )
+        assert df.height == 0
+        # The gate refused entry before predicate planning's first
+        # extension call.
+        assert calls == []
+    finally:
+        lazy._SHUTTING_DOWN.clear()
+    # Normal operation: planning runs and the predicate matches.
+    df = (
+        scan_gdx(GROW, symbol="BIG", backend="gdxrs", key_mode="uel_id")
+        .filter(pl.col("dim_0") == "u00000")
+        .collect()
+    )
+    assert df.height == 1
+    assert calls == [1]
+
+
+def test_shutdown_closes_cursors_published_during_drain():
+    """Review finding: setup unregistered before publishing the cursor,
+    so a paused interleaving let shutdown miss a newly created parallel
+    cursor (four admitted workers, zero joined). Setup now stays
+    registered through publication, and the drain closes cursors
+    published while it waits: every published cursor is closed (workers
+    joined) before shutdown returns."""
+    import time as _time
+
+    import polars_gdx.lazy as lazy
+
+    closed = []
+
+    class StubCursor:
+        def close(self):
+            closed.append(1)
+
+    lazy._SHUTTING_DOWN.clear()
+    assert lazy._IN_FLIGHT == 0
+    first = StubCursor()
+    lazy._OPEN_CURSORS.add(first)
+    with lazy._IN_FLIGHT_LOCK:
+        lazy._IN_FLIGHT += 1
+    hook = threading.Thread(target=lazy._close_open_cursors)
+    hook.start()
+    _time.sleep(0.3)
+    # The sweep closed the already-published cursor and is now draining
+    # (one registered callback still active).
+    assert closed == [1]
+    # A registered callback publishes a NEW cursor during the drain...
+    second = StubCursor()
+    lazy._OPEN_CURSORS.add(second)
+    # ...and then completes.
+    with lazy._IN_FLIGHT_LOCK:
+        lazy._IN_FLIGHT -= 1
+    hook.join(timeout=30)
+    assert not hook.is_alive()
+    # The cursor published during the drain was closed (workers joined),
+    # not missed.
+    assert closed == [1, 1]
+    assert lazy._IN_FLIGHT == 0
+    assert not lazy._OPEN_CURSORS
+    # Restore the module for the rest of the process.
+    lazy._SHUTTING_DOWN.clear()
