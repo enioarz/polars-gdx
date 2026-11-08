@@ -14,6 +14,8 @@ import atexit
 import json
 import os
 import sys
+import threading
+import time
 import weakref
 from typing import TYPE_CHECKING, Iterator, Sequence
 
@@ -100,13 +102,44 @@ DEFAULT_BACKEND = _default_backend()
 _OPEN_CURSORS: set = set()
 
 
+#: Set once the interpreter begins shutting down: streaming sources
+#: check it before every extension call so a Polars engine thread that
+#: resumes a suspended generator during teardown executes only pure
+#: Python and never touches the finalizing interpreter through PyO3.
+_SHUTTING_DOWN = threading.Event()
+
+#: Number of source callbacks currently inside ``cursor.next_stream()``
+#: (the GIL is released there, so the callback can be in flight while the
+#: main thread shuts down). The atexit hook drains this to zero so no
+#: callback is suspended between the GIL release and its reacquisition
+#: when interpreter teardown starts.
+_IN_FLIGHT_LOCK = threading.Lock()
+_IN_FLIGHT = 0
+
+
 def _close_open_cursors() -> None:
+    # 1. Forbid new source steps: in-flight and teardown-resumed
+    #    generators break out of their loops before any extension call.
+    _SHUTTING_DOWN.set()
+    # 2. Stop and join all remaining production while the interpreter is
+    #    still alive (close() waits for in-flight steps via the cursor
+    #    state lock and joins the workers).
     for cursor in list(_OPEN_CURSORS):
         try:
             cursor.close()
         except Exception:
             pass
     _OPEN_CURSORS.clear()
+    # 3. Wait for any callback suspended inside next_stream() to return
+    #    (its GIL reacquisition and capsule creation must happen before
+    #    teardown, or the finalizing interpreter can abort the process).
+    #    Sleeping releases the GIL so those callbacks can finish.
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        with _IN_FLIGHT_LOCK:
+            if _IN_FLIGHT == 0:
+                break
+        time.sleep(0.001)
 
 
 atexit.register(_close_open_cursors)
@@ -499,7 +532,7 @@ def scan_gdx(
             # core could not apply: track the remainder across batches.
             remaining = n_rows if not native_limit_safe else None
             try:
-                while True:
+                while not _SHUTTING_DOWN.is_set():
                     # Consume the Arrow C Data Interface stream capsule:
                     # no pyarrow object is created on this (possibly
                     # Polars engine) thread — pyarrow objects created
@@ -508,38 +541,57 @@ def scan_gdx(
                     # the declared schema (Enum keys) is re-applied by an
                     # exact cast; the dictionary is the full UEL table in
                     # file order, so the cast preserves the values.
-                    holder = cursor.next_stream()
-                    if holder is None:
-                        break
-                    # Polars imports a C stream as a struct series; unnest
-                    # it back into the record-batch columns (only the
-                    # needed ones when projection pushdown applied).
-                    df = pl.from_arrow(holder).struct.unnest()
-                    # Re-apply the declared schema: dictionary keys arrive
-                    # as Categorical and are cast to the declared Enum
-                    # (the dictionary is the full UEL table in file order,
-                    # so the cast preserves values and physicals); other
-                    # columns cast to their declared (identical) dtypes.
-                    df = df.select(
-                        [
-                            pl.col(name).cast(schema[name])
-                            for name in df.columns
-                        ]
-                    )
-                    if shadow_mask is not None:
-                        df = _apply_key_label_predicate(df, reader, *shadow_mask)
-                    elif pred_expr is not None:
-                        df = df.filter(pred_expr)
-                    if remaining is not None:
-                        df = df.head(remaining)
-                        remaining -= df.height
-                    elif n_rows is not None:
-                        # The core already enforced the global limit;
-                        # per-batch head is a no-op except on the final
-                        # batch.
-                        df = df.head(n_rows)
-                    if with_columns is not None:
-                        df = df.select(with_columns)
+                    global _IN_FLIGHT
+                    with _IN_FLIGHT_LOCK:
+                        _IN_FLIGHT += 1
+                    try:
+                        # The in-flight count covers the WHOLE callback
+                        # body — next_stream plus the Arrow/Polars
+                        # conversion, residual predicates and projection
+                        # — so the atexit drain waits until the callback
+                        # is fully back at its suspension point before
+                        # interpreter teardown begins. The decrement runs
+                        # before the yield, so a generator suspended at
+                        # the yield is never counted and its teardown-time
+                        # resumption executes only the pure-Python flag
+                        # check.
+                        holder = cursor.next_stream()
+                        if holder is None:
+                            break
+                        # Polars imports a C stream as a struct series;
+                        # unnest it back into the record-batch columns
+                        # (only the needed ones when projection pushdown
+                        # applied).
+                        df = pl.from_arrow(holder).struct.unnest()
+                        # Re-apply the declared schema: dictionary keys
+                        # arrive as Categorical and are cast to the
+                        # declared Enum (the dictionary is the full UEL
+                        # table in file order, so the cast preserves
+                        # values and physicals); other columns cast to
+                        # their declared (identical) dtypes.
+                        df = df.select(
+                            [
+                                pl.col(name).cast(schema[name])
+                                for name in df.columns
+                            ]
+                        )
+                        if shadow_mask is not None:
+                            df = _apply_key_label_predicate(df, reader, *shadow_mask)
+                        elif pred_expr is not None:
+                            df = df.filter(pred_expr)
+                        if remaining is not None:
+                            df = df.head(remaining)
+                            remaining -= df.height
+                        elif n_rows is not None:
+                            # The core already enforced the global limit;
+                            # per-batch head is a no-op except on the
+                            # final batch.
+                            df = df.head(n_rows)
+                        if with_columns is not None:
+                            df = df.select(with_columns)
+                    finally:
+                        with _IN_FLIGHT_LOCK:
+                            _IN_FLIGHT -= 1
                     yield df
                     if remaining is not None and remaining <= 0:
                         break
