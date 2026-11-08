@@ -431,6 +431,17 @@ impl GdxrsReader {
                     .map_err(|e| PyValueError::new_err(format!("gdxrs backend: {e}")))?,
             );
         }
+        // Fixed costs first: the core's paged label cursor (fixed state
+        // plus its two label pages) and the validation storage must fit
+        // the budget before anything is allocated or fetched.
+        const RESOLVER_FIXED_BYTES: usize = 64 * 1024;
+        if self.dictionary_budget_bytes < RESOLVER_FIXED_BYTES {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label resolution fixed costs ({RESOLVER_FIXED_BYTES} bytes) \
+                 already exceed the adapter dictionary budget of {} bytes",
+                self.dictionary_budget_bytes
+            )));
+        }
         // Admission pass: sum the label bytes before building anything.
         let mut label_bytes = 0usize;
         {
@@ -440,16 +451,26 @@ impl GdxrsReader {
                 label_bytes = label_bytes.saturating_add(label.len());
             }
         }
-        // Simultaneous copies: the collected label buffer plus the Arrow
-        // BinaryArray values (offsets + bytes + validity) and the
-        // UInt32 id column.
-        let estimate = ids
-            .len()
-            .checked_mul(std::mem::size_of::<Vec<u8>>())
-            .and_then(|n| n.checked_add(label_bytes))
+        // Every simultaneously live allocation is charged, including
+        // validation storage, borrowed slices and conversion temporaries.
+        // Per-label heap allocations carry allocator granularity.
+        let granularity = |bytes: usize, count: usize| bytes.saturating_add(16 * count);
+        let heap = granularity(label_bytes, ids.len());
+        let estimate = RESOLVER_FIXED_BYTES
+            // Validation storage: one UelId (u32) per request.
+            .checked_add(4 * ids.len())
+            // Collected Vec<Vec<u8>>: headers + heap payload.
+            .and_then(|n| n.checked_add(ids.len() * std::mem::size_of::<Vec<u8>>()))
+            .and_then(|n| n.checked_add(heap))
+            // Arrow BinaryArray: i32 offsets + values payload + validity.
             .and_then(|n| n.checked_add(4 * ids.len().saturating_add(1)))
-            .and_then(|n| n.checked_add(label_bytes))
+            .and_then(|n| n.checked_add(granularity(label_bytes, ids.len())))
             .and_then(|n| n.checked_add(ids.len().saturating_add(7) / 8))
+            // Borrowed-slice vector used to build the array.
+            .and_then(|n| n.checked_add(ids.len() * std::mem::size_of::<&[u8]>()))
+            // One transient values-buffer copy during the array build.
+            .and_then(|n| n.checked_add(granularity(label_bytes, ids.len())))
+            // The returned UInt32 id column.
             .and_then(|n| n.checked_add(4 * ids.len()))
             .ok_or_else(|| {
                 PyRuntimeError::new_err("gdxrs backend: label request layout overflow")

@@ -99,14 +99,19 @@ def test_mode_a_admits_under_budget_and_rejects_clearly():
 def test_signed_zero_conversion_expectation():
     """Frozen adapter conversion expectation: ordinary NumberBits inputs
     for +0 and -0 project to bits 0000000000000000 and 8000000000000000
-    (the gdxrs writer's Preserve policy keeps the signed zero on disk)."""
+    (the gdxrs writer's Preserve policy keeps the signed zero on disk).
+    The returned values' packed bytes are compared against the expected
+    bit patterns, so simulated [+0.0, +0.0] output fails."""
     df = read_gdx(DICT, symbol="ZEROS", backend="gdxrs")
-    bits = [struct.unpack("<d", struct.pack("<d", v))[0] for v in df["value"]]
-    assert [struct.pack("<d", b) for b in (0.0, -0.0)] == [
+    packed = [struct.pack("<d", v) for v in df["value"].to_list()]
+    assert packed == [
         struct.pack("<Q", 0x0000000000000000),
         struct.pack("<Q", 0x8000000000000000),
     ]
-    assert bits == [0.0, -0.0]
+    # And the sign is preserved through the values themselves.
+    import math
+
+    assert [math.copysign(1.0, v) for v in df["value"].to_list()] == [1.0, -1.0]
     assert df["dim_0"].to_list() == ["aa", "bb"]
 
 
@@ -175,6 +180,51 @@ def test_mode_b_string_filters_match_exactly():
     assert lf.filter(pl.col("dim_0") == "AA").collect().height == 0
     assert lf.filter(pl.col("dim_0").is_in([1, 3])).collect()["dim_0"].to_list() == [1, 3]
     assert lf.filter(pl.col("dim_0").is_in([999])).collect().height == 0
+
+
+def test_mode_b_key_label_predicates_consistent_with_residuals():
+    """Finding 2: a key-label predicate means the same thing whether or not
+    it can be fully pushed down. Mixing a key-label comparison with a
+    residual condition evaluates against exact label strings and returns
+    the same rows as the pushed-down path."""
+    lf = scan_gdx(DICT, symbol="P", backend="gdxrs", key_mode="uel_id")
+    pushed = lf.filter(pl.col("dim_0") == "cc").collect()
+    # Key label + residual value condition: same meaning, same rows.
+    mixed = lf.filter((pl.col("dim_0") == "cc") & (pl.col("value") > 0)).collect()
+    assert mixed.equals(pushed)
+    assert mixed["dim_0"].to_list() == [3]
+    # A residual that excludes the row excludes it here too.
+    none = lf.filter((pl.col("dim_0") == "cc") & (pl.col("value") > 35)).collect()
+    assert none.height == 0
+    # is_in with String lists cannot even plan against UInt32 columns
+    # (Polars schema validation, before the adapter is consulted): the
+    # behavior is the same with or without residuals — a type error —
+    # and integer IDs are the documented form.
+    with pytest.raises(pl.exceptions.InvalidOperationError):
+        lf.filter(
+            (pl.col("dim_0").is_in(["aa", "cc"])) & (pl.col("value") >= 30)
+        ).collect()
+    assert (
+        lf.filter(
+            (pl.col("dim_0").is_in([1, 3])) & (pl.col("value") >= 30)
+        ).collect()["dim_0"].to_list()
+        == [3]
+    )
+    # Unknown labels still match nothing alongside residuals.
+    assert (
+        lf.filter((pl.col("dim_0") == "nope") & (pl.col("value") > 0)).collect().height
+        == 0
+    )
+    # Pure residual predicates on the value column are untouched.
+    assert lf.filter(pl.col("value") >= 30).collect()["dim_0"].to_list() == [3, 4]
+    # The labelbytes fixture: non-UTF-8 labels never match a string
+    # literal, with or without residuals.
+    lf_b = scan_gdx(LABELS, symbol="B", backend="gdxrs", key_mode="uel_id")
+    assert lf_b.filter(pl.col("dim_0") == "aa").collect()["dim_0"].to_list() == [1]
+    assert (
+        lf_b.filter((pl.col("dim_0") == "aa") & (pl.col("value") > 15)).collect().height
+        == 0
+    )
 
 
 def expected_schema_b():
@@ -268,9 +318,36 @@ def test_resolve_labels_conversion_budget_rejects_before_partial_output():
     with GdxrsReader(LABELS, dictionary_budget_bytes=64) as reader:
         with pytest.raises(RuntimeError, match="dictionary budget"):
             reader.resolve_labels([1, 2])
-        # A zero-budget reader is invalid configuration.
+    # A zero-budget reader is invalid configuration.
     with pytest.raises(ValueError, match="positive"):
         GdxrsReader(LABELS, dictionary_budget_bytes=0)
+
+
+def test_resolve_labels_admission_counts_all_simultaneous_buffers():
+    """Finding 1: the resolver's admission counts every simultaneously
+    live allocation — validation storage, the collected label buffer, the
+    Arrow offsets/values/validity, borrowed slices and conversion
+    temporaries, plus fixed cursor costs — so a request that needs more
+    than the budget is rejected even when the raw label payload alone
+    would fit. Fixed costs are checked before anything is allocated."""
+    # Fixed costs alone exceed a 64 KiB-minus-one budget, before any
+    # label is even fetched.
+    with GdxrsReader(LABELS, dictionary_budget_bytes=64 * 1024 - 1) as reader:
+        with pytest.raises(RuntimeError, match="fixed costs"):
+            reader.resolve_labels([1, 2])
+    # Resolving all 20,000 labels of the growing fixture needs ~2.2 MB
+    # of simultaneous buffers for a ~120 KB raw payload: a 1 MiB budget
+    # must reject it, while the default budget resolves the full table.
+    ids = list(range(1, 20_001))
+    with GdxrsReader(GROW, dictionary_budget_bytes=1024 * 1024) as reader:
+        with pytest.raises(RuntimeError, match="dictionary budget"):
+            reader.resolve_labels(ids)
+        assert reader.scan_statistics()["decoded_rows"] == 0
+    with GdxrsReader(GROW) as reader:
+        table = reader.resolve_labels(ids)
+        assert table.num_rows == 20_000
+        assert table.column(0).to_pylist()[:3] == [1, 2, 3]
+        assert table.column(1).to_pylist()[:3] == [b"u00000", b"u00001", b"u00002"]
 
 
 def test_label_ids_bounded_lookup():

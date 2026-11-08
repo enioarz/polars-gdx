@@ -352,6 +352,7 @@ def scan_gdx(
         del batch_size
         filters = explicit_filters
         pred_expr = None
+        shadow_mask = None
         native_limit_safe = True
         if predicate is not None:
             pred_expr = predicate
@@ -363,7 +364,24 @@ def scan_gdx(
                 # under-fill head(n), so read unlimited and let Polars-side
                 # filter().head(n) apply.
                 native_limit_safe = False
+                if key_mode == "uel_id" and _references_key_labels(
+                    pred_expr, key_names
+                ):
+                    # The predicate compares key columns against string
+                    # labels but also contains conditions the adapter
+                    # cannot translate (residuals). Polars cannot compare
+                    # String literals against UInt32 columns, so evaluate
+                    # the whole predicate against a shadow frame whose
+                    # key columns hold the exact label strings (resolved
+                    # through the bounded resolver); the resulting mask
+                    # filters the ID frame. This keeps the predicate's
+                    # meaning identical to the pushed-down path.
+                    pred_expr = None
+                    shadow_mask = (predicate, key_names)
+                else:
+                    shadow_mask = None
             else:
+                shadow_mask = None
                 # The predicate depends only on key columns: fold it into the
                 # native prefilter so non-matching records are skipped during
                 # the raw read, and re-apply it exactly on the produced frame.
@@ -398,7 +416,9 @@ def scan_gdx(
         # Passing the Enum schema makes Polars reinterpret the dictionary
         # indices as enum physicals instead of decoding to strings.
         df = pl.from_arrow(batch, schema=schema)
-        if pred_expr is not None:
+        if shadow_mask is not None:
+            df = _apply_key_label_predicate(df, reader, *shadow_mask)
+        elif pred_expr is not None:
             df = df.filter(pred_expr)
         if n_rows is not None:
             df = df.head(n_rows)
@@ -468,6 +488,81 @@ def _predicate_key_filter(
             return [(d, [])]
         resolved.append((d, existing))
     return resolved
+
+
+def _references_key_labels(pred: pl.Expr, key_names: list[str]) -> bool:
+    """True when the serialized predicate plan compares a key column
+    against string label literals (== either side, or is_in), which Polars
+    cannot evaluate against UInt32 ID columns."""
+    try:
+        plan = json.loads(pred.meta.serialize(format="json"))
+    except Exception:
+        return False
+    return _plan_has_key_labels(plan, key_names)
+
+
+def _plan_has_key_labels(node: dict, key_names: list[str]) -> bool:
+    if "BinaryExpr" in node:
+        b = node["BinaryExpr"]
+        if b["op"] == "And":
+            return _plan_has_key_labels(
+                b["left"], key_names
+            ) or _plan_has_key_labels(b["right"], key_names)
+        if b["op"] == "Eq":
+            for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
+                if "Column" in col_side and col_side["Column"] in key_names:
+                    if _string_literal(lit_side) is not None:
+                        return True
+            return False
+        return False
+    if "Function" in node:
+        f = node["Function"]
+        opts = f.get("function", {}).get("Boolean", {})
+        if "IsIn" in opts:
+            inputs = f.get("input", [])
+            if inputs and "Column" in inputs[0] and inputs[0]["Column"] in key_names:
+                return _list_literal_strings(inputs[1]) is not None
+        return False
+    return False
+
+
+def _apply_key_label_predicate(
+    df: pl.DataFrame, reader, predicate: pl.Expr, key_names: list[str]
+) -> pl.DataFrame:
+    """Evaluate a predicate that compares key columns against string labels
+    on a frame whose key columns are original UEL IDs (UInt32).
+
+    The key columns are temporarily replaced by their exact label strings
+    (resolved through the bounded resolver; invalid UTF-8 labels become
+    null and never match a string literal), the whole predicate is
+    evaluated against that shadow frame, and the resulting boolean mask
+    filters the ID frame. The meaning is identical to the pushed-down
+    path, where the same labels are resolved to their IDs."""
+    shadow = df
+    for name in key_names:
+        ids = shadow[name].unique().to_list()
+        if not ids:
+            continue
+        resolved = reader.resolve_labels(sorted(ids))
+        id_to_label = dict(
+            zip(resolved.column(0).to_pylist(), resolved.column(1).to_pylist())
+        )
+        # Decode strictly per label: invalid UTF-8 becomes null and can
+        # never equal a UTF-8 string literal.
+        def decode(label):
+            if label is None:
+                return None
+            try:
+                return label.decode()
+            except UnicodeDecodeError:
+                return None
+
+        labels = [decode(id_to_label.get(i)) for i in shadow[name].to_list()]
+        shadow = shadow.with_columns(pl.Series(name, labels, dtype=pl.String))
+    mask = shadow.select(predicate.alias("__polars_gdx_mask"))[
+        "__polars_gdx_mask"
+    ]
+    return df.filter(mask)
 
 
 def _exact_expr(
