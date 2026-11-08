@@ -334,3 +334,78 @@ def test_index_sidecars_released_on_reader_close():
     # ...and is removed (with its sidecar) once the reader closes.
     final = set(_glob.glob(os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")))
     assert final == before
+
+
+def test_cancel_from_another_thread_during_production():
+    """Review finding: cancel() from another thread while next_stream()
+    runs must not fail with "Already borrowed" (5/5 in the review). The
+    lock-free cancellation signal wakes in-flight production; the state
+    lock makes cleanup wait for the current step and join. The fixture
+    may complete before the cancel lands — either terminal state is
+    accepted; the regression is the borrow failure, captured and
+    re-raised from the producer thread."""
+    import time
+
+    errors = []
+
+    with GdxrsReader(GROW) as reader:
+        cursor = reader.scan_batches("BIG", threads=4, batch_rows=100)
+        first_batch = threading.Event()
+
+        def produce():
+            try:
+                while True:
+                    batch = cursor.next_stream()
+                    if batch is None:
+                        break
+                    first_batch.set()
+            except Exception as exc:  # e.g. "Already borrowed" — must not happen
+                errors.append(exc)
+
+        thread = threading.Thread(target=produce)
+        thread.start()
+        # Wait until production is provably active, then cancel from this
+        # thread while the producer loop runs. (The 20k fixture may
+        # complete quickly; the assertion below accepts either terminal
+        # state — the finding was the "Already borrowed" failure.)
+        first_batch.wait(timeout=30)
+        cursor.cancel()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert errors == [], errors
+        stats = cursor.scan_statistics()
+        assert stats["cancelled"] or stats["complete"]
+        assert stats["joined_workers"] == 4
+        # The stream ends without replaying acknowledged rows.
+        assert cursor.next_stream() is None
+        cursor.close()
+
+
+def test_reader_drop_releases_index_sidecars():
+    """Review finding: deleting the reader without an explicit close()
+    must release the index sidecars and directory (owned cleanup in
+    Drop), including when a cursor outlives the reader."""
+    import gc
+    import glob as _glob
+    import os
+    import tempfile
+
+    pattern = os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")
+
+    def current():
+        return set(_glob.glob(pattern))
+
+    before = current()
+    reader = GdxrsReader(GROW)
+    cursor = reader.scan_batches("BIG", threads=2, batch_rows=100)
+    next(iter(cursor))
+    del reader
+    gc.collect()
+    assert current() == before
+    # A cursor that outlives its reader still completes its scan and
+    # releases its own handle on close/drop.
+    remaining = sum(b.num_rows for b in iter(cursor))
+    assert remaining >= 0
+    del cursor
+    gc.collect()
+    assert current() == before
