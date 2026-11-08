@@ -463,7 +463,15 @@ def test_shutdown_gate_and_registration_share_one_lock():
         assert results == []
     # The lock is released: both proceed (in either order, atomically).
     gater.join(timeout=10)
+    if results == [True]:
+        # The registration won the race: match it, or the shutdown
+        # thread's confirmed-completion drain would wait indefinitely.
+        lazy._exit_callback()
     hook.join(timeout=60)
+    # Both threads terminate.
+    assert not gater.is_alive()
+    assert not hook.is_alive()
+    assert results in ([True], [False])
     assert lazy._SHUTTING_DOWN.is_set()
     # Whichever order occurred, the registration was matched.
     assert lazy._IN_FLIGHT == 0
@@ -506,3 +514,30 @@ def test_shutdown_drain_waits_for_confirmed_completion():
     thread.join(timeout=10)
     # Restore the module for the rest of the process.
     lazy._SHUTTING_DOWN.clear()
+
+
+def test_shutdown_gate_covers_source_setup():
+    """Review finding: source setup (reader.scan_batches — an extension
+    call that builds the checkpoint index and spawns workers) ran before
+    callback registration, so a paused setup could resume into the
+    extension after shutdown. The gate now covers setup: with shutdown
+    begun, a parallel scan yields nothing and no index sidecar is ever
+    built."""
+    import glob as _glob
+    import os
+    import tempfile
+
+    import polars_gdx.lazy as lazy
+
+    pattern = os.path.join(tempfile.gettempdir(), "polars-gdx-gdxrs-index-*")
+    before = set(_glob.glob(pattern))
+
+    lazy._SHUTTING_DOWN.set()
+    try:
+        df = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4).collect()
+        assert df.height == 0
+        # The setup extension call never ran: no NEW index directory was
+        # created (the parallel path builds one inside scan_batches).
+        assert set(_glob.glob(pattern)) == before
+    finally:
+        lazy._SHUTTING_DOWN.clear()

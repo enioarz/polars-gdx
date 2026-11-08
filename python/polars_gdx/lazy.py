@@ -551,9 +551,20 @@ def scan_gdx(
             # core cursor advances or closes.
             read_kwargs["key_mode"] = key_mode
             read_kwargs["columns"] = needed_columns
-            cursor = reader.scan_batches(
-                symbol, batch_rows=batch_size, **read_kwargs
-            )
+            # Source setup is itself an extension call (index build,
+            # worker spawn, admission): gate and register it exactly
+            # like a production step, so shutdown cannot drain to zero
+            # while a paused setup resumes into the extension after
+            # shutdown. A shutdown that has already begun ends the
+            # source before any extension call.
+            if not _enter_callback():
+                return
+            try:
+                cursor = reader.scan_batches(
+                    symbol, batch_rows=batch_size, **read_kwargs
+                )
+            finally:
+                _exit_callback()
             # Keep a registry reference so a disposed-but-unclosed source
             # is finalized on the main thread, not on a Polars engine
             # thread during interpreter shutdown.
