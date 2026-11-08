@@ -409,3 +409,100 @@ def test_reader_drop_releases_index_sidecars():
     del cursor
     gc.collect()
     assert current() == before
+
+
+def test_shutdown_gate_refuses_new_callbacks():
+    """Review finding: the shutdown check and the registration are
+    atomic — once shutdown has begun, no callback can enter production.
+    A scan started (or resumed) after the flag is set yields nothing
+    instead of touching the extension."""
+    import polars_gdx.lazy as lazy
+
+    lazy._SHUTTING_DOWN.set()
+    try:
+        df = scan_gdx(GROW, symbol="BIG", backend="gdxrs").collect()
+        assert df.height == 0
+        # The gate also refuses parallel scans.
+        df = scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4).collect()
+        assert df.height == 0
+    finally:
+        lazy._SHUTTING_DOWN.clear()
+    # Normal operation is restored.
+    assert scan_gdx(GROW, symbol="BIG", backend="gdxrs").collect().height == 20_000
+
+
+def test_shutdown_gate_and_registration_share_one_lock():
+    """Review finding: pausing between the shutdown check and the
+    counter increment let shutdown return with zero callbacks while a
+    paused callback resumed into next_stream() afterwards. The gate and
+    the registration now happen under the same lock the shutdown hook
+    uses, which this test observes directly: while the lock is held,
+    neither the hook's flag nor a concurrent registration can proceed."""
+    import time as _time
+
+    import polars_gdx.lazy as lazy
+
+    lazy._SHUTTING_DOWN.clear()
+    assert lazy._IN_FLIGHT == 0
+    with lazy._IN_FLIGHT_LOCK:
+        hook = threading.Thread(target=lazy._close_open_cursors)
+        hook.start()
+        _time.sleep(0.2)
+        # The hook cannot set the shutdown flag while the lock is held.
+        assert not lazy._SHUTTING_DOWN.is_set()
+        # A concurrent gate attempt blocks on the same lock instead of
+        # slipping between the check and the registration.
+        results = []
+
+        def try_enter():
+            results.append(lazy._enter_callback())
+
+        gater = threading.Thread(target=try_enter)
+        gater.start()
+        _time.sleep(0.1)
+        assert results == []
+    # The lock is released: both proceed (in either order, atomically).
+    gater.join(timeout=10)
+    hook.join(timeout=60)
+    assert lazy._SHUTTING_DOWN.is_set()
+    # Whichever order occurred, the registration was matched.
+    assert lazy._IN_FLIGHT == 0
+    # The gate refuses entry after shutdown.
+    assert lazy._enter_callback() is False
+    # Restore the module for the rest of the process (the real atexit
+    # hook sets the flag again at exit).
+    lazy._SHUTTING_DOWN.clear()
+
+
+def test_shutdown_drain_waits_for_confirmed_completion():
+    """Review finding: the drain silently expired after 30 seconds with
+    a callback still active. The drain now has no deadline: it returns
+    only after confirmed completion of every registered callback."""
+    import time as _time
+
+    import polars_gdx.lazy as lazy
+
+    lazy._SHUTTING_DOWN.clear()
+    assert lazy._IN_FLIGHT == 0
+    released = threading.Event()
+
+    def slow_callback():
+        _time.sleep(1.5)
+        with lazy._IN_FLIGHT_LOCK:
+            lazy._IN_FLIGHT -= 1
+        released.set()
+
+    with lazy._IN_FLIGHT_LOCK:
+        lazy._IN_FLIGHT += 1
+    thread = threading.Thread(target=slow_callback)
+    thread.start()
+    started = _time.monotonic()
+    lazy._close_open_cursors()
+    waited = _time.monotonic() - started
+    # The drain returned only after the callback confirmed completion.
+    assert released.is_set()
+    assert lazy._IN_FLIGHT == 0
+    assert waited >= 1.4
+    thread.join(timeout=10)
+    # Restore the module for the rest of the process.
+    lazy._SHUTTING_DOWN.clear()

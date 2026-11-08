@@ -117,10 +117,38 @@ _IN_FLIGHT_LOCK = threading.Lock()
 _IN_FLIGHT = 0
 
 
+def _enter_callback() -> bool:
+    """Atomically gate on shutdown and register an in-flight callback.
+
+    The shutdown check and the registration happen under the same lock
+    the shutdown hook uses to set the flag, so no callback can slip
+    between the check and the increment (and no shutdown can complete
+    its gate while a callback is registering). Returns False once
+    shutdown has begun — the caller must not touch the extension; every
+    True is matched by exactly one :func:`_exit_callback`.
+    """
+    global _IN_FLIGHT
+    with _IN_FLIGHT_LOCK:
+        if _SHUTTING_DOWN.is_set():
+            return False
+        _IN_FLIGHT += 1
+        return True
+
+
+def _exit_callback() -> None:
+    """Release a registration acquired by :func:`_enter_callback`."""
+    global _IN_FLIGHT
+    with _IN_FLIGHT_LOCK:
+        _IN_FLIGHT -= 1
+
+
 def _close_open_cursors() -> None:
-    # 1. Forbid new source steps: in-flight and teardown-resumed
+    # 1. Forbid new source steps: the flag is set under the same lock the
+    #    callbacks gate and register on, so no callback can enter
+    #    production after this point and in-flight/teardown-resumed
     #    generators break out of their loops before any extension call.
-    _SHUTTING_DOWN.set()
+    with _IN_FLIGHT_LOCK:
+        _SHUTTING_DOWN.set()
     # 2. Stop and join all remaining production while the interpreter is
     #    still alive (close() waits for in-flight steps via the cursor
     #    state lock and joins the workers).
@@ -130,12 +158,14 @@ def _close_open_cursors() -> None:
         except Exception:
             pass
     _OPEN_CURSORS.clear()
-    # 3. Wait for any callback suspended inside next_stream() to return
-    #    (its GIL reacquisition and capsule creation must happen before
-    #    teardown, or the finalizing interpreter can abort the process).
-    #    Sleeping releases the GIL so those callbacks can finish.
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
+    # 3. Wait for CONFIRMED completion of every registered callback: a
+    #    callback suspended inside next_stream() must reacquire the GIL
+    #    and return before teardown, or the finalizing interpreter can
+    #    abort the process. The wait has no deadline — blocked
+    #    synchronous OS reads cannot be forcibly interrupted (documented),
+    #    so shutdown waits for them by design. Sleeping releases the GIL
+    #    so the callbacks can finish.
+    while True:
         with _IN_FLIGHT_LOCK:
             if _IN_FLIGHT == 0:
                 break
@@ -532,7 +562,11 @@ def scan_gdx(
             # core could not apply: track the remainder across batches.
             remaining = n_rows if not native_limit_safe else None
             try:
-                while not _SHUTTING_DOWN.is_set():
+                while True:
+                    if not _enter_callback():
+                        # Shutdown has begun: no extension call may
+                        # happen; end the source immediately.
+                        break
                     # Consume the Arrow C Data Interface stream capsule:
                     # no pyarrow object is created on this (possibly
                     # Polars engine) thread — pyarrow objects created
@@ -541,9 +575,6 @@ def scan_gdx(
                     # the declared schema (Enum keys) is re-applied by an
                     # exact cast; the dictionary is the full UEL table in
                     # file order, so the cast preserves the values.
-                    global _IN_FLIGHT
-                    with _IN_FLIGHT_LOCK:
-                        _IN_FLIGHT += 1
                     try:
                         # The in-flight count covers the WHOLE callback
                         # body — next_stream plus the Arrow/Polars
@@ -590,8 +621,7 @@ def scan_gdx(
                         if with_columns is not None:
                             df = df.select(with_columns)
                     finally:
-                        with _IN_FLIGHT_LOCK:
-                            _IN_FLIGHT -= 1
+                        _exit_callback()
                     yield df
                     if remaining is not None and remaining <= 0:
                         break
