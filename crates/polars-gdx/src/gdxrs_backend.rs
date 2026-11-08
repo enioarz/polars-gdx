@@ -698,7 +698,7 @@ impl GdxrsReader {
     /// limit across all batches. Schema, value projection, key modes,
     /// filters and admission behave exactly like `read_arrow`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None, batch_rows=None))]
+    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None, batch_rows=None, columns=None))]
     fn scan_batches(
         &self,
         name: &str,
@@ -709,6 +709,7 @@ impl GdxrsReader {
         threads: Option<usize>,
         key_mode: Option<String>,
         batch_rows: Option<usize>,
+        columns: Option<Vec<String>>,
     ) -> PyResult<GdxrsBatchCursor> {
         let core = self.core()?;
         if let Some(n) = threads {
@@ -749,6 +750,47 @@ impl GdxrsReader {
             }
         };
         let names = column_names(kind, dim, key_names, field)?;
+        // Projection pushdown (task 045): when the caller names the
+        // columns it needs, only those key dimensions are read from the
+        // core (KeyProjection::Mask) and the value column is decoded only
+        // when needed. The key-filter selection still applies at the
+        // decoder for dimensions that are not projected. Columns required
+        // by residual predicates must be retained by the caller — the
+        // Python layer unions every predicate-referenced column in.
+        let (emit_dims, emit_value, projected_names) = match &columns {
+            None => ((0..dim).collect::<Vec<usize>>(), true, names.clone()),
+            Some(requested) => {
+                let value_name = match kind {
+                    SymbolType::Variable | SymbolType::Equation => field_name(field),
+                    _ => "value".to_string(),
+                };
+                let mut emit_dims = Vec::new();
+                let mut projected = Vec::new();
+                for (d, name) in names.iter().take(dim).enumerate() {
+                    if requested.contains(name) {
+                        emit_dims.push(d);
+                        projected.push(name.clone());
+                    }
+                }
+                let emit_value = requested.contains(&value_name);
+                if emit_value {
+                    projected.push(value_name);
+                }
+                for name in requested {
+                    if !projected.contains(name) && !names.contains(name) {
+                        return Err(PyValueError::new_err(format!(
+                            "gdxrs backend: unknown projected column {name:?}"
+                        )));
+                    }
+                }
+                if emit_dims.is_empty() && !emit_value {
+                    return Err(PyValueError::new_err(
+                        "gdxrs backend: projection leaves no readable columns",
+                    ));
+                }
+                (emit_dims, emit_value, projected)
+            }
+        };
         // Admission before decoding, exactly like read_arrow: rejected
         // reads report zero decoded rows.
         if !id_mode {
@@ -778,27 +820,44 @@ impl GdxrsReader {
                 })
                 .collect();
             let selection = core.selection(&handle, &clauses).map_err(to_py_err)?;
-            // Row layout charged by the core: one UelId (4 bytes) per key
-            // dimension plus one 16-byte typed value per row.
-            let payload = dim * std::mem::size_of::<UelId>() + std::mem::size_of::<Value>();
+            // Row layout charged by the core: one UelId (4 bytes) per
+            // projected key dimension plus one 16-byte typed value per row
+            // when the value column is read.
+            let payload = emit_dims.len() * std::mem::size_of::<UelId>()
+                + usize::from(emit_value) * std::mem::size_of::<Value>();
             let maximum_bytes = core.scan_options().batch_bytes;
             // Honor batch_rows as the maximum rows per emitted batch while
             // staying inside the core's separate byte budget: wide rows
             // get fewer rows per batch automatically.
             let batch_bytes = match batch_rows {
                 None => maximum_bytes,
-                Some(rows) => (rows.max(1) * payload).clamp(payload, maximum_bytes),
+                Some(rows) => (rows.max(1) * payload.max(1)).clamp(payload.max(1), maximum_bytes),
             };
+            let key_mask = emit_dims.iter().fold(0u32, |mask, &d| mask | 1u32 << d);
             let options = ScanOptions {
                 limit: n_rows.map(|n| n as u64),
                 batch_bytes,
+                key_projection: if columns.is_some() {
+                    gdxrs::KeyProjection::Mask(key_mask)
+                } else {
+                    gdxrs::KeyProjection::All
+                },
                 value_projection: match kind {
                     SymbolType::Variable | SymbolType::Equation => {
-                        ValueProjection::Mask(1u8 << field.index())
+                        if emit_value {
+                            ValueProjection::Mask(1u8 << field.index())
+                        } else {
+                            ValueProjection::Mask(0)
+                        }
                     }
-                    _ => ValueProjection::All,
+                    _ => {
+                        if emit_value {
+                            ValueProjection::All
+                        } else {
+                            ValueProjection::Mask(0)
+                        }
+                    }
                 },
-                ..core.scan_options()
             };
             cursor = Some(
                 core.scan_selected(&handle, &selection, options)
@@ -808,10 +867,12 @@ impl GdxrsReader {
         drop(handle);
         Ok(GdxrsBatchCursor {
             cursor,
-            dim,
+            dim: emit_dims.len(),
+            emit_dims,
+            emit_value,
             field,
             fieldless,
-            names,
+            names: projected_names,
             n_uels,
             id_mode,
             dictionary,
@@ -971,7 +1032,7 @@ impl GdxrsReader {
             dictionary,
             dim,
             &mut keys,
-            &mut values,
+            Some(&mut values),
             names,
             n_uels,
             id_mode,
@@ -1051,6 +1112,8 @@ impl GdxrsArrowStream {
 pub struct GdxrsBatchCursor {
     cursor: Option<gdxrs::ScanCursor>,
     dim: usize,
+    emit_dims: Vec<usize>,
+    emit_value: bool,
     field: ValueField,
     fieldless: bool,
     names: Vec<String>,
@@ -1141,30 +1204,36 @@ impl GdxrsBatchCursor {
         let rows = batch.len();
         let mut keys: Vec<Vec<i32>> = vec![Vec::with_capacity(rows); self.dim];
         let mut values: Vec<Option<f64>> = Vec::with_capacity(rows);
-        for (d, key_column) in keys.iter_mut().enumerate().take(self.dim) {
+        for (slot, &d) in self.emit_dims.iter().enumerate() {
             let column = batch
                 .key_column(d as u8)
                 .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing key column"))?;
-            key_column.extend(column.iter().map(|id| id.get() as i32));
+            keys[slot].extend(column.iter().map(|id| id.get() as i32));
         }
-        if self.fieldless {
-            // Zero-valued projection; do not touch the level column.
-            values.resize(rows, Some(0.0));
-        } else if let Some(column) = batch.value_column(self.field) {
-            for value in column {
-                values.push(project_value(*value, &mut self.stats)?);
+        if self.emit_value {
+            if self.fieldless {
+                // Zero-valued projection; do not touch the level column.
+                values.resize(rows, Some(0.0));
+            } else if let Some(column) = batch.value_column(self.field) {
+                for value in column {
+                    values.push(project_value(*value, &mut self.stats)?);
+                }
+            } else if !batch.is_empty() {
+                return Err(PyRuntimeError::new_err(
+                    "gdxrs backend: missing value column",
+                ));
             }
-        } else if !batch.is_empty() {
-            return Err(PyRuntimeError::new_err(
-                "gdxrs backend: missing value column",
-            ));
         }
         self.stats.decoded_rows = cursor.statistics().decoded_rows;
         let record = to_record_batch(
             self.dictionary.clone(),
             self.dim,
             &mut keys,
-            &mut values,
+            if self.emit_value {
+                Some(&mut values)
+            } else {
+                None
+            },
             self.names.clone(),
             self.n_uels,
             self.id_mode,
@@ -1261,12 +1330,14 @@ fn to_record_batch(
     dictionary: Option<Arc<StringArray>>,
     dim: usize,
     keys: &mut [Vec<i32>],
-    values: &mut Vec<Option<f64>>,
+    values: Option<&mut Vec<Option<f64>>>,
     names: Vec<String>,
     n_uels: usize,
     id_mode: bool,
 ) -> PyResult<RecordBatch> {
     let dict_values = dictionary;
+    let key_count = dim;
+    let value_count = usize::from(values.is_some());
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for key_column in keys.iter_mut().take(dim) {
         let column = std::mem::take(key_column);
@@ -1324,12 +1395,17 @@ fn to_record_batch(
         };
         columns.push(dict);
     }
-    columns.push(Arc::new(Float64Array::from(std::mem::take(values))) as ArrayRef);
+    if let Some(values) = values {
+        columns.push(Arc::new(Float64Array::from(std::mem::take(values))) as ArrayRef);
+    }
     let fields: Vec<Field> = names
         .iter()
         .zip(&columns)
         .enumerate()
-        .map(|(index, (name, col))| Field::new(name.clone(), col.data_type().clone(), index == dim))
+        .map(|(index, (name, col))| {
+            let is_value = index >= key_count && index < key_count + value_count;
+            Field::new(name.clone(), col.data_type().clone(), is_value)
+        })
         .collect();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| PyRuntimeError::new_err(format!("record batch error: {e}")))
