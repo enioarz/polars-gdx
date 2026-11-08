@@ -10,8 +10,11 @@ materialised.
 from __future__ import annotations
 
 import io
+import atexit
 import json
 import os
+import sys
+import weakref
 from typing import TYPE_CHECKING, Iterator, Sequence
 
 import polars as pl
@@ -86,6 +89,27 @@ AVAILABLE_BACKENDS = tuple(
 #: Default backend (docs/m7-adapter-contract.md §4: legacy stays the 0.6.x
 #: default; ``POLARS_GDX_BACKEND`` overrides it for differential test runs).
 DEFAULT_BACKEND = _default_backend()
+
+#: Live streaming cursors (M7 task 044). A noncollecting-sink consumer can
+#: drop a suspended source without closing it, and Polars may finalize the
+#: suspended generator on an engine thread during interpreter shutdown,
+#: where destroying extension objects can abort the process. The registry
+#: keeps a reference so final destruction happens on the main thread, and
+#: the atexit hook stops and joins all remaining production explicitly
+#: before interpreter shutdown. Completed scans remove their entry.
+_OPEN_CURSORS: set = set()
+
+
+def _close_open_cursors() -> None:
+    for cursor in list(_OPEN_CURSORS):
+        try:
+            cursor.close()
+        except Exception:
+            pass
+    _OPEN_CURSORS.clear()
+
+
+atexit.register(_close_open_cursors)
 
 #: Smallest symbol (in records) for which ``threads="auto"`` parallelises
 #: the raw read. Below this, open/coordination overhead outweighs the gain.
@@ -353,7 +377,10 @@ def scan_gdx(
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        del batch_size
+        if not backend_is_gdxrs:
+            # Only the gdxrs backend streams batches (task 044); the legacy
+            # backend still ignores batch_size and emits one batch.
+            del batch_size
         filters = explicit_filters
         pred_expr = None
         shadow_mask = None
@@ -404,18 +431,87 @@ def scan_gdx(
                         merged[d] = list(labels)
                 filters = list(merged.items())
 
-        kwargs = {}
+        read_kwargs = {
+            "key_names": list(key_names),
+            "value_field": (None if value_name == "value" else value_name),
+            "key_filter": filters,
+            "n_rows": (n_rows if native_limit_safe else None),
+            "threads": threads,
+        }
         if backend_is_gdxrs:
-            kwargs["key_mode"] = key_mode
-        batch = reader.read_arrow(
-            symbol,
-            key_names=list(key_names),
-            value_field=(None if value_name == "value" else value_name),
-            key_filter=filters,
-            n_rows=(n_rows if native_limit_safe else None),
-            threads=threads,
-            **kwargs,
-        )
+            # M7 task 044: cursor-backed streaming batches. The source
+            # emits incrementally without accumulating the whole symbol;
+            # `batch_size` is honored as the maximum rows per emitted
+            # batch (subject to the core's separate byte budget for wide
+            # rows). Each yielded batch owns valid data after the lending
+            # core cursor advances or closes.
+            read_kwargs["key_mode"] = key_mode
+            cursor = reader.scan_batches(
+                symbol, batch_rows=batch_size, **read_kwargs
+            )
+            # Keep a registry reference so a disposed-but-unclosed source
+            # is finalized on the main thread, not on a Polars engine
+            # thread during interpreter shutdown.
+            _OPEN_CURSORS.add(cursor)
+            # Global accepted-row limit for residual predicates that the
+            # core could not apply: track the remainder across batches.
+            remaining = n_rows if not native_limit_safe else None
+            try:
+                while True:
+                    # Consume the Arrow C Data Interface stream capsule:
+                    # no pyarrow object is created on this (possibly
+                    # Polars engine) thread — pyarrow objects created
+                    # there can abort the interpreter at shutdown.
+                    # Polars maps the dictionary keys to Categorical, so
+                    # the declared schema (Enum keys) is re-applied by an
+                    # exact cast; the dictionary is the full UEL table in
+                    # file order, so the cast preserves the values.
+                    holder = cursor.next_stream()
+                    if holder is None:
+                        break
+                    # Polars imports a C stream as a struct series; unnest
+                    # it back into the record-batch columns.
+                    df = pl.from_arrow(holder).struct.unnest()
+                    # Re-apply the declared schema: dictionary keys arrive
+                    # as Categorical and are cast to the declared Enum
+                    # (the dictionary is the full UEL table in file order,
+                    # so the cast preserves values and physicals); other
+                    # columns cast to their declared (identical) dtypes.
+                    df = df.select(
+                        [pl.col(name).cast(dtype) for name, dtype in schema.items()]
+                    )
+                    if shadow_mask is not None:
+                        df = _apply_key_label_predicate(df, reader, *shadow_mask)
+                    elif pred_expr is not None:
+                        df = df.filter(pred_expr)
+                    if remaining is not None:
+                        df = df.head(remaining)
+                        remaining -= df.height
+                    elif n_rows is not None:
+                        # The core already enforced the global limit;
+                        # per-batch head is a no-op except on the final
+                        # batch.
+                        df = df.head(n_rows)
+                    if with_columns is not None:
+                        df = df.select(with_columns)
+                    yield df
+                    if remaining is not None and remaining <= 0:
+                        break
+            finally:
+                # Explicit cursor cleanup on every exit path — normal end
+                # of stream, early break, exception, or consumer disposal
+                # (GeneratorExit when the sink drops a suspended source).
+                # Closing the cursor stops and joins core production
+                # while the interpreter is still alive. If the generator
+                # is only finalized during interpreter shutdown (a sink
+                # that dropped it without closing), skip the extension
+                # call: the atexit hook already stopped production, and
+                # extension calls during finalization can abort.
+                _OPEN_CURSORS.discard(cursor)
+                if not sys.is_finalizing():
+                    cursor.close()
+            return
+        batch = reader.read_arrow(symbol, **read_kwargs)
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         # Passing the Enum schema makes Polars reinterpret the dictionary
         # indices as enum physicals instead of decoding to strings.
