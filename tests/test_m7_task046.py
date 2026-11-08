@@ -626,3 +626,72 @@ def test_shutdown_closes_cursors_published_during_drain():
     assert not lazy._OPEN_CURSORS
     # Restore the module for the rest of the process.
     lazy._SHUTTING_DOWN.clear()
+
+
+def test_shutdown_sweep_does_not_erase_late_published_cursors():
+    """Review finding: the initial sweep's registry clear() removed a
+    cursor published while the sweep ran, without closing it. Only the
+    processed snapshot is removed now: a cursor published during the
+    sweep (or drain) is closed in a later iteration."""
+    import polars_gdx.lazy as lazy
+
+    closed = []
+
+    class Stub:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            closed.append(self.name)
+            if self.name == "first":
+                # A registered callback publishes a new cursor while the
+                # sweep is processing this one.
+                lazy._OPEN_CURSORS.add(Stub("second"))
+
+    lazy._SHUTTING_DOWN.clear()
+    assert lazy._IN_FLIGHT == 0
+    lazy._OPEN_CURSORS.add(Stub("first"))
+    lazy._close_open_cursors()
+    # Both cursors were closed; neither was silently erased.
+    assert closed == ["first", "second"]
+    assert not lazy._OPEN_CURSORS
+    assert lazy._IN_FLIGHT == 0
+    lazy._SHUTTING_DOWN.clear()
+
+
+def test_preamble_cancellation_releases_registration_once(monkeypatch):
+    """Review finding: a cancellation landing after the registration
+    release but before the flag update double-decremented the counter
+    (to -1), hanging shutdown indefinitely. The registration now has
+    exactly one cleanup path (the preamble's finally), so any
+    cancellation in the registered preamble releases it exactly once."""
+    import polars_gdx.lazy as lazy
+
+    lazy._SHUTTING_DOWN.clear()
+    assert lazy._IN_FLIGHT == 0
+
+    def boom(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(lazy, "_predicate_key_filter", boom)
+    # The predicate makes the planning path (and the spy) execute; the
+    # cancellation may propagate or be handled by the engine — the
+    # invariant under test is the accounting.
+    try:
+        scan_gdx(GROW, symbol="BIG", backend="gdxrs", threads=4).filter(
+            pl.col("dim_0") == "u00000"
+        ).collect()
+    except BaseException:
+        pass
+    # Exactly one release: the counter is back to zero, never negative.
+    assert lazy._IN_FLIGHT == 0
+    assert not lazy._OPEN_CURSORS
+    monkeypatch.undo()
+    # Normal operation restored.
+    assert (
+        scan_gdx(GROW, symbol="BIG", backend="gdxrs")
+        .filter(pl.col("dim_0") == "u00000")
+        .collect()
+        .height
+        == 1
+    )
