@@ -277,10 +277,32 @@ def test_mode_b_numeric_key_predicates():
     # confusing Polars type error.
     with pytest.raises(ValueError, match="mixes string-label and numeric"):
         lf.filter((pl.col("dim_0") == "cc") & (pl.col("dim_0") == 3)).collect()
-    # With pushdown disabled, Polars evaluates string comparisons against
-    # the UInt32 column directly: the documented limitation.
-    with pytest.raises(Exception):
-        lf.filter(pl.col("dim_0") == "cc").collect(pred_pushdown=False)
+    # With pushdown disabled (QueryOptFlags(predicate_pushdown=False)),
+    # Polars evaluates string comparisons against the UInt32 column
+    # directly: the documented limitation, asserted as the specific
+    # ComputeError Polars raises for String-vs-UInt32 comparisons.
+    with pytest.raises(pl.exceptions.ComputeError, match="cannot compare"):
+        lf.filter(pl.col("dim_0") == "cc").collect(
+            optimizations=pl.QueryOptFlags(predicate_pushdown=False)
+        )
+    # The same plan with integer IDs works with pushdown disabled, since
+    # the UInt32 comparison is then valid.
+    no_pushdown = lf.filter(pl.col("dim_0") == 3).collect(
+        optimizations=pl.QueryOptFlags(predicate_pushdown=False)
+    )
+    assert no_pushdown["dim_0"].to_list() == [3]
+
+
+def test_resolve_labels_preflights_before_extraction():
+    """Review finding: the request-sized preflight runs on the borrowed
+    Python sequence before PyO3 extracts it, so a multi-million-ID request
+    against a tiny budget is rejected without materializing the request."""
+    with GdxrsReader(LABELS, dictionary_budget_bytes=128) as reader:
+        with pytest.raises(RuntimeError, match="request-sized storage"):
+            reader.resolve_labels([1] * 4_000_000)
+        # A generator is not a sized sequence and is rejected clearly.
+        with pytest.raises(ValueError, match="sized sequence"):
+            reader.resolve_labels(i for i in [1, 2])
 
 
 def expected_schema_b():
@@ -415,13 +437,13 @@ def test_resolve_labels_admission_counts_all_simultaneous_buffers():
 
 def test_label_ids_bounded_lookup():
     """The bounded label→ID lookup preserves request order and reports
-    unknown labels as None, without materializing the dictionary."""
-    with GdxrsReader(LABELS, dictionary_budget_bytes=64) as reader:
-        # 64 bytes cannot admit the dictionary, but the bounded lookup
-        # still resolves labels.
-        assert reader.label_ids(["aa", "zz", "aa"]) == [1, None, 1]
+    unknown labels as None, without materializing the dictionary: on the
+    growing fixture a 512 KiB budget rejects the full-dictionary
+    admission (~1.1 MB) while the lookup still resolves labels."""
+    with GdxrsReader(GROW, dictionary_budget_bytes=512 * 1024) as reader:
         with pytest.raises(RuntimeError, match="dictionary budget"):
             reader.uel_table()
+        assert reader.label_ids(["u00000", "nope", "u00000"]) == [1, None, 1]
     with GdxrsReader(DICT) as reader:
         assert reader.label_ids(["dd", "aa", "bb", "nope"]) == [4, 1, 2, None]
 

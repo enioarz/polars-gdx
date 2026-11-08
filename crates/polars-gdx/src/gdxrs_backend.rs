@@ -31,7 +31,7 @@ use gdxrs::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict};
 
 fn to_py_err(e: gdxrs::Error) -> PyErr {
     PyRuntimeError::new_err(format!("gdxrs backend: {e}"))
@@ -416,30 +416,38 @@ impl GdxrsReader {
     /// resource error before returning a partial table. Labels are
     /// fetched through the core's paged label cursor — no full
     /// dictionary is materialized.
-    fn resolve_labels(&self, ids: Vec<u32>, py: Python<'_>) -> PyResult<PyObject> {
+    fn resolve_labels(&self, ids: &Bound<'_, PyAny>, py: Python<'_>) -> PyResult<PyObject> {
         let core = self.core()?;
         let uel_count = core.information().map_err(to_py_err)?.uel_count;
-        // Preflight the request-sized storage before ANY allocation: the
-        // fixed cursor costs plus the validation vector (one UelId per
+        // Preflight from the BORROWED sequence before PyO3 extracts it:
+        // accepting `Vec<u32>` would materialize the whole request
+        // (4 bytes per ID) before admission. The fixed cursor costs plus
+        // the incoming extraction, the validation vector (one UelId per
         // request) and the collected buffer's Vec headers must fit the
-        // budget, so a huge request against a tiny budget is rejected
-        // before the validation vector exists.
+        // budget first, so a huge request against a tiny budget is
+        // rejected before any request-sized allocation exists.
         const RESOLVER_FIXED_BYTES: usize = 64 * 1024;
+        let len = ids.len().map_err(|_| {
+            PyValueError::new_err(
+                "gdxrs backend: resolve_labels expects a sized sequence of UEL IDs",
+            )
+        })?;
         let request_sized = RESOLVER_FIXED_BYTES
-            .checked_add(ids.len() * std::mem::size_of::<UelId>())
-            .and_then(|n| n.checked_add(ids.len() * std::mem::size_of::<Vec<u8>>()))
+            .checked_add(len * std::mem::size_of::<u32>())
+            .and_then(|n| n.checked_add(len * std::mem::size_of::<UelId>()))
+            .and_then(|n| n.checked_add(len * std::mem::size_of::<Vec<u8>>()))
             .ok_or_else(|| {
                 PyRuntimeError::new_err("gdxrs backend: label request layout overflow")
             })?;
         if request_sized > self.dictionary_budget_bytes {
             return Err(PyRuntimeError::new_err(format!(
-                "gdxrs backend: label resolution of {} IDs needs at least ~{request_sized} \
+                "gdxrs backend: label resolution of {len} IDs needs at least ~{request_sized} \
                  bytes of fixed and request-sized storage, exceeding the adapter \
                  dictionary budget of {} bytes",
-                ids.len(),
                 self.dictionary_budget_bytes
             )));
         }
+        let ids: Vec<u32> = ids.extract()?;
         let mut validated: Vec<UelId> = Vec::with_capacity(ids.len());
         for id in &ids {
             if *id == 0 || *id > uel_count {
@@ -519,8 +527,29 @@ impl GdxrsReader {
     /// exact (case-sensitive, byte-for-byte after UTF-8 encoding)
     /// matching, without materializing the dictionary. Entry `i` is the
     /// ID of `labels[i]`, or None when the label is not in the file.
-    fn label_ids(&self, labels: Vec<String>) -> PyResult<Vec<Option<u32>>> {
+    fn label_ids(&self, labels: &Bound<'_, PyAny>) -> PyResult<Vec<Option<u32>>> {
         let core = self.core()?;
+        // Preflight from the borrowed sequence before extraction: the
+        // incoming Vec<String> (headers + string allocations) must fit
+        // the budget, mirroring resolve_labels.
+        const LOOKUP_FIXED_BYTES: usize = 64 * 1024;
+        let len = labels.len().map_err(|_| {
+            PyValueError::new_err("gdxrs backend: label_ids expects a sized sequence of labels")
+        })?;
+        let request_sized = LOOKUP_FIXED_BYTES
+            .checked_add(len * (std::mem::size_of::<String>() + std::mem::size_of::<usize>()))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("gdxrs backend: label request layout overflow")
+            })?;
+        if request_sized > self.dictionary_budget_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label lookup of {len} labels needs at least ~{request_sized} \
+                 bytes of fixed and request-sized storage, exceeding the adapter \
+                 dictionary budget of {} bytes",
+                self.dictionary_budget_bytes
+            )));
+        }
+        let labels: Vec<String> = labels.extract()?;
         let encoded: Vec<Vec<u8>> = labels.iter().map(|l| l.as_bytes().to_vec()).collect();
         let refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
         let matches = core.lookup_labels(&refs).map_err(to_py_err)?;
