@@ -529,15 +529,37 @@ impl GdxrsReader {
     /// ID of `labels[i]`, or None when the label is not in the file.
     fn label_ids(&self, labels: &Bound<'_, PyAny>) -> PyResult<Vec<Option<u32>>> {
         let core = self.core()?;
-        // Preflight from the borrowed sequence before extraction: the
-        // incoming Vec<String> (headers + string allocations) must fit
-        // the budget, mirroring resolve_labels.
+        // Preflight from the borrowed list before extraction, mirroring
+        // resolve_labels: the UTF-8 payload bytes are counted by walking
+        // the borrowed list (no string is extracted yet), and every
+        // simultaneously live copy is charged — the extracted Vec<String>
+        // heap payloads and the core's lookup buffer, each with per-string
+        // allocation granularity.
         const LOOKUP_FIXED_BYTES: usize = 64 * 1024;
-        let len = labels.len().map_err(|_| {
-            PyValueError::new_err("gdxrs backend: label_ids expects a sized sequence of labels")
+        let list = labels.downcast::<pyo3::types::PyList>().map_err(|_| {
+            PyValueError::new_err("gdxrs backend: label_ids expects a list of labels")
         })?;
+        let len = list.len();
+        let mut payload_bytes = 0usize;
+        for item in list {
+            let string = item.downcast::<pyo3::types::PyString>().map_err(|_| {
+                PyValueError::new_err("gdxrs backend: label_ids expects labels to be strings")
+            })?;
+            let text = string
+                .to_str()
+                .map_err(|_| {
+                    PyValueError::new_err("gdxrs backend: label_ids expects labels to be strings")
+                })?
+                .len();
+            payload_bytes = payload_bytes.saturating_add(text + 1);
+        }
+        let granularity = |bytes: usize| bytes.saturating_add(16 * len);
         let request_sized = LOOKUP_FIXED_BYTES
             .checked_add(len * (std::mem::size_of::<String>() + std::mem::size_of::<usize>()))
+            // Two simultaneous payload copies: the extracted Vec<String>
+            // heap and the core's lookup buffer.
+            .and_then(|n| n.checked_add(granularity(payload_bytes)))
+            .and_then(|n| n.checked_add(granularity(payload_bytes)))
             .ok_or_else(|| {
                 PyRuntimeError::new_err("gdxrs backend: label request layout overflow")
             })?;

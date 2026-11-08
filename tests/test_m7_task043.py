@@ -293,6 +293,23 @@ def test_mode_b_numeric_key_predicates():
     assert no_pushdown["dim_0"].to_list() == [3]
 
 
+def test_label_ids_preflight_counts_string_payloads():
+    """Review finding: the label_ids preflight counts the UTF-8 payload
+    bytes and both simultaneous copies before extraction — 250 labels of
+    255 bytes need 127,500 bytes of payload copies alone and are rejected
+    under a 72 KiB budget, while the default budget resolves them."""
+    long_labels = ["x" * 255] * 250
+    with GdxrsReader(DICT, dictionary_budget_bytes=72 * 1024) as reader:
+        with pytest.raises(RuntimeError, match="request-sized storage"):
+            reader.label_ids(long_labels)
+    with GdxrsReader(DICT) as reader:
+        assert reader.label_ids(long_labels) == [None] * 250
+    # Non-string elements are rejected clearly before any lookup.
+    with GdxrsReader(DICT) as reader:
+        with pytest.raises(ValueError, match="strings"):
+            reader.label_ids(["aa", 5])
+
+
 def test_resolve_labels_preflights_before_extraction():
     """Review finding: the request-sized preflight runs on the borrowed
     Python sequence before PyO3 extracts it, so a multi-million-ID request
