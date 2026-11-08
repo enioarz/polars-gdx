@@ -79,3 +79,44 @@ def test_label_residual_keeps_id_columns_without_python_row_copies(monkeypatch):
         )
     assert result.schema == df.schema
     assert result.rows() == [(3, 30.)]
+
+
+def test_oversized_labels_are_unmatched_in_id_mode():
+    """Labels longer than the encoded string maximum (255 UTF-8 bytes) can
+    never match a stored GDX label: they are treated as unmatched instead
+    of failing the core lookup, in every ID-mode path."""
+    long_label = "x" * 256
+    with GdxrsReader(DICT) as reader:
+        # The bounded lookup resolves oversized labels to None, preserving
+        # request order.
+        assert reader.label_ids(["aa", long_label]) == [1, None]
+        assert reader.label_ids([long_label, "aa", long_label]) == [None, 1, None]
+    # ID-mode predicates with an oversized label match zero rows.
+    from polars_gdx import scan_gdx
+
+    df = read_gdx(DICT, symbol="P", backend="gdxrs", key_mode="uel_id")
+    lf = scan_gdx(DICT, symbol="P", backend="gdxrs", key_mode="uel_id")
+    assert lf.filter(pl.col("dim_0") == long_label).collect().height == 0
+    # The same predicate with a residual condition stays consistent.
+    assert (
+        lf.filter((pl.col("dim_0") == long_label) & (pl.col("value") > 0)).collect().height
+        == 0
+    )
+    # key_filter with an oversized label yields zero rows with the planned
+    # schema, in both modes.
+    for key_mode in ("enum", "uel_id"):
+        empty = read_gdx(
+            DICT, symbol="P", backend="gdxrs", key_mode=key_mode, key_filter={0: [long_label]}
+        )
+        assert empty.height == 0
+        assert empty.columns == ["dim_0", "value"]
+        assert empty.schema["value"] == pl.Float64
+        if key_mode == "uel_id":
+            assert empty.schema["dim_0"] == pl.UInt32
+        else:
+            assert isinstance(empty.schema["dim_0"], pl.Enum)
+    # Enum mode predicates already matched zero rows; both modes agree.
+    enum_lf = scan_gdx(DICT, symbol="P", backend="gdxrs")
+    assert (
+        enum_lf.filter(pl.col("dim_0") == long_label).collect().height == 0
+    )

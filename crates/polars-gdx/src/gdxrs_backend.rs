@@ -271,7 +271,14 @@ impl GdxrsReader {
         let core = self.core()?;
         let mut out = Vec::with_capacity(filters.len());
         for (dim, labels) in filters {
-            let refs: Vec<&[u8]> = labels.iter().map(|label| label.as_bytes()).collect();
+            // GDX stores at most 255 bytes per label, so longer labels can
+            // never match; they are treated as unmatched rather than
+            // passed to the core lookup, which rejects them.
+            let refs: Vec<&[u8]> = labels
+                .iter()
+                .map(|label| label.as_bytes())
+                .filter(|bytes| bytes.len() <= 255)
+                .collect();
             let matches = core.lookup_labels(&refs).map_err(to_py_err)?;
             let mut ids = Vec::with_capacity(labels.len());
             for ordinal in 0..matches.len() {
@@ -656,18 +663,28 @@ impl GdxrsReader {
                 PyValueError::new_err("gdxrs backend: label_ids expects labels to be strings")
             })?);
         }
-        let mut refs = reserved_vec(len)?;
-        for string in &strings {
-            refs.push(string.to_str()?.as_bytes());
+        // GDX stores at most 255 bytes per label, so longer labels can
+        // never match: they resolve to None without being passed to the
+        // core lookup, which would reject them. Request order and
+        // duplicates are preserved.
+        let mut sized = reserved_vec(len)?;
+        for (index, string) in strings.iter().enumerate() {
+            if string.to_str()?.len() <= 255 {
+                sized.push(index);
+            }
+        }
+        let mut refs = reserved_vec(sized.len())?;
+        for &index in &sized {
+            refs.push(strings[index].to_str()?.as_bytes());
         }
         let matches = core.lookup_labels(&refs).map_err(to_py_err)?;
-        let mut out = reserved_vec(len)?;
-        for ordinal in 0..matches.len() {
+        let mut out: Vec<Option<u32>> = vec![None; len];
+        for (ordinal, &index) in sized.iter().enumerate() {
             let id = matches
                 .get(ordinal)
                 .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing lookup result"))?
                 .id;
-            out.push(id.map(UelId::get));
+            out[index] = id.map(UelId::get);
         }
         Ok(out)
     }
