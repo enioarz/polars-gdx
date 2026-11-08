@@ -353,7 +353,10 @@ def scan_gdx(
         n_rows: int | None,
         batch_size: int | None,
     ) -> Iterator[pl.DataFrame]:
-        del batch_size
+        if not backend_is_gdxrs:
+            # Only the gdxrs backend streams batches (task 044); the legacy
+            # backend still ignores batch_size and emits one batch.
+            del batch_size
         filters = explicit_filters
         pred_expr = None
         shadow_mask = None
@@ -404,18 +407,51 @@ def scan_gdx(
                         merged[d] = list(labels)
                 filters = list(merged.items())
 
-        kwargs = {}
+        read_kwargs = {
+            "key_names": list(key_names),
+            "value_field": (None if value_name == "value" else value_name),
+            "key_filter": filters,
+            "n_rows": (n_rows if native_limit_safe else None),
+            "threads": threads,
+        }
         if backend_is_gdxrs:
-            kwargs["key_mode"] = key_mode
-        batch = reader.read_arrow(
-            symbol,
-            key_names=list(key_names),
-            value_field=(None if value_name == "value" else value_name),
-            key_filter=filters,
-            n_rows=(n_rows if native_limit_safe else None),
-            threads=threads,
-            **kwargs,
-        )
+            # M7 task 044: cursor-backed streaming batches. The source
+            # emits incrementally without accumulating the whole symbol;
+            # `batch_size` is honored as the maximum rows per emitted
+            # batch (subject to the core's separate byte budget for wide
+            # rows). Each yielded batch owns valid data after the lending
+            # core cursor advances or closes.
+            read_kwargs["key_mode"] = key_mode
+            cursor = reader.scan_batches(
+                symbol, batch_rows=batch_size, **read_kwargs
+            )
+            # Global accepted-row limit for residual predicates that the
+            # core could not apply: track the remainder across batches.
+            remaining = n_rows if not native_limit_safe else None
+            for batch in cursor:
+                # pyarrow RecordBatch -> polars: zero-copy over the Arrow
+                # buffers. Passing the Enum schema makes Polars reinterpret
+                # the dictionary indices as enum physicals.
+                df = pl.from_arrow(batch, schema=schema)
+                if shadow_mask is not None:
+                    df = _apply_key_label_predicate(df, reader, *shadow_mask)
+                elif pred_expr is not None:
+                    df = df.filter(pred_expr)
+                if remaining is not None:
+                    df = df.head(remaining)
+                    remaining -= df.height
+                elif n_rows is not None:
+                    # The core already enforced the global limit; per-batch
+                    # head is a no-op except on the final batch.
+                    df = df.head(n_rows)
+                if with_columns is not None:
+                    df = df.select(with_columns)
+                yield df
+                if remaining is not None and remaining <= 0:
+                    cursor.close()
+                    break
+            return
+        batch = reader.read_arrow(symbol, **read_kwargs)
         # pyarrow RecordBatch -> polars: zero-copy over the Arrow buffers.
         # Passing the Enum schema makes Polars reinterpret the dictionary
         # indices as enum physicals instead of decoding to strings.

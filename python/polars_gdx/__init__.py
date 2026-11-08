@@ -15,11 +15,15 @@ Reader = getattr(_core, "Reader", None)
 #: gdxrs backend class (pinned pure-Rust core, M7 task 042); ``None`` when
 #: the extension was built without the ``gdxrs`` cargo feature.
 GdxrsReader = getattr(_core, "GdxrsReader", None)
+#: Streaming batch cursor class (M7 task 044); ``None`` without the
+#: ``gdxrs`` cargo feature.
+GdxrsBatchCursor = getattr(_core, "GdxrsBatchCursor", None)
 
 __version__ = "0.6.0"
 __all__ = [
     "Reader",
     "GdxrsReader",
+    "GdxrsBatchCursor",
     "scan_gdx",
     "read_gdx",
     "read_domains",

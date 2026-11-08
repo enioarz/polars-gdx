@@ -689,6 +689,137 @@ impl GdxrsReader {
         Ok(out)
     }
 
+    /// Start a cursor-backed streaming batch source over one symbol
+    /// (M7 task 044): the returned `GdxrsBatchCursor` yields self-owned
+    /// Arrow RecordBatches incrementally without accumulating the whole
+    /// symbol or dictionary. `batch_rows` is the agreed maximum rows per
+    /// emitted batch; the core's separate byte budget (`batch_bytes`)
+    /// additionally bounds wide rows. `n_rows` is a global accepted-row
+    /// limit across all batches. Schema, value projection, key modes,
+    /// filters and admission behave exactly like `read_arrow`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None, batch_rows=None))]
+    fn scan_batches(
+        &self,
+        name: &str,
+        key_names: Option<Vec<String>>,
+        value_field: Option<String>,
+        key_filter: Option<Vec<(usize, Vec<String>)>>,
+        n_rows: Option<usize>,
+        threads: Option<usize>,
+        key_mode: Option<String>,
+        batch_rows: Option<usize>,
+    ) -> PyResult<GdxrsBatchCursor> {
+        let core = self.core()?;
+        if let Some(n) = threads {
+            if n > 1 {
+                return Err(PyValueError::new_err(
+                    "gdxrs backend: parallel reads are not implemented yet (task 046); \
+                     use threads=None",
+                ));
+            }
+        }
+        let handle = core
+            .find_symbol(name.as_bytes())
+            .map_err(to_py_err)?
+            .ok_or_else(|| not_found(name))?;
+        let metadata = handle.metadata().map_err(to_py_err)?;
+        let dim = usize::from(metadata.dimension);
+        let kind = metadata.kind;
+        let field = match value_field.as_deref() {
+            Some(s) => parse_field(s)?,
+            None => ValueField::Level,
+        };
+        let mut filters = Vec::new();
+        for (dim_idx, labels) in key_filter.unwrap_or_default() {
+            if dim_idx >= dim {
+                return Err(PyRuntimeError::new_err(format!(
+                    "key filter dimension {dim_idx} out of range (symbol has {dim} dimensions)"
+                )));
+            }
+            filters.push((dim_idx, labels));
+        }
+        let id_mode = match key_mode.as_deref() {
+            None | Some("enum") => false,
+            Some("uel_id") => true,
+            Some(other) => {
+                return Err(PyValueError::new_err(format!(
+                    "key_mode must be 'enum' or 'uel_id', got {other:?}"
+                )))
+            }
+        };
+        let names = column_names(kind, dim, key_names, field)?;
+        // Admission before decoding, exactly like read_arrow: rejected
+        // reads report zero decoded rows.
+        if !id_mode {
+            self.uel_strings()?;
+        }
+        let resolved = self.resolve_filters(&filters)?;
+        let empty = n_rows == Some(0) || resolved.iter().any(|(_, ids)| ids.is_empty());
+        let fieldless = !matches!(kind, SymbolType::Variable | SymbolType::Equation)
+            && field != ValueField::Level;
+        let dictionary = if id_mode {
+            None
+        } else {
+            Some(self.uel_array()?)
+        };
+        let n_uels = if id_mode {
+            0
+        } else {
+            self.uel_strings()?.len()
+        };
+        let mut cursor = None;
+        if !empty {
+            let clauses: Vec<DimensionSelection<'_>> = resolved
+                .iter()
+                .map(|(d, ids)| DimensionSelection {
+                    dimension: *d as u8,
+                    keys: KeySelection::AnyOf(ids),
+                })
+                .collect();
+            let selection = core.selection(&handle, &clauses).map_err(to_py_err)?;
+            // Row layout charged by the core: one UelId (4 bytes) per key
+            // dimension plus one 16-byte typed value per row.
+            let payload = dim * std::mem::size_of::<UelId>() + std::mem::size_of::<Value>();
+            let maximum_bytes = core.scan_options().batch_bytes;
+            // Honor batch_rows as the maximum rows per emitted batch while
+            // staying inside the core's separate byte budget: wide rows
+            // get fewer rows per batch automatically.
+            let batch_bytes = match batch_rows {
+                None => maximum_bytes,
+                Some(rows) => (rows.max(1) * payload).clamp(payload, maximum_bytes),
+            };
+            let options = ScanOptions {
+                limit: n_rows.map(|n| n as u64),
+                batch_bytes,
+                value_projection: match kind {
+                    SymbolType::Variable | SymbolType::Equation => {
+                        ValueProjection::Mask(1u8 << field.index())
+                    }
+                    _ => ValueProjection::All,
+                },
+                ..core.scan_options()
+            };
+            cursor = Some(
+                core.scan_selected(&handle, &selection, options)
+                    .map_err(to_py_err)?,
+            );
+        }
+        drop(handle);
+        Ok(GdxrsBatchCursor {
+            cursor,
+            dim,
+            field,
+            fieldless,
+            names,
+            n_uels,
+            id_mode,
+            dictionary,
+            stats: ProjectionStats::default(),
+            finished: empty,
+        })
+    }
+
     /// Read one symbol as an Arrow RecordBatch, mirroring the legacy
     /// backend's `read_arrow`. `key_mode="enum"` (default) emits Arrow
     /// dictionary key arrays over the full UEL table with 0-based raw UEL
@@ -831,8 +962,138 @@ impl GdxrsReader {
         } else {
             self.uel_strings()?.len()
         };
-        let batch = to_record_batch(self, dim, &mut keys, &mut values, names, n_uels, id_mode)?;
+        let dictionary = if id_mode {
+            None
+        } else {
+            Some(self.uel_array()?)
+        };
+        let batch = to_record_batch(
+            dictionary,
+            dim,
+            &mut keys,
+            &mut values,
+            names,
+            n_uels,
+            id_mode,
+        )?;
         Ok(batch.into_pyarrow(py)?.into_any())
+    }
+}
+
+/// Cursor-backed streaming batch source (M7 task 044).
+///
+/// Wraps the core's lending `ScanCursor`: each `__next__` call advances
+/// the core cursor, copies the decoded rows into a fresh, self-owned
+/// Arrow RecordBatch and returns it — no full symbol is ever accumulated,
+/// and a previously yielded batch stays valid after the cursor advances
+/// or closes. Batches are bounded both by the requested `batch_rows`
+/// (the agreed maximum rows per emitted batch) and by the core's separate
+/// byte budget (`maximum_batch_bytes`), so wide rows yield fewer rows per
+/// batch automatically. The schema is fixed at creation and identical for
+/// every batch, including empty results.
+#[pyclass]
+pub struct GdxrsBatchCursor {
+    cursor: Option<gdxrs::ScanCursor>,
+    dim: usize,
+    field: ValueField,
+    fieldless: bool,
+    names: Vec<String>,
+    n_uels: usize,
+    id_mode: bool,
+    dictionary: Option<Arc<StringArray>>,
+    stats: ProjectionStats,
+    finished: bool,
+}
+
+#[pymethods]
+impl GdxrsBatchCursor {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    /// The next owned RecordBatch, or StopIteration at end of stream.
+    /// The lending core view is copied out within this call; the returned
+    /// batch owns valid data after the cursor advances or closes.
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let Some(cursor) = self.cursor.as_mut() else {
+            return Ok(None);
+        };
+        if self.finished {
+            return Ok(None);
+        }
+        let batch = match cursor.next_batch().map_err(to_py_err)? {
+            Some(batch) => batch,
+            None => {
+                self.finished = true;
+                return Ok(None);
+            }
+        };
+        let rows = batch.len();
+        let mut keys: Vec<Vec<i32>> = vec![Vec::with_capacity(rows); self.dim];
+        let mut values: Vec<Option<f64>> = Vec::with_capacity(rows);
+        for (d, key_column) in keys.iter_mut().enumerate().take(self.dim) {
+            let column = batch
+                .key_column(d as u8)
+                .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing key column"))?;
+            key_column.extend(column.iter().map(|id| id.get() as i32));
+        }
+        if self.fieldless {
+            // Zero-valued projection; do not touch the level column.
+            values.resize(rows, Some(0.0));
+        } else if let Some(column) = batch.value_column(self.field) {
+            for value in column {
+                values.push(project_value(*value, &mut self.stats)?);
+            }
+        } else if !batch.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "gdxrs backend: missing value column",
+            ));
+        }
+        self.stats.decoded_rows = cursor.statistics().decoded_rows;
+        let record = to_record_batch(
+            self.dictionary.clone(),
+            self.dim,
+            &mut keys,
+            &mut values,
+            self.names.clone(),
+            self.n_uels,
+            self.id_mode,
+        )?;
+        Ok(Some(record.into_pyarrow(py)?.into_any()))
+    }
+
+    /// Per-cursor projection counters plus the core's decoded rows so far.
+    fn scan_statistics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let mut stats = self.stats;
+        stats.decoded_rows = self
+            .cursor
+            .as_ref()
+            .map(|cursor| cursor.statistics().decoded_rows)
+            .unwrap_or(self.stats.decoded_rows);
+        let dict = PyDict::new(py);
+        dict.set_item("decoded_rows", stats.decoded_rows)?;
+        dict.set_item("eps_to_zero", stats.eps_to_zero)?;
+        dict.set_item("acronyms_to_null", stats.acronyms_to_null)?;
+        Ok(dict)
+    }
+
+    /// Stop at the acknowledged prefix: release the core decoder and
+    /// batch buffers; later `__next__` calls end the stream. Idempotent.
+    fn close(&mut self) -> PyResult<()> {
+        if let Some(mut cursor) = self.cursor.take() {
+            self.stats.decoded_rows = cursor.statistics().decoded_rows;
+            cursor.close().map_err(to_py_err)?;
+        }
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for GdxrsBatchCursor {
+    fn drop(&mut self) {
+        if let Some(mut cursor) = self.cursor.take() {
+            let _ = cursor.close();
+        }
     }
 }
 
@@ -913,7 +1174,7 @@ fn column_names(
 
 #[allow(clippy::too_many_arguments)]
 fn to_record_batch(
-    reader: &GdxrsReader,
+    dictionary: Option<Arc<StringArray>>,
     dim: usize,
     keys: &mut [Vec<i32>],
     values: &mut Vec<Option<f64>>,
@@ -921,11 +1182,7 @@ fn to_record_batch(
     n_uels: usize,
     id_mode: bool,
 ) -> PyResult<RecordBatch> {
-    let dict_values = if id_mode {
-        None
-    } else {
-        Some(reader.uel_array()?)
-    };
+    let dict_values = dictionary;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(dim + 1);
     for key_column in keys.iter_mut().take(dim) {
         let column = std::mem::take(key_column);
