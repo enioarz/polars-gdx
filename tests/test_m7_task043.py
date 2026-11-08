@@ -227,6 +227,62 @@ def test_mode_b_key_label_predicates_consistent_with_residuals():
     )
 
 
+def test_mode_b_label_fallback_stays_bounded():
+    """Finding 1: the residual fallback resolves only the predicate's label
+    literals, never the output's labels. A label filter plus an
+    always-true value condition succeeds on the 20,000-label growing
+    fixture even under a 1 MiB reader budget that could never admit the
+    full label resolution."""
+    from polars_gdx.lazy import _apply_key_label_predicate
+
+    lf = scan_gdx(GROW, symbol="BIG", backend="gdxrs", key_mode="uel_id")
+    pushed = lf.filter(pl.col("dim_0") == "u00042").collect()
+    assert pushed.height == 1
+    # Same filter plus an always-true residual: identical rows.
+    mixed = lf.filter(
+        (pl.col("dim_0") == "u00042") & (pl.col("value") >= 0)
+    ).collect()
+    assert mixed.equals(pushed)
+    # Directly against a 1 MiB-budget reader: the fallback resolves only
+    # the single predicate literal, so no admission failure occurs (the
+    # previous design resolved all 20,000 output labels here).
+    df = read_gdx(GROW, symbol="BIG", backend="gdxrs", key_mode="uel_id")
+    with GdxrsReader(GROW, dictionary_budget_bytes=1024 * 1024) as reader:
+        out = _apply_key_label_predicate(
+            df,
+            reader,
+            (pl.col("dim_0") == "u00042") & (pl.col("value") >= 0),
+            ["dim_0"],
+        )
+        assert out.height == 1
+        assert out["dim_0"].to_list() == [43]
+
+
+def test_mode_b_numeric_key_predicates():
+    """Finding 2: numeric ID predicates keep working alongside label
+    predicates on other key columns; mixing string-label and numeric
+    comparisons on the same key column is rejected clearly; with
+    predicate pushdown disabled, string comparisons against UInt32 are
+    the documented Polars type error."""
+    # Numeric-only key predicates evaluate directly against the IDs.
+    lf = scan_gdx(DICT, symbol="P", backend="gdxrs", key_mode="uel_id")
+    assert lf.filter(pl.col("dim_0") == 3).collect()["dim_0"].to_list() == [3]
+    assert lf.filter(pl.col("dim_0") < 3).collect()["dim_0"].to_list() == [1, 2]
+    # Label and numeric comparisons on different key columns coexist.
+    lf2 = scan_gdx("tests/data/trnsport.gdx", symbol="x", backend="gdxrs", key_mode="uel_id")
+    both = lf2.filter((pl.col("dim_0") == "seattle") & (pl.col("dim_1") == 3)).collect()
+    assert both.height == 1
+    assert both["dim_1"].to_list() == [3]
+    # Mixing on the SAME key column is rejected clearly, not with a
+    # confusing Polars type error.
+    with pytest.raises(ValueError, match="mixes string-label and numeric"):
+        lf.filter((pl.col("dim_0") == "cc") & (pl.col("dim_0") == 3)).collect()
+    # With pushdown disabled, Polars evaluates string comparisons against
+    # the UInt32 column directly: the documented limitation.
+    with pytest.raises(Exception):
+        lf.filter(pl.col("dim_0") == "cc").collect(pred_pushdown=False)
+
+
 def expected_schema_b():
     return pl.Schema({"dim_0": pl.UInt32, "value": pl.Float64})
 
@@ -330,11 +386,18 @@ def test_resolve_labels_admission_counts_all_simultaneous_buffers():
     temporaries, plus fixed cursor costs — so a request that needs more
     than the budget is rejected even when the raw label payload alone
     would fit. Fixed costs are checked before anything is allocated."""
-    # Fixed costs alone exceed a 64 KiB-minus-one budget, before any
-    # label is even fetched.
+    # Fixed and request-sized storage alone exceed a 64 KiB-minus-one
+    # budget, before any label is even fetched.
     with GdxrsReader(LABELS, dictionary_budget_bytes=64 * 1024 - 1) as reader:
-        with pytest.raises(RuntimeError, match="fixed costs"):
+        with pytest.raises(RuntimeError, match="request-sized storage"):
             reader.resolve_labels([1, 2])
+    # The preflight precedes validation: a huge request against a tiny
+    # budget is rejected for its request-sized storage, not per-ID
+    # validation (the ID-0 ValueError would prove the validation vector
+    # was built first).
+    with GdxrsReader(LABELS, dictionary_budget_bytes=128) as reader:
+        with pytest.raises(RuntimeError, match="request-sized storage"):
+            reader.resolve_labels([0] * 100_000)
     # Resolving all 20,000 labels of the growing fixture needs ~2.2 MB
     # of simultaneous buffers for a ~120 KB raw payload: a 1 MiB budget
     # must reject it, while the default budget resolves the full table.

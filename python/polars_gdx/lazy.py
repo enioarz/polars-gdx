@@ -494,36 +494,80 @@ def _references_key_labels(pred: pl.Expr, key_names: list[str]) -> bool:
     """True when the serialized predicate plan compares a key column
     against string label literals (== either side, or is_in), which Polars
     cannot evaluate against UInt32 ID columns."""
-    try:
-        plan = json.loads(pred.meta.serialize(format="json"))
-    except Exception:
-        return False
-    return _plan_has_key_labels(plan, key_names)
+    return bool(_classify_label_conjuncts(pred, key_names)[0])
 
 
-def _plan_has_key_labels(node: dict, key_names: list[str]) -> bool:
+def _split_conjuncts(node: dict) -> list[dict]:
+    """Split a serialized plan into its top-level AND conjuncts."""
+    if "BinaryExpr" in node and node["BinaryExpr"]["op"] == "And":
+        b = node["BinaryExpr"]
+        return _split_conjuncts(b["left"]) + _split_conjuncts(b["right"])
+    return [node]
+
+
+def _label_comparison(node: dict, key_names: list[str]) -> dict[str, list[str]]:
+    """If the node is a recognized key-label comparison (== or is_in
+    against string literals), return {column: [labels]}; else {}."""
     if "BinaryExpr" in node:
         b = node["BinaryExpr"]
-        if b["op"] == "And":
-            return _plan_has_key_labels(
-                b["left"], key_names
-            ) or _plan_has_key_labels(b["right"], key_names)
         if b["op"] == "Eq":
             for col_side, lit_side in ((b["left"], b["right"]), (b["right"], b["left"])):
                 if "Column" in col_side and col_side["Column"] in key_names:
-                    if _string_literal(lit_side) is not None:
-                        return True
-            return False
-        return False
+                    label = _string_literal(lit_side)
+                    if label is not None:
+                        return {col_side["Column"]: [label]}
+            return {}
     if "Function" in node:
         f = node["Function"]
         opts = f.get("function", {}).get("Boolean", {})
         if "IsIn" in opts:
             inputs = f.get("input", [])
             if inputs and "Column" in inputs[0] and inputs[0]["Column"] in key_names:
-                return _list_literal_strings(inputs[1]) is not None
-        return False
-    return False
+                labels = _list_literal_strings(inputs[1])
+                if labels is not None:
+                    return {inputs[0]["Column"]: labels}
+    return {}
+
+
+def _referenced_columns(node: dict) -> set[str]:
+    """Every column name referenced anywhere in a serialized subtree."""
+    if not isinstance(node, dict):
+        return set()
+    if "Column" in node:
+        return {node["Column"]}
+    names: set[str] = set()
+    for value in node.values():
+        if isinstance(value, dict):
+            names |= _referenced_columns(value)
+        elif isinstance(value, list):
+            for item in value:
+                names |= _referenced_columns(item)
+    return names
+
+
+def _classify_label_conjuncts(
+    pred: pl.Expr, key_names: list[str]
+) -> tuple[dict[str, list[str]], set[str]]:
+    """Classify the predicate's top-level AND conjuncts.
+
+    Returns ({column: [label literals]}, {key columns referenced by other
+    conjuncts}). A key column that appears in both sets mixes string-label
+    and other (e.g. numeric) comparisons and cannot be evaluated against a
+    single frame."""
+    try:
+        plan = json.loads(pred.meta.serialize(format="json"))
+    except Exception:
+        return {}, set()
+    labels: dict[str, list[str]] = {}
+    other: set[str] = set()
+    for conjunct in _split_conjuncts(plan):
+        comparison = _label_comparison(conjunct, key_names)
+        if comparison:
+            for column, literals in comparison.items():
+                labels.setdefault(column, []).extend(literals)
+        else:
+            other |= _referenced_columns(conjunct) & set(key_names)
+    return labels, other
 
 
 def _apply_key_label_predicate(
@@ -532,33 +576,32 @@ def _apply_key_label_predicate(
     """Evaluate a predicate that compares key columns against string labels
     on a frame whose key columns are original UEL IDs (UInt32).
 
-    The key columns are temporarily replaced by their exact label strings
-    (resolved through the bounded resolver; invalid UTF-8 labels become
-    null and never match a string literal), the whole predicate is
-    evaluated against that shadow frame, and the resulting boolean mask
-    filters the ID frame. The meaning is identical to the pushed-down
-    path, where the same labels are resolved to their IDs."""
-    shadow = df
-    for name in key_names:
-        ids = shadow[name].unique().to_list()
-        if not ids:
-            continue
-        resolved = reader.resolve_labels(sorted(ids))
-        id_to_label = dict(
-            zip(resolved.column(0).to_pylist(), resolved.column(1).to_pylist())
+    The predicate's label literals are resolved to their IDs through the
+    bounded lookup, and only those key columns are temporarily replaced by
+    sparse label strings: a row's cell holds the label string when the
+    row's ID is one of the resolved literal IDs, else null — exactly the
+    rows that could match the literal. No dictionary-scale resolution ever
+    happens, so a bounded reader budget survives residual conditions.
+    Other key columns keep their UInt32 IDs, so numeric ID predicates in
+    the same predicate keep working. The resulting boolean mask filters
+    the ID frame; the meaning is identical to the pushed-down path."""
+    labels, other = _classify_label_conjuncts(predicate, key_names)
+    mixed = sorted(set(labels) & other)
+    if mixed:
+        raise ValueError(
+            f"the predicate mixes string-label and numeric comparisons on the "
+            f"same uel_id key column(s) {mixed}; compare integer IDs "
+            "consistently (labels resolve to their original UEL IDs)"
         )
-        # Decode strictly per label: invalid UTF-8 becomes null and can
-        # never equal a UTF-8 string literal.
-        def decode(label):
-            if label is None:
-                return None
-            try:
-                return label.decode()
-            except UnicodeDecodeError:
-                return None
-
-        labels = [decode(id_to_label.get(i)) for i in shadow[name].to_list()]
-        shadow = shadow.with_columns(pl.Series(name, labels, dtype=pl.String))
+    shadow = df
+    for name, literals in labels.items():
+        unique = sorted(set(literals))
+        ids = reader.label_ids(unique)
+        id_to_label = {
+            i: label for i, label in zip(ids, unique) if i is not None
+        }
+        cells = [id_to_label.get(i) for i in shadow[name].to_list()]
+        shadow = shadow.with_columns(pl.Series(name, cells, dtype=pl.String))
     mask = shadow.select(predicate.alias("__polars_gdx_mask"))[
         "__polars_gdx_mask"
     ]

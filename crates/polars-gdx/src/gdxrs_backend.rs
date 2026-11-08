@@ -419,6 +419,27 @@ impl GdxrsReader {
     fn resolve_labels(&self, ids: Vec<u32>, py: Python<'_>) -> PyResult<PyObject> {
         let core = self.core()?;
         let uel_count = core.information().map_err(to_py_err)?.uel_count;
+        // Preflight the request-sized storage before ANY allocation: the
+        // fixed cursor costs plus the validation vector (one UelId per
+        // request) and the collected buffer's Vec headers must fit the
+        // budget, so a huge request against a tiny budget is rejected
+        // before the validation vector exists.
+        const RESOLVER_FIXED_BYTES: usize = 64 * 1024;
+        let request_sized = RESOLVER_FIXED_BYTES
+            .checked_add(ids.len() * std::mem::size_of::<UelId>())
+            .and_then(|n| n.checked_add(ids.len() * std::mem::size_of::<Vec<u8>>()))
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("gdxrs backend: label request layout overflow")
+            })?;
+        if request_sized > self.dictionary_budget_bytes {
+            return Err(PyRuntimeError::new_err(format!(
+                "gdxrs backend: label resolution of {} IDs needs at least ~{request_sized} \
+                 bytes of fixed and request-sized storage, exceeding the adapter \
+                 dictionary budget of {} bytes",
+                ids.len(),
+                self.dictionary_budget_bytes
+            )));
+        }
         let mut validated: Vec<UelId> = Vec::with_capacity(ids.len());
         for id in &ids {
             if *id == 0 || *id > uel_count {
@@ -430,17 +451,6 @@ impl GdxrsReader {
                 UelId::new(*id)
                     .map_err(|e| PyValueError::new_err(format!("gdxrs backend: {e}")))?,
             );
-        }
-        // Fixed costs first: the core's paged label cursor (fixed state
-        // plus its two label pages) and the validation storage must fit
-        // the budget before anything is allocated or fetched.
-        const RESOLVER_FIXED_BYTES: usize = 64 * 1024;
-        if self.dictionary_budget_bytes < RESOLVER_FIXED_BYTES {
-            return Err(PyRuntimeError::new_err(format!(
-                "gdxrs backend: label resolution fixed costs ({RESOLVER_FIXED_BYTES} bytes) \
-                 already exceed the adapter dictionary budget of {} bytes",
-                self.dictionary_budget_bytes
-            )));
         }
         // Admission pass: sum the label bytes before building anything.
         let mut label_bytes = 0usize;
