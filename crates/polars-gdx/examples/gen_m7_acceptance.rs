@@ -70,8 +70,20 @@ fn main() {
     let radices: Vec<u64> = if kind == "metadata" {
         vec![72_000_000]
     } else {
-        let mut radix_list = vec![2u64; 10];
-        radix_list.extend(vec![5u64; 8]);
+        // Factor the record count into radices of 2 and 5 so the mixed-
+        // radix enumeration produces exactly `records` unique ascending
+        // tuples (400M = 2^10 x 5^8; smoke sizes factor the same way).
+        let mut rest = records;
+        let mut radix_list = Vec::new();
+        while rest % 2 == 0 {
+            radix_list.push(2);
+            rest /= 2;
+        }
+        while rest % 5 == 0 {
+            radix_list.push(5);
+            rest /= 5;
+        }
+        assert_eq!(rest, 1, "record count must factor into 2s and 5s");
         radix_list
     };
     let label_count: u64 = radices.iter().sum();
@@ -110,7 +122,6 @@ fn main() {
             // Strictly ascending unique key tuples: record i is the
             // mixed-radix (2^10 x 5^8) representation of i, most
             // significant dimension first.
-            assert_eq!(records, 400_000_000, "record fixtures use 400M tuples");
             let dims = radices.len();
             let mut keys = vec![ids[0]; dims];
             let mut digits = vec![0u64; dims];

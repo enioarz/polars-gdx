@@ -16,7 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14, macos-13, windows-latest]
+        # macos-latest is ARM64; macos-13 is the last Intel runner.
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,7 +25,7 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Python deps
-        run: pip install patchelf polars pyarrow pytest
+        run: pip install maturin patchelf polars pyarrow pytest
       - name: Build and install (both backends)
         run: pip install -e .
       - name: Suite (default backend)
@@ -38,7 +39,7 @@ jobs:
       - name: gdxrs-only wheel and suite
         shell: bash
         run: |
-          pip uninstall -y polars-gdx
+          pip uninstall -y polars-gdx || true
           maturin build --release --no-default-features --features gdxrs --out dist
           pip install dist/*.whl
           pytest tests/ -q
