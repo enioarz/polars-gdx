@@ -11,7 +11,10 @@ name = "polars_gdx"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-gdx = { path = "../gdx" }
+gdx = { path = "../gdx", optional = true }
+# M7 task 042: pinned core revision from docs/m7-adapter-contract.md §1;
+# bump only via a reviewed change that reruns the affected gates.
+gdxrs = { git = "https://github.com/enioarz/gdxrs", rev = "9a7411764f176adb613185fa1e45d64b06123683", optional = true, features = ["index"] }
 arrow = { version = "56", default-features = false, features = ["pyarrow", "ipc"] }
 arrow-pyarrow = "56"
 pyo3 = { version = "0.25", features = ["extension-module", "abi3-py310"] }
@@ -19,3 +22,18 @@ thiserror.workspace = true
 
 [build-dependencies]
 pyo3-build-config = "0.25"
+
+[features]
+default = ["legacy", "gdxrs"]
+# Vendored native GDX C library backend (default in 0.6.x).
+legacy = ["dep:gdx"]
+# Pure-Rust gdxrs core backend (M7). No GAMS, C++ or native GDX library.
+gdxrs = ["dep:gdxrs"]
+
+# NOTE: the gdxrs git dependency requires Rust 1.99.1 (the pinned core's
+# MSRV; docs/m7-adapter-contract.md §1). Legacy-only builds keep the
+# workspace's 1.80 declaration, which does not apply to gdxrs-enabled builds.
+
+[[example]]
+name = "gen_m7_fixtures"
+required-features = ["gdxrs"]

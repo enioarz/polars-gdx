@@ -5,6 +5,8 @@ import pytest
 
 from polars_gdx import Reader, scan_gdx
 
+from conftest import legacy_backend_only
+
 
 @pytest.mark.parametrize(
     "path,symbol,label",
@@ -14,6 +16,7 @@ from polars_gdx import Reader, scan_gdx
     ],
 )
 @pytest.mark.parametrize("threads", [None, 4])
+@legacy_backend_only
 def test_raw_limits_match_sliced_read(path, symbol, label, threads):
     with Reader(path) as reader:
         if label is None:
@@ -30,6 +33,7 @@ def test_raw_limits_match_sliced_read(path, symbol, label, threads):
 @pytest.mark.parametrize("dim", [0, 1])
 @pytest.mark.parametrize("labels", [[], ["not-a-stored-label"]])
 @pytest.mark.parametrize("threads", [None, 4])
+@legacy_backend_only
 def test_empty_filter_preserves_schema(dim, labels, threads):
     path = "tests/data/trnsport.gdx"
     with Reader(path) as reader:
@@ -43,6 +47,7 @@ def test_empty_filter_preserves_schema(dim, labels, threads):
     assert frame.schema == scan_gdx(path, symbol="x").collect_schema()
 
 
+@legacy_backend_only
 def test_empty_read_still_validates_arguments():
     with Reader("tests/data/trnsport.gdx") as reader:
         with pytest.raises(RuntimeError, match="out of range"):
@@ -53,6 +58,7 @@ def test_empty_read_still_validates_arguments():
             reader.read_arrow("x", key_names=["level", "j"], n_rows=0)
 
 
+@legacy_backend_only
 def test_compressed_span_within_one_block_after_parallel_read():
     with Reader("tests/data/compressed.gdx") as reader:
         full = reader.read_arrow("big")

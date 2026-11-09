@@ -4,6 +4,18 @@ Polars IO plugin for reading GAMS GDX files lazily, with native key-prefiltering
 Extracted from [lolow/gdxcomp](https://github.com/lolow/gdxcomp) (`gdx-sys` + `gdx` crates),
 building on the vendored, MIT-licensed [GAMS-dev/gdx](https://github.com/GAMS-dev/gdx) C++ library.
 
+## M7 integration workflow
+
+M7 work targets **`develop/m7`**, potentially across multiple PRs per task. Read
+[the integration tracker](docs/m7-development.md),
+[adapter contract](docs/m7-adapter-contract.md) and
+[independent expectations](docs/m7-fixture-expectations.md) before M7 changes.
+Do not merge or fast-forward this branch into `main` until tasks 041–047 are all
+complete, their required acceptance gates pass, blocking reviews are resolved,
+and a maintainer explicitly approves the final milestone merge. Task PR merges
+authorize progress on the integration branch only. The merging note below does
+not override this gate. Keep Arrow/PyO3/Polars dependencies out of the gdxrs core.
+
 ## Layout
 
 ```
@@ -11,14 +23,18 @@ crates/gdx-sys            # raw FFI to vendored GDX C library (CMake build, ~8MB
                           #   under third_party/gdx — no GAMS install needed at runtime)
 crates/gdx                # safe RAII wrapper; global FFI lock (lock.rs); lazy UEL interning
 crates/polars-gdx         # PyO3 extension: symbol listing, UEL table, read_arrow()
+                          #   two selectable backends behind cargo features (default: both):
+                          #   "legacy" (vendored C library) and "gdxrs" (pinned pure-Rust core,
+                          #   M7 task 042; git dep, needs Rust 1.99.1, no GAMS/C++/native GDX lib)
 python/polars_gdx         # scan_gdx / read_gdx / list_symbols / predicate→prefilter translation
+                          #   backend= parameter; POLARS_GDX_BACKEND overrides the default
 benchmarks/               # bench_vs_gamsapi.py + fixture generators (cargo examples)
 tests/                    # pytest suite (uses tests/data/trnsport.gdx fixture)
 ```
 
 ## Key design facts (do not rediscover these)
 
-- **Read path**: `scan_gdx()` → `pl.register_io_source` → Rust `read_arrow()` →
+- **Legacy read path**: `scan_gdx()` → `pl.register_io_source` → Rust `read_arrow()` →
   raw UEL indices via `gdxDataReadRawFastEx` (bulk C callback with user-data pointer and
   early-termination return, ONE FFI crossing per symbol — used for unfiltered, filtered
   AND limited reads alike)

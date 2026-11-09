@@ -1,11 +1,16 @@
 # polars-gdx
 
+M7 integration work targets **`develop/m7`** across multiple task PRs. Merge that
+branch into `main` only after every task 041–047 and its required acceptance gates
+is complete and a maintainer approves the final merge. See the
+[M7 tracker](docs/m7-development.md) for progress and the full merge gate.
+
 Lazy, prefiltered Polars access to [GAMS GDX](https://github.com/GAMS-dev/gdx) files — no GAMS installation required.
 
 - `scan_gdx(path, symbol=...)` returns a `pl.LazyFrame`; nothing is read until `collect()`, and column projection is pushed down via Polars' IO-source interface. `read_gdx(...)` is the eager convenience wrapper (`scan_gdx(...).collect()`, same arguments).
 - **Key columns are Polars `Enum` typed over the file's UEL table** (requires Polars ≥ 2.0). The Rust layer emits Arrow dictionary arrays whose values are the full UEL table in file order and whose indices are the raw 0-based UEL numbers, so Polars reinterprets the buffers **zero-copy**: no per-record string materialisation, and `==`/`is_in`/`join`/`group_by` on keys run as integer category comparisons. Use `.cast(pl.String)` when you need string operations on keys.
 - Predicates on key columns (`key_filter={dim_index: allowed_labels}`, `filter(pl.col(key) == label)` or `filter(pl.col(key).is_in(labels))`) are folded into a **native, index-based prefilter inside the Rust read loop**, so unwanted records are never materialized — unlike the official `gamsapi` reader, which must load everything into pandas first. The prefilter runs inside a bulk C callback (`gdxDataReadRawFastEx`): one FFI crossing for the whole symbol, with early termination for `head(n)`.
-- `threads=` (on `scan_gdx`/`read_gdx`) parallelises the raw read across independent file handles. With a first-dimension filter, each worker scans a contiguous range of the first key dimension and whole non-matching ranges are skipped without touching the file. Without one, the data section is split by *file position* at exact record boundaries: a cached restart-position index (one cheap sequential pass, built once per file+symbol) provides the boundaries, and each worker decodes only its own byte range. In both cases results are concatenated in range order so record order matches the serial read exactly, and any boundary/count mismatch falls back to a verified serial read. `threads="auto"` (recommended) uses all cores for symbols of 5M+ records and stays serial for smaller ones. Filters on non-leading dimensions still decode every record within each worker's range, but the decode is now spread across all workers instead of the single-threaded wall-time floor. Block-compressed GDX files (written with GAMS compression) are fully supported: record checkpoints become (compressed-block start, offset-in-block) pairs, so workers resume mid-block exactly and the span-seek path skips the decompression of the whole prefix before a first-dimension filter's window.
+- `threads=` (on `scan_gdx`/`read_gdx`) parallelises the raw read across independent file handles. With a first-dimension filter, each worker scans a contiguous range of the first key dimension and whole non-matching ranges are skipped without touching the file. Without one, the data section is split by *file position* at exact record boundaries: a cached restart-position index (one cheap sequential pass, built once per file+symbol) provides the boundaries, and each worker decodes only its own byte range. In both cases results are concatenated in range order so record order matches the serial read exactly, and any boundary/count mismatch falls back to a verified serial read. `threads="auto"` (recommended; legacy backend) uses all cores for symbols of 5M+ records and stays serial for smaller ones. Filters on non-leading dimensions still decode every record within each worker's range, but the decode is now spread across all workers instead of the single-threaded wall-time floor. Block-compressed GDX files (written with GAMS compression) are fully supported: record checkpoints become (compressed-block start, offset-in-block) pairs, so workers resume mid-block exactly and the span-seek path skips the decompression of the whole prefix before a first-dimension filter's window.
 - `read_domains(path, symbol=...)` lists the unique labels actually used per index dimension in a single bulk C scan (`gdxGetDomainElements`) — the cost of `unique()` over a key column without reading or materialising any records, valuable on very large symbols.
 - Under the hood: hand-written FFI to the vendored MIT-licensed GDX C library, extracted from [lolow/gdxcomp](https://github.com/lolow/gdxcomp), building on [GAMS-dev/gdx](https://github.com/GAMS-dev/gdx).
 
@@ -55,6 +60,67 @@ vs [`gamsapi`](https://pypi.org/project/gamsapi/) 54.5.0 (pandas-backed), on a 2
 | `head(1000)` of 2M rows | **0.004 s** | 0.101 s¹ |
 
 ¹ gamsapi has no lazy loading or pushdown: it must materialize the whole symbol, then filter. The advantage of polars-gdx grows with predicate selectivity; `head(n)`/`n_rows` terminates the native read after n records.
+
+## Backends (M7, `develop/m7`)
+
+`scan_gdx`/`read_gdx`/`list_symbols`/`read_domains` accept an explicit
+`backend=` argument: `"legacy"` (the vendored native GDX C library; the 0.6.x
+default) or `"gdxrs"` (a pinned pure-Rust GDX v7 core — no GAMS, C++ or native
+GDX library in that build/runtime path). Backend selection is final: a gdxrs
+source/decode/resource failure is raised, never retried through the legacy
+backend. The two backends produce identical frames except for the documented
+deliberate projection differences (UNDEF/NA/acronyms: `null` under gdxrs vs
+NaN/native acronym numbers under legacy; EPS counts as a projected +0.0 in
+scan statistics). A gdxrs-only wheel builds with
+`maturin build --no-default-features --features gdxrs`. See
+[docs/m7-adapter-contract.md](docs/m7-adapter-contract.md) and
+[docs/m7-development.md](docs/m7-development.md).
+
+The gdxrs backend streams through `scan_gdx` and admits up to four workers.
+`threads="auto"` is resolved per execution: it stays serial unless parallel
+execution pays off, and a finite row limit pushed to the source (e.g. `head(n)`)
+always uses the serial early-stop path, so bounded prefix queries never pay the
+parallel setup. Parallel scans build a checkpoint index once per reader and
+symbol, so their first scan includes the index-build cost.
+`GdxrsReader.read_arrow()` remains serial; use `GdxrsReader.scan_batches()` for
+parallel batches.
+
+Gdxrs scan frames provide an owned `collect_batches()` iterator. Dropping it
+cancels that execution's cursors and joins their workers, even when Polars retains
+the source generator. Prefer a context manager or explicit `close()` to surface
+cleanup errors:
+
+```python
+lf = scan_gdx("huge.gdx", symbol="x", backend="gdxrs", threads=4)
+with lf.filter(pl.col("level") > 0).collect_batches(chunk_size=1000) as batches:
+    for batch in batches:
+        process(batch)
+        if enough_data():
+            break  # workers join on context exit; lf remains reusable
+```
+
+For operations that return a plain Polars LazyFrame, such as `pl.concat` or
+group-by aggregation, use
+`polars_gdx.collect_batches(plan, chunk_size=1000)` for the same ownership behavior.
+Ordinary Polars `collect_batches()` on a plain LazyFrame has Polars' own disposal
+semantics. Owned collection binds sources by cloning the local Polars plan; custom
+UDF captures must be serializable. The clone includes plan metadata and any
+in-memory inputs, while GDX records remain incremental. `collect()` is unchanged.
+
+Owned batches also support Arrow stream export:
+
+```python
+import pyarrow as pa
+
+with pa.RecordBatchReader.from_stream(lf.collect_batches(chunk_size=1000)) as reader:
+    for batch in reader:
+        process(batch)
+```
+
+Export transfers execution ownership to the Arrow stream. The original iterator
+is exhausted, and closing or dropping it leaves the stream usable. Closing or
+releasing the stream cancels its cursors and joins their workers; already yielded
+batches retain their buffers.
 
 ## Free-threaded Python
 
