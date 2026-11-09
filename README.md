@@ -76,6 +76,49 @@ scan statistics). A gdxrs-only wheel builds with
 [docs/m7-adapter-contract.md](docs/m7-adapter-contract.md) and
 [docs/m7-development.md](docs/m7-development.md).
 
+The gdxrs backend streams through `scan_gdx` and admits up to four workers;
+`threads="auto"` stays within that cap. Parallel scans build a checkpoint index
+once per reader and symbol, so their first scan includes the index-build cost.
+`GdxrsReader.read_arrow()` remains serial; use `GdxrsReader.scan_batches()` for
+parallel batches.
+
+Gdxrs scan frames provide an owned `collect_batches()` iterator. Dropping it
+cancels that execution's cursors and joins their workers, even when Polars retains
+the source generator. Prefer a context manager or explicit `close()` to surface
+cleanup errors:
+
+```python
+lf = scan_gdx("huge.gdx", symbol="x", backend="gdxrs", threads=4)
+with lf.filter(pl.col("level") > 0).collect_batches(chunk_size=1000) as batches:
+    for batch in batches:
+        process(batch)
+        if enough_data():
+            break  # workers join on context exit; lf remains reusable
+```
+
+For operations that return a plain Polars LazyFrame, such as `pl.concat` or
+group-by aggregation, use
+`polars_gdx.collect_batches(plan, chunk_size=1000)` for the same ownership behavior.
+Ordinary Polars `collect_batches()` on a plain LazyFrame has Polars' own disposal
+semantics. Owned collection binds sources by cloning the local Polars plan; custom
+UDF captures must be serializable. The clone includes plan metadata and any
+in-memory inputs, while GDX records remain incremental. `collect()` is unchanged.
+
+Owned batches also support Arrow stream export:
+
+```python
+import pyarrow as pa
+
+with pa.RecordBatchReader.from_stream(lf.collect_batches(chunk_size=1000)) as reader:
+    for batch in reader:
+        process(batch)
+```
+
+Export transfers execution ownership to the Arrow stream. The original iterator
+is exhausted, and closing or dropping it leaves the stream usable. Closing or
+releasing the stream cancels its cursors and joins their workers; already yielded
+batches retain their buffers.
+
 ## Free-threaded Python
 
 GIL-disabled Python is **not currently supported**. The PyO3 module requires

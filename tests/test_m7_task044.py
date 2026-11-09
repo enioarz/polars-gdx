@@ -12,6 +12,8 @@ recipes of docs/m7-fixture-expectations.md.
 """
 
 import itertools
+import sys
+from pathlib import Path
 
 import polars as pl
 import pytest
@@ -24,7 +26,7 @@ GROW = "tests/data/m7/m7-labels20k.gdx"
 GDX = "tests/data/trnsport.gdx"
 
 pytestmark = pytest.mark.skipif(
-    not __import__("pathlib").Path(DICT).exists(), reason="m7 fixtures not present"
+    not Path(DICT).exists(), reason="m7 fixtures not present"
 )
 
 if GdxrsReader is None:
@@ -214,6 +216,17 @@ def test_byte_budget_bounds_rows_per_batch_for_wide_requests():
         cursor.close()
 
 
+def test_batch_rows_overflow_still_uses_the_byte_cap():
+    """A representable row request must clamp without wrapping its byte size."""
+    with GdxrsReader(GROW) as reader:
+        cursor = reader.scan_batches("BIG", batch_rows=sys.maxsize // 2 + 1)
+        try:
+            first = next(cursor)
+            assert first.num_rows == 64 * 1024 // 20
+        finally:
+            cursor.close()
+
+
 # ---------------------------------------------------------------------------
 # Stable schemas: empty symbols, zero-column projections, repeated scans
 # ---------------------------------------------------------------------------
@@ -311,15 +324,15 @@ def test_early_consumer_exit_terminates_cleanly(script):
     GeneratorExit, so the process exits 0 (no SIGABRT), across repeated
     trials."""
     import subprocess
-    import sys as _sys
 
     program = script.format(path=GROW)
     for _ in range(3):
         result = subprocess.run(
-            [_sys.executable, "-c", program],
+            [sys.executable, "-c", program],
             capture_output=True,
             text=True,
             cwd=".",
+            timeout=60,
         )
         assert result.returncode == 0, (result.returncode, result.stderr)
         assert "(1000, 2)" in result.stdout

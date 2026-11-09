@@ -31,6 +31,10 @@ use gdxrs::{
     DimensionSelection, KeySelection, OpenOptions, Reader as Core, ScanOptions, SpecialValue,
     SymbolType, UelId, Value, ValueField, ValueProjection,
 };
+
+/// Admitted core-worker concurrency (adapter contract §6: at most four
+/// core workers, with at most one task/batch per worker in flight).
+const MAX_ADMITTED_WORKERS: usize = 4;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyCapsule, PyDict, PyList, PySequence, PyString};
@@ -154,6 +158,13 @@ pub struct GdxrsReader {
     uel_strings: Mutex<Option<Arc<Vec<String>>>>,
     uel_array: Mutex<Option<Arc<StringArray>>>,
     statistics: Mutex<ProjectionStats>,
+    /// Published checkpoint-index sidecar paths per symbol (task 046).
+    /// Each parallel scan opens its own `CheckpointIndex` from the
+    /// sidecar, so concurrent and repeated scans share the build cost
+    /// without sharing a handle.
+    index_paths: Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
+    /// Directory holding the sidecars; removed on close/drop.
+    index_dir: std::path::PathBuf,
 }
 
 type SymbolTuple = (String, String, usize, usize, Vec<String>, String);
@@ -258,6 +269,73 @@ impl GdxrsReader {
         let array = Arc::new(builder.finish());
         *lock(&self.uel_array)? = Some(Arc::clone(&array));
         Ok(array)
+    }
+
+    /// Remove the cached sidecar paths and the index directory
+    /// (best-effort: cursors that outlive this reader keep their own open
+    /// sidecar handles, which may briefly outlive the directory on
+    /// platforms that lock open files — documented).
+    fn cleanup_index_sidecars(&mut self) {
+        self.index_paths = Mutex::new(std::collections::HashMap::new());
+        let _ = std::fs::remove_dir_all(&self.index_dir);
+    }
+
+    /// Open a checkpoint index for parallel scans (task 046). The
+    /// sidecar is built once per symbol and reused for repeated scans;
+    /// every call opens a fresh `CheckpointIndex` from the published
+    /// sidecar (strict `UseIfValid` validation), so concurrent scans hold
+    /// independent handles. The build is an explicit index-build cost:
+    /// one sequential pass over the symbol.
+    fn parallel_index(
+        &self,
+        core: &Core,
+        handle: &gdxrs::SymbolHandle,
+        symbol: &str,
+    ) -> PyResult<gdxrs::CheckpointIndex> {
+        let sidecar = {
+            let cache = lock(&self.index_paths)?;
+            if let Some(path) = cache.get(symbol) {
+                path.clone()
+            } else {
+                drop(cache);
+                std::fs::create_dir_all(&self.index_dir).map_err(|e| {
+                    PyRuntimeError::new_err(format!("gdxrs backend: index directory: {e}"))
+                })?;
+                let path = self
+                    .index_dir
+                    .join(format!("{}.gdxrs-index", symbol.replace('/', "_")));
+                // A finer record stride than the core default keeps
+                // useful parallel granularity for smaller symbols
+                // (65536-record intervals would leave sub-64k-record
+                // symbols single-interval and serial in practice).
+                let options = gdxrs::IndexOptions {
+                    record_stride: 4096,
+                    ..gdxrs::IndexOptions::default()
+                };
+                let mut builder = core
+                    .index_builder(handle, &path, options)
+                    .map_err(to_py_err)?;
+                builder.finish().map_err(to_py_err)?;
+                lock(&self.index_paths)?.insert(symbol.to_string(), path.clone());
+                path
+            }
+        };
+        let opened = core
+            .open_index(
+                handle,
+                &sidecar,
+                gdxrs::IndexOptions {
+                    record_stride: 4096,
+                    ..gdxrs::IndexOptions::default()
+                },
+                gdxrs::IndexPolicy::UseIfValid,
+            )
+            .map_err(to_py_err)?;
+        opened.index.ok_or_else(|| {
+            PyRuntimeError::new_err(format!(
+                "gdxrs backend: checkpoint index for {symbol:?} failed strict validation"
+            ))
+        })
     }
 
     /// Resolve filter labels to UEL IDs with exact (case-sensitive,
@@ -374,6 +452,15 @@ impl GdxrsReader {
             uel_strings: Mutex::new(None),
             uel_array: Mutex::new(None),
             statistics: Mutex::new(ProjectionStats::default()),
+            index_paths: Mutex::new(std::collections::HashMap::new()),
+            index_dir: std::env::temp_dir().join(format!(
+                "polars-gdx-gdxrs-index-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            )),
         })
     }
 
@@ -385,6 +472,11 @@ impl GdxrsReader {
         // a second owner after close.
         self.uel_array = Mutex::new(None);
         self.uel_strings = Mutex::new(None);
+        // Drop the cached sidecar paths, then remove the index directory.
+        // Open indexes held by live cursors keep their own handles; their
+        // sidecars are deleted best-effort here and may briefly outlive
+        // the reader on platforms that lock open files (documented).
+        self.cleanup_index_sidecars();
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
@@ -712,14 +804,20 @@ impl GdxrsReader {
         columns: Option<Vec<String>>,
     ) -> PyResult<GdxrsBatchCursor> {
         let core = self.core()?;
-        if let Some(n) = threads {
-            if n > 1 {
-                return Err(PyValueError::new_err(
-                    "gdxrs backend: parallel reads are not implemented yet (task 046); \
-                     use threads=None",
-                ));
+        // Thread admission (task 046, contract §6): None/0/1 stays serial;
+        // 2..=MAX_ADMITTED_WORKERS runs the core's parallel scan over an
+        // explicit checkpoint index; requests above the configured worker
+        // admission are rejected, never silently clamped.
+        let workers = match threads {
+            None | Some(0) | Some(1) => None,
+            Some(n) if n > MAX_ADMITTED_WORKERS => {
+                return Err(PyValueError::new_err(format!(
+                    "gdxrs backend: threads={n} exceeds the configured worker \
+                     admission of {MAX_ADMITTED_WORKERS}"
+                )))
             }
-        }
+            Some(n) => Some(n),
+        };
         let handle = core
             .find_symbol(name.as_bytes())
             .map_err(to_py_err)?
@@ -811,6 +909,7 @@ impl GdxrsReader {
             self.uel_strings()?.len()
         };
         let mut cursor = None;
+        let mut cancel_signal = None;
         if !empty {
             let clauses: Vec<DimensionSelection<'_>> = resolved
                 .iter()
@@ -831,7 +930,10 @@ impl GdxrsReader {
             // get fewer rows per batch automatically.
             let batch_bytes = match batch_rows {
                 None => maximum_bytes,
-                Some(rows) => (rows.max(1) * payload.max(1)).clamp(payload.max(1), maximum_bytes),
+                Some(rows) => rows
+                    .max(1)
+                    .saturating_mul(payload.max(1))
+                    .clamp(payload.max(1), maximum_bytes),
             };
             let key_mask = emit_dims.iter().fold(0u32, |mask, &d| mask | 1u32 << d);
             let options = ScanOptions {
@@ -859,25 +961,58 @@ impl GdxrsReader {
                     }
                 },
             };
-            cursor = Some(
-                core.scan_selected(&handle, &selection, options)
+            cursor = Some(if let Some(workers) = workers {
+                // Parallel execution over the explicit checkpoint index.
+                // Workers persist across batches and join on completion,
+                // close or cancellation. Their stacks and bounded batch
+                // slots are charged to the shared core budget.
+                let index = self.parallel_index(core, &handle, name)?;
+                let parallel_options = gdxrs::ParallelOptions {
+                    workers,
+                    maximum_in_flight_tasks: workers,
+                    intervals_per_task: 1,
+                    worker_stack_bytes: 2 * 1024 * 1024,
+                    admission: gdxrs::ParallelAdmission::Exact,
+                };
+                let parallel = Box::new(
+                    core.scan_selected_parallel(
+                        &handle,
+                        &selection,
+                        index,
+                        options,
+                        parallel_options,
+                    )
                     .map_err(to_py_err)?,
-            );
+                );
+                // Lock-free cancellation signal: request_cancel wakes
+                // in-flight production from any thread.
+                cancel_signal = Some(parallel.cancellation_handle());
+                CursorKind::Parallel(parallel)
+            } else {
+                CursorKind::Serial(Box::new(
+                    core.scan_selected(&handle, &selection, options)
+                        .map_err(to_py_err)?,
+                ))
+            });
         }
         drop(handle);
         Ok(GdxrsBatchCursor {
-            cursor,
-            dim: emit_dims.len(),
-            emit_dims,
-            emit_value,
-            field,
-            fieldless,
-            names: projected_names,
-            n_uels,
-            id_mode,
-            dictionary,
-            stats: ProjectionStats::default(),
-            finished: empty,
+            state: Arc::new(Mutex::new(CursorState {
+                cursor,
+                dim: emit_dims.len(),
+                emit_dims,
+                emit_value,
+                field,
+                fieldless,
+                names: projected_names,
+                n_uels,
+                id_mode,
+                dictionary,
+                stats: ProjectionStats::default(),
+                final_parallel: None,
+                finished: empty,
+            })),
+            cancel_signal,
         })
     }
 
@@ -891,8 +1026,8 @@ impl GdxrsReader {
     /// documented in the adapter contract. `key_filter` labels match
     /// exactly (UTF-8 encoded, byte-for-byte) in either mode; an empty
     /// resolved ID set yields zero rows with the planned schema. `n_rows`
-    /// is a global accepted-row limit. Parallel reads are not implemented
-    /// for this backend yet (task 046); `threads` must be None/0/1.
+    /// is a global accepted-row limit. This materializing method is serial;
+    /// use `scan_batches` with `threads=2..=4` for parallel production.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None))]
     fn read_arrow(
@@ -910,8 +1045,8 @@ impl GdxrsReader {
         if let Some(n) = threads {
             if n > 1 {
                 return Err(PyValueError::new_err(
-                    "gdxrs backend: parallel reads are not implemented yet (task 046); \
-                     use threads=None",
+                    "gdxrs backend: read_arrow is serial; use scan_batches \
+                     for parallel reads",
                 ));
             }
         }
@@ -1041,6 +1176,18 @@ impl GdxrsReader {
     }
 }
 
+impl Drop for GdxrsReader {
+    fn drop(&mut self) {
+        // Owned cleanup: a reader deleted without an explicit close()
+        // still releases its checkpoint-index sidecars and directory.
+        // Live cursors keep their own open handles (their Drop joins and
+        // releases them); on Linux the unlink happens regardless, and on
+        // handle-locking platforms the directory removal is best-effort
+        // (documented, task 047 verifies per platform).
+        self.cleanup_index_sidecars();
+    }
+}
+
 /// One record batch exported through the Arrow C Data Interface
 /// (`__arrow_c_stream__`), so Polars can consume it without creating any
 /// pyarrow object on the calling (engine) thread. The capsule's release
@@ -1097,20 +1244,50 @@ impl GdxrsArrowStream {
     }
 }
 
-/// Cursor-backed streaming batch source (M7 task 044).
-///
-/// Wraps the core's lending `ScanCursor`: each `__next__` call advances
-/// the core cursor, copies the decoded rows into a fresh, self-owned
-/// Arrow RecordBatch and returns it — no full symbol is ever accumulated,
-/// and a previously yielded batch stays valid after the cursor advances
-/// or closes. Batches are bounded both by the requested `batch_rows`
-/// (the agreed maximum rows per emitted batch) and by the core's separate
-/// byte budget (`maximum_batch_bytes`), so wide rows yield fewer rows per
-/// batch automatically. The schema is fixed at creation and identical for
-/// every batch, including empty results.
+/// Core scan variants. Parallel workers join on completion, close or cancellation.
+enum CursorKind {
+    Serial(Box<gdxrs::ScanCursor>),
+    Parallel(Box<gdxrs::ParallelScanCursor>),
+}
+
+impl CursorKind {
+    fn next_batch(&mut self) -> gdxrs::Result<Option<gdxrs::BatchView<'_>>> {
+        match self {
+            Self::Serial(cursor) => cursor.next_batch(),
+            Self::Parallel(cursor) => cursor.next_batch(),
+        }
+    }
+
+    fn decoded_rows(&self) -> u64 {
+        match self {
+            Self::Serial(cursor) => cursor.statistics().decoded_rows,
+            Self::Parallel(cursor) => cursor.statistics().decoded_rows,
+        }
+    }
+}
+
+/// Incremental batches with a fixed schema and row/byte caps. Every returned
+/// batch owns its converted buffers and survives cursor advancement or closure;
+/// enum batches share the admitted dictionary by reference.
 #[pyclass]
 pub struct GdxrsBatchCursor {
-    cursor: Option<gdxrs::ScanCursor>,
+    /// Interior-mutable scan state behind a mutex: production runs with
+    /// the GIL released while holding the lock, and `close`/`cancel`
+    /// from another thread acquire the same lock — so cleanup waits for
+    /// (and then joins) in-flight production instead of failing with a
+    /// PyO3 "Already borrowed" error.
+    state: Arc<Mutex<CursorState>>,
+    /// Lock-free cancellation signal for parallel scans (the core's
+    /// `ParallelCancellation` handle): `request_cancel` wakes in-flight
+    /// production from any thread without borrowing the scan state.
+    /// Serial scans have no signal; their cleanup waits for the current
+    /// step via the state lock.
+    cancel_signal: Option<gdxrs::ParallelCancellation>,
+}
+
+/// State owned by one scan cursor.
+struct CursorState {
+    cursor: Option<CursorKind>,
     dim: usize,
     emit_dims: Vec<usize>,
     emit_value: bool,
@@ -1121,6 +1298,9 @@ pub struct GdxrsBatchCursor {
     id_mode: bool,
     dictionary: Option<Arc<StringArray>>,
     stats: ProjectionStats,
+    /// Final parallel lifecycle counters, snapshotted when the cursor
+    /// closes/cancels so joins remain observable afterwards.
+    final_parallel: Option<gdxrs::ParallelStatistics>,
     finished: bool,
 }
 
@@ -1133,8 +1313,18 @@ impl GdxrsBatchCursor {
     /// The next owned RecordBatch, or StopIteration at end of stream.
     /// The lending core view is copied out within this call; the returned
     /// batch owns valid data after the cursor advances or closes.
-    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        let Some(record) = self.build_batch()? else {
+    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        // Release the GIL during core production (I/O, decode, worker
+        // joins): the core owns its data and no Python object is touched,
+        // so other Python threads proceed while batches are produced.
+        // The state lock is held inside the closure, so a concurrent
+        // close/cancel waits for this step and then joins.
+        let state = Arc::clone(&self.state);
+        let record = py.allow_threads(|| {
+            let mut state = lock(&state)?;
+            produce_batch(&mut state)
+        })?;
+        let Some(record) = record else {
             return Ok(None);
         };
         Ok(Some(record.into_pyarrow(py)?.into_any()))
@@ -1145,8 +1335,15 @@ impl GdxrsBatchCursor {
     /// the calling thread: creating pyarrow objects on Polars' streaming
     /// engine thread can abort the interpreter at shutdown, so the
     /// lazy source consumes this form instead of `__next__`.
-    fn next_stream(&mut self) -> PyResult<Option<GdxrsArrowStream>> {
-        let Some(record) = self.build_batch()? else {
+    fn next_stream(&self, py: Python<'_>) -> PyResult<Option<GdxrsArrowStream>> {
+        // GIL released during core production; the capsule is created
+        // afterwards with the GIL held.
+        let state = Arc::clone(&self.state);
+        let record = py.allow_threads(|| {
+            let mut state = lock(&state)?;
+            produce_batch(&mut state)
+        })?;
+        let Some(record) = record else {
             return Ok(None);
         };
         let schema = record.schema();
@@ -1157,95 +1354,159 @@ impl GdxrsBatchCursor {
         }))
     }
 
-    /// Per-cursor projection counters plus the core's decoded rows so far.
+    /// Per-cursor projection counters plus the core's decoded rows so far,
+    /// and, for parallel scans, the lifecycle counters (admitted
+    /// concurrency, bounded queue pressure, join state).
     fn scan_statistics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let mut stats = self.stats;
-        stats.decoded_rows = self
-            .cursor
-            .as_ref()
-            .map(|cursor| cursor.statistics().decoded_rows)
-            .unwrap_or(self.stats.decoded_rows);
+        let state = lock(&self.state)?;
         let dict = PyDict::new(py);
-        dict.set_item("decoded_rows", stats.decoded_rows)?;
-        dict.set_item("eps_to_zero", stats.eps_to_zero)?;
-        dict.set_item("acronyms_to_null", stats.acronyms_to_null)?;
+        dict.set_item("decoded_rows", state.stats.decoded_rows)?;
+        dict.set_item("eps_to_zero", state.stats.eps_to_zero)?;
+        dict.set_item("acronyms_to_null", state.stats.acronyms_to_null)?;
+        let parallel = match state.cursor.as_ref() {
+            Some(CursorKind::Parallel(cursor)) => Some(cursor.statistics()),
+            _ => state.final_parallel,
+        };
+        if let Some(parallel) = parallel {
+            dict.set_item("requested_workers", parallel.requested_workers)?;
+            dict.set_item("admitted_workers", parallel.admitted_workers)?;
+            dict.set_item(
+                "maximum_buffered_batches",
+                parallel.maximum_buffered_batches,
+            )?;
+            dict.set_item("peak_ready_batches", parallel.peak_ready_batches)?;
+            dict.set_item("joined_workers", parallel.joined_workers)?;
+            dict.set_item("cancelled", parallel.cancelled)?;
+            dict.set_item("complete", parallel.complete)?;
+        }
         Ok(dict)
     }
 
-    /// Stop at the acknowledged prefix: release the core decoder and
-    /// batch buffers; later `__next__` calls end the stream. Idempotent.
-    fn close(&mut self) -> PyResult<()> {
-        if let Some(mut cursor) = self.cursor.take() {
-            self.stats.decoded_rows = cursor.statistics().decoded_rows;
-            cursor.close().map_err(to_py_err)?;
+    /// Stop at the acknowledged prefix: wake blocked
+    /// producers/consumers, wait for any in-flight production step, then
+    /// release the core decoder and batch buffers and join all owned
+    /// workers; later `__next__` calls end the stream. Idempotent.
+    fn close(&self) -> PyResult<()> {
+        // The core's parallel close delegates to cancel as well. Keep one
+        // adapter path for signalling, joining and retaining final statistics.
+        self.cancel()
+    }
+
+    /// Request cancellation and join all owned workers: in-flight
+    /// production is woken through the lock-free signal and the current
+    /// step joins; the stream then ends without replaying acknowledged
+    /// rows. Blocked synchronous OS reads inside an in-flight worker
+    /// step cannot be forcibly interrupted (documented); the join waits
+    /// for the current step.
+    fn cancel(&self) -> PyResult<()> {
+        if let Some(signal) = &self.cancel_signal {
+            signal.request_cancel();
         }
-        self.finished = true;
+        let mut state = lock(&self.state)?;
+        let mut cursor = state.cursor.take();
+        if let Some(cursor) = cursor.as_mut() {
+            match cursor {
+                CursorKind::Serial(cursor) => {
+                    state.stats.decoded_rows = cursor.statistics().decoded_rows;
+                    cursor.close().map_err(to_py_err)?;
+                }
+                CursorKind::Parallel(cursor) => {
+                    let before = cursor.statistics();
+                    // cancel() wakes all waiters and joins every owned
+                    // worker; snapshot the final lifecycle counters.
+                    cursor.cancel().map_err(to_py_err)?;
+                    let final_stats = cursor.statistics();
+                    state.final_parallel = Some(final_stats);
+                    state.stats.decoded_rows = final_stats.decoded_rows.max(before.decoded_rows);
+                }
+            }
+        }
+        state.finished = true;
         Ok(())
     }
 }
 
-impl GdxrsBatchCursor {
-    /// Copy the lending core view of the next batch into a fresh,
-    /// self-owned RecordBatch, or None at end of stream.
-    fn build_batch(&mut self) -> PyResult<Option<RecordBatch>> {
-        let Some(cursor) = self.cursor.as_mut() else {
-            return Ok(None);
-        };
-        if self.finished {
-            return Ok(None);
-        }
-        let batch = match cursor.next_batch().map_err(to_py_err)? {
-            Some(batch) => batch,
-            None => {
-                self.finished = true;
-                return Ok(None);
-            }
-        };
-        let rows = batch.len();
-        let mut keys: Vec<Vec<i32>> = vec![Vec::with_capacity(rows); self.dim];
-        let mut values: Vec<Option<f64>> = Vec::with_capacity(rows);
-        for (slot, &d) in self.emit_dims.iter().enumerate() {
-            let column = batch
-                .key_column(d as u8)
-                .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing key column"))?;
-            keys[slot].extend(column.iter().map(|id| id.get() as i32));
-        }
-        if self.emit_value {
-            if self.fieldless {
-                // Zero-valued projection; do not touch the level column.
-                values.resize(rows, Some(0.0));
-            } else if let Some(column) = batch.value_column(self.field) {
-                for value in column {
-                    values.push(project_value(*value, &mut self.stats)?);
-                }
-            } else if !batch.is_empty() {
-                return Err(PyRuntimeError::new_err(
-                    "gdxrs backend: missing value column",
-                ));
-            }
-        }
-        self.stats.decoded_rows = cursor.statistics().decoded_rows;
-        let record = to_record_batch(
-            self.dictionary.clone(),
-            self.dim,
-            &mut keys,
-            if self.emit_value {
-                Some(&mut values)
-            } else {
-                None
-            },
-            self.names.clone(),
-            self.n_uels,
-            self.id_mode,
-        )?;
-        Ok(Some(record))
+/// Copy the lending core view of the next batch into a fresh,
+/// self-owned RecordBatch, or None at end of stream. Runs with the
+/// GIL released and the state lock held: the core owns its data and no
+/// Python object is touched during production, so other Python threads
+/// proceed during I/O and worker joins while close/cancel wait for the
+/// current step.
+fn produce_batch(state: &mut CursorState) -> PyResult<Option<RecordBatch>> {
+    let Some(cursor) = state.cursor.as_mut() else {
+        return Ok(None);
+    };
+    if state.finished {
+        return Ok(None);
     }
+    let Some(batch) = cursor.next_batch().map_err(to_py_err)? else {
+        state.finished = true;
+        return Ok(None);
+    };
+    let rows = batch.len();
+    let mut keys: Vec<Vec<i32>> = (0..state.dim)
+        .map(|_| reserved_vec(rows))
+        .collect::<PyResult<_>>()?;
+    let mut values: Vec<Option<f64>> = if state.emit_value {
+        reserved_vec(rows)?
+    } else {
+        Vec::new()
+    };
+    for (slot, &d) in state.emit_dims.iter().enumerate() {
+        let column = batch
+            .key_column(d as u8)
+            .ok_or_else(|| PyRuntimeError::new_err("gdxrs backend: missing key column"))?;
+        keys[slot].extend(column.iter().map(|id| id.get() as i32));
+    }
+    if state.emit_value {
+        if state.fieldless {
+            // Zero-valued projection; do not touch the level column.
+            values.resize(rows, Some(0.0));
+        } else if let Some(column) = batch.value_column(state.field) {
+            for value in column {
+                values.push(project_value(*value, &mut state.stats)?);
+            }
+        } else if !batch.is_empty() {
+            return Err(PyRuntimeError::new_err(
+                "gdxrs backend: missing value column",
+            ));
+        }
+    }
+    state.stats.decoded_rows = cursor.decoded_rows();
+    let record = to_record_batch(
+        state.dictionary.clone(),
+        state.dim,
+        &mut keys,
+        if state.emit_value {
+            Some(&mut values)
+        } else {
+            None
+        },
+        state.names.clone(),
+        state.n_uels,
+        state.id_mode,
+    )?;
+    Ok(Some(record))
 }
 
 impl Drop for GdxrsBatchCursor {
     fn drop(&mut self) {
-        if let Some(mut cursor) = self.cursor.take() {
-            let _ = cursor.close();
+        // Stop and join production even when the cursor is dropped
+        // without an explicit close/cancel.
+        if let Some(signal) = &self.cancel_signal {
+            signal.request_cancel();
+        }
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(mut cursor) = state.cursor.take() {
+                match &mut cursor {
+                    CursorKind::Serial(cursor) => {
+                        let _ = cursor.close();
+                    }
+                    CursorKind::Parallel(cursor) => {
+                        let _ = cursor.close();
+                    }
+                }
+            }
         }
     }
 }

@@ -188,6 +188,28 @@ report losses/regressions without universal speedup claims.
 
 ## 7. Lifecycle: ownership, cancellation, errors, repeated scans
 
+Current consumer API: gdxrs scan frames and their derived frames provide an owned
+`collect_batches()` iterator with explicit `close()` and context-manager support.
+For operations that return a plain LazyFrame (for example, `pl.concat` or group-by
+aggregation), call `polars_gdx.collect_batches(plan)` to retain this ownership.
+The adapter does not patch Polars' global methods. Plain Polars batch consumers
+keep the installed Polars version's own disposal behavior.
+
+Owned batch iterators implement `__arrow_c_stream__(requested_schema=None)`,
+delegating schema negotiation to Polars and forwarding Arrow schemas, metadata
+and arrays unchanged. Export transfers execution ownership: closing or dropping
+the original iterator cannot cancel the exported stream. Stream release closes
+the execution and joins its workers, even if the original iterator remains alive.
+Unreleased streams are closed before interpreter teardown. Arrow release has no
+error return; cleanup failures there use Python's unraisable-error hook.
+
+Owned execution binds the existing live sources through an in-process Polars
+plan clone, preserving the original reader/source identity. Custom Python UDF
+captures must be serializable. Cloning copies plan metadata and any in-memory
+inputs in the plan; it does not decode or accumulate GDX records. Task 047 must
+include this metadata staging in resource qualification. Portable serialization
+of live GDX readers is not provided.
+
 - Each yielded Arrow/Polars batch owns valid data after the lending core cursor
   advances or closes; no borrowing across batches.
 - Fallible close/cancellation: dropping the consumer, sink exceptions and Python

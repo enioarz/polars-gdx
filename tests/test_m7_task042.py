@@ -285,12 +285,16 @@ def test_gdxrs_failures_never_fall_back_to_legacy(tmp_path):
         list_symbols(str(garbage), backend="gdxrs")
 
 
-def test_gdxrs_rejects_parallel_threads():
+def test_gdxrs_admits_parallel_threads():
+    """Task 046 admits 2..=4 workers; only requests above the admission
+    raise. (Before task 046 every parallel request raised.)"""
     if GdxrsReader is None:
         pytest.skip("gdxrs backend not compiled")
+    serial = read_gdx(M7, symbol="P", backend="gdxrs")
     for threads in (2, 4):
-        with pytest.raises(ValueError, match="task 046"):
-            read_gdx(M7, symbol="P", backend="gdxrs", threads=threads)
+        assert read_gdx(M7, symbol="P", backend="gdxrs", threads=threads).equals(serial)
+    with pytest.raises(ValueError, match="worker admission"):
+        read_gdx(M7, symbol="P", backend="gdxrs", threads=5)
 
 
 def test_backend_selection_is_explicit():
