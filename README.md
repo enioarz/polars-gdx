@@ -104,6 +104,21 @@ semantics. Owned collection binds sources by cloning the local Polars plan; cust
 UDF captures must be serializable. The clone includes plan metadata and any
 in-memory inputs, while GDX records remain incremental. `collect()` is unchanged.
 
+Owned batches also support Arrow stream export:
+
+```python
+import pyarrow as pa
+
+with pa.RecordBatchReader.from_stream(lf.collect_batches(chunk_size=1000)) as reader:
+    for batch in reader:
+        process(batch)
+```
+
+Export transfers execution ownership to the Arrow stream. The original iterator
+is exhausted, and closing or dropping it leaves the stream usable. Closing or
+releasing the stream cancels its cursors and joins their workers; already yielded
+batches retain their buffers.
+
 ## Free-threaded Python
 
 GIL-disabled Python is **not currently supported**. The PyO3 module requires

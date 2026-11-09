@@ -7,6 +7,7 @@ can close cursors independently of that generator's eventual finalization.
 
 from __future__ import annotations
 
+import atexit
 import contextvars
 import io
 import threading
@@ -14,6 +15,12 @@ import uuid
 import weakref
 
 import polars as pl
+
+from polars_gdx import _core
+
+# Registered before lazy.py's cursor drain and weakref's consumer finalizers;
+# LIFO atexit ordering disables foreign-thread callbacks after those cleanups.
+atexit.register(_core._disable_arrow_callbacks)
 
 _BINDING = contextvars.ContextVar("gdx_batch_execution", default=None)
 _SOURCES = weakref.WeakValueDictionary()
@@ -25,6 +32,7 @@ class _Execution:
         self._closed = False
         self._setups = 0
         self._cursors = {}
+        self._stream_guards = []
         self.sources = {}
 
     @property
@@ -56,9 +64,19 @@ class _Execution:
             self._cursors.pop(cursor, None)
             self._condition.notify_all()
 
+    def retain_stream_guard(self, guard):
+        with self._condition:
+            if self._closed:
+                guard.disarm()
+            else:
+                self._stream_guards.append(guard)
+
     def close(self):
         with self._condition:
             self._closed = True
+            for guard in self._stream_guards:
+                guard.disarm()
+            self._stream_guards.clear()
         while True:
             with self._condition:
                 pending = list(self._cursors.items())
@@ -142,10 +160,22 @@ def register_source(read, schema, *, owned_batches):
     return frame
 
 
+class _ArrowExecutionLease:
+    def __init__(self, execution):
+        self.execution = execution
+        # Also close an unreleased exported stream before interpreter teardown.
+        self.finalizer = weakref.finalize(self, execution.close)
+
+    def close(self):
+        self.execution.close()
+        self.finalizer.detach()
+
+
 class _OwnedBatches:
     def __init__(self, inner, execution):
         self._inner = inner
         self._execution = execution
+        self._exported = False
         # The callback retains the execution, not this consumer. A source
         # generator retained by Polars cannot keep the consumer alive.
         self._finalizer = weakref.finalize(self, execution.close)
@@ -166,11 +196,37 @@ class _OwnedBatches:
             raise
 
     def close(self):
+        if self._exported:
+            # Ownership moved to the Arrow stream, including across context
+            # exit or disposal of this original iterator.
+            return
         try:
             self._execution.close()
         finally:
             self._inner = None
         self._finalizer.detach()
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        """Transfer iteration and execution ownership to an Arrow C stream."""
+        if self._inner is None:
+            raise RuntimeError("batch consumer is closed or already exported")
+        # Let Polars negotiate the requested schema before moving ownership.
+        capsule = self._inner.__arrow_c_stream__(requested_schema)
+        try:
+            lease = _ArrowExecutionLease(self._execution)
+            stream, guard = _core._retain_arrow_stream(capsule, lease)
+            self._execution.retain_stream_guard(guard)
+            exported = stream.__arrow_c_stream__()
+            self._finalizer.detach()
+            self._exported = True
+            self._inner = None
+            return exported
+        except BaseException as primary:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                raise primary from cleanup
+            raise
 
     def __enter__(self):
         return self
@@ -192,6 +248,10 @@ def collect_batches(frame: pl.LazyFrame, **options):
     Gdxrs frames returned by ``scan_gdx`` use it automatically. Keep the iterator
     alive while consuming; ``with`` or explicit ``close()`` also reports cleanup
     errors. Previously yielded frames retain their own buffers.
+
+    Arrow export transfers ownership to the exported stream. The original
+    iterator is exhausted and its close becomes a no-op; releasing the stream
+    closes the execution, even when the original iterator is still alive.
 
     Binding uses a local Polars plan clone: custom UDF captures must be
     serializable, and in-memory plan inputs are copied. GDX records and open

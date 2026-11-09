@@ -8,6 +8,7 @@
 //! explicit in the Python layer; a gdxrs failure is never retried through
 //! the legacy backend.
 
+mod arrow_stream;
 #[cfg(feature = "gdxrs")]
 pub mod gdxrs_backend;
 #[cfg(feature = "legacy")]
@@ -20,6 +21,10 @@ use pyo3::prelude::*;
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("HAS_LEGACY", cfg!(feature = "legacy"))?;
     m.add("HAS_GDXRS", cfg!(feature = "gdxrs"))?;
+    m.add_function(wrap_pyfunction!(arrow_stream::_retain_arrow_stream, m)?)?;
+    m.add_function(wrap_pyfunction!(arrow_stream::_disable_arrow_callbacks, m)?)?;
+    m.add_class::<arrow_stream::RetainedArrowStream>()?;
+    m.add_class::<arrow_stream::ArrowStreamGuard>()?;
     #[cfg(feature = "legacy")]
     m.add_class::<legacy::Reader>()?;
     #[cfg(feature = "gdxrs")]
