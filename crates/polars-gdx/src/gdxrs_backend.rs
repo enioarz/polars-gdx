@@ -789,6 +789,14 @@ impl GdxrsReader {
     /// additionally bounds wide rows. `n_rows` is a global accepted-row
     /// limit across all batches. Schema, value projection, key modes,
     /// filters and admission behave exactly like `read_arrow`.
+    ///
+    /// Execution mode (head-latency investigation): a finite `n_rows`
+    /// resolves to the serial early-stop cursor regardless of the
+    /// requested `threads` — no checkpoint index is built or strictly
+    /// reopened and no workers are admitted, matching the legacy
+    /// backend's early-stop behavior. Only unlimited scans run the
+    /// parallel path over an explicit checkpoint index; explicit worker
+    /// requests above the admission are still rejected here.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (name, key_names=None, value_field=None, key_filter=None, n_rows=None, threads=None, key_mode=None, batch_rows=None, columns=None))]
     fn scan_batches(
@@ -818,6 +826,16 @@ impl GdxrsReader {
             }
             Some(n) => Some(n),
         };
+        // Early-stop mode resolution (head-latency investigation): a
+        // finite accepted-row limit resolves to the serial early-stop
+        // cursor for auto and explicit worker requests alike, matching
+        // the legacy backend. Parallel setup is a whole-symbol cost —
+        // one index-build pass plus a strict reopen that hashes the
+        // whole file and replays the symbol — which a bounded prefix
+        // request must never pay. The requested admission is still
+        // validated above, and unlimited scans keep explicit parallel
+        // execution.
+        let workers = if n_rows.is_some() { None } else { workers };
         let handle = core
             .find_symbol(name.as_bytes())
             .map_err(to_py_err)?

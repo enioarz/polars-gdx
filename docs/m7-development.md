@@ -22,6 +22,7 @@ specifications, not evidence that the later tasks are implemented. Core revision
 | 045 | Exact predicate/projection/global-limit behavior | Merged in PR #44 at `ccdf7ff`; [evidence](evidence/045.md) |
 | 046 | Scan ownership, repeated scans, threads and cancellation | Implementation complete; [evidence](evidence/046.md), [quality follow-up](evidence/046-quality.md), [consumer disposal](evidence/046-consumer-disposal.md), [Arrow stream ownership](evidence/046-arrow-stream.md); task PR pending review/merge |
 | 047 | Four-platform functionality, capped streaming and migration review | Pending |
+| 048 | Head latency: finite-limit early-stop mode resolution | Adapter fix in review; [evidence](evidence/048-head-latency.md); validated-session reuse, remaining profiling and acceptance gates are separately scoped follow-ups |
 
 For every implementation PR, state its task(s), base `develop/m7`, checks actually
 run and outstanding gates. Add evidence links and update this table when a task

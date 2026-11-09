@@ -175,8 +175,12 @@ def _close_open_cursors() -> None:
 
 atexit.register(_close_open_cursors)
 
-#: Smallest symbol (in records) for which ``threads="auto"`` parallelises
-#: the raw read. Below this, open/coordination overhead outweighs the gain.
+#: Smallest symbol (in records) for which the legacy backend's
+#: ``threads="auto"`` parallelises the raw read. Below this,
+#: open/coordination overhead outweighs the gain. The gdxrs backend keeps
+#: ``"auto"`` as a per-execution policy instead (see ``scan_gdx`` and the
+#: head-latency investigation): it never resolves a worker count from the
+#: symbol's total records before the accepted-row limit is known.
 _AUTO_THREADS_MIN_RECORDS = 5_000_000
 
 #: Admitted core-worker concurrency for the gdxrs backend (adapter
@@ -324,23 +328,31 @@ def scan_gdx(
         materialisation. This runs in the Rust read loop, in addition to any
         predicate pushdown Polars performs on the produced frame.
     threads
-        Number of worker threads for the raw read. When > 1 and no row
-        limit applies, the read is split across that many independent file
-        handles: first-dimension filters seek straight into the matching
-        byte range (via a cached restart index), other reads split by file
-        position. Record order always matches the serial read exactly.
-        ``"auto"`` (recommended for large symbols)
-        parallelises reads of symbols with at least
-        ``_AUTO_THREADS_MIN_RECORDS`` records using all available cores;
-        smaller symbols stay serial. ``None``/0/1 means serial.
-        The ``gdxrs`` backend admits 2..=4 workers (M7 task 046): the read
-        runs on the core's parallel scan over an explicit checkpoint
-        index, built once per reader and symbol at a one-pass build cost
-        and reused for repeated scans; results are byte-identical to the
-        serial read. Requests above the admission raise ``ValueError``,
-        and ``"auto"`` never exceeds it. Blocked synchronous OS reads
-        inside an in-flight worker step cannot be forcibly interrupted;
-        cancellation joins the current step.
+        Requested threading policy for the raw read. ``None``/0/1 means
+        serial. An explicit integer > 1 splits the read across that many
+        independent workers; record order always matches the serial read
+        exactly.
+
+        On the legacy backend, ``"auto"`` parallelises reads of symbols
+        with at least ``_AUTO_THREADS_MIN_RECORDS`` records using all
+        available cores; smaller symbols stay serial.
+
+        On the gdxrs backend, ``"auto"`` is a policy, not a worker count:
+        it is resolved per execution, when the accepted-row limit is
+        known. A finite row limit pushed to the source (e.g. ``head(n)``)
+        always resolves to the serial early-stop cursor — for ``"auto"``
+        and explicit worker requests alike, matching the legacy backend —
+        so a bounded prefix query never pays the whole-file parallel
+        setup (checkpoint-index build plus strict reopen: one full-file
+        hash and symbol replay each). ``"auto"`` on an unprepared source
+        also resolves to serial; explicit unlimited scans keep their
+        requested workers and run the core's parallel scan over an
+        explicit checkpoint index with byte-identical results. Requests
+        above the 2..=4 worker admission raise ``ValueError`` (M7 task
+        046). For the fastest early stop on a known-small prefix, pass
+        ``threads=None`` or ``threads=1`` explicitly. Blocked synchronous
+        OS reads inside an in-flight worker step cannot be forcibly
+        interrupted; cancellation joins the current step.
     backend
         ``"legacy"`` (vendored native GDX C library; default in 0.6.x) or
         ``"gdxrs"`` (pinned pure-Rust core; M7 task 042). The default is
@@ -416,19 +428,22 @@ def scan_gdx(
         raise ValueError(f"value_field must be one of {_VALUE_FIELDS}, got {value_field!r}")
     if backend_is_gdxrs:
         if threads == "auto":
-            # ``"auto"`` never exceeds the worker admission (contract §6);
-            # small symbols stay serial.
-            auto = _resolve_threads("auto", _n)
-            threads = auto if auto is None else min(auto, _GDXRS_MAX_WORKERS)
+            # ``"auto"`` is a requested policy, not a worker count: it is
+            # resolved per execution inside the IO-source callback (see
+            # ``_read``), where the accepted-row limit is known. Resolving
+            # it here from the symbol's total record count is what made a
+            # ``head()`` query pay whole-file parallel setup (head-latency
+            # investigation).
+            pass
         else:
             threads = _resolve_threads(threads, _n)
-        if threads is not None and threads > _GDXRS_MAX_WORKERS:
-            # Explicit requests above the configured worker admission are
-            # rejected, never silently clamped (contract §6).
-            raise ValueError(
-                f"gdxrs backend: threads={threads} exceeds the configured "
-                f"worker admission of {_GDXRS_MAX_WORKERS}"
-            )
+            if threads is not None and threads > _GDXRS_MAX_WORKERS:
+                # Explicit requests above the configured worker admission
+                # are rejected, never silently clamped (contract §6).
+                raise ValueError(
+                    f"gdxrs backend: threads={threads} exceeds the configured "
+                    f"worker admission of {_GDXRS_MAX_WORKERS}"
+                )
     else:
         threads = _resolve_threads(threads, _n)
     value_name = "value" if type_str in ("Set", "Parameter", "Alias") else (value_field or "level")
@@ -549,12 +564,27 @@ def scan_gdx(
                                 merged[d] = list(labels)
                         filters = list(merged.items())
 
+                # Effective execution mode, resolved before any sidecar
+                # lookup, creation or strict reopen (head-latency
+                # investigation): a finite accepted-row limit pushed to the
+                # source uses the serial early-stop cursor for ``"auto"``
+                # and explicit worker requests alike, matching the legacy
+                # backend. ``"auto"`` on an unprepared source stays serial
+                # — parallel setup (checkpoint-index build plus strict
+                # reopen) is a whole-symbol cost. Explicit unlimited scans
+                # keep their requested workers. A residual predicate keeps
+                # its limit here (``native_limit_safe`` is False), so its
+                # output limit is never pushed ahead of filtering.
+                pushed_limit = n_rows if native_limit_safe else None
+                effective_threads = threads
+                if effective_threads == "auto" or pushed_limit is not None:
+                    effective_threads = None
                 read_kwargs = {
                     "key_names": list(key_names),
                     "value_field": (None if value_name == "value" else value_name),
                     "key_filter": filters,
-                    "n_rows": (n_rows if native_limit_safe else None),
-                    "threads": threads,
+                    "n_rows": pushed_limit,
+                    "threads": effective_threads,
                 }
                 # Projection pushdown (task 045): the columns the plan
                 # needs. A residual predicate must find its required

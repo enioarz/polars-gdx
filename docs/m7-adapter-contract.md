@@ -37,8 +37,13 @@ backend unless an exclusion below says otherwise):
 - Scan parameters honored today: `value_field` ∈ {level, marginal, lower, upper,
   scale} (default level; Sets/Parameters/Aliases expose a single `value` column),
   `key_filter={dim_index: [labels]}` exact case-sensitive native prefilter,
-  `threads` (None/0/1 serial; N workers; `"auto"` = all cores for symbols ≥ 5M
-  records), Polars IO-source callback parameters `with_columns` (projection),
+  `threads` (None/0/1 serial; explicit N workers, admitted 2..=4 on gdxrs;
+  `"auto"` = all cores for symbols ≥ 5M records on legacy — on gdxrs it is a
+  per-execution policy: a finite accepted-row limit pushed to the source and
+  an unprepared source both resolve to the serial early-stop cursor, so a
+  bounded prefix query never pays the whole-file checkpoint-index build plus
+  strict reopen; see the head-latency evidence), Polars IO-source callback
+  parameters `with_columns` (projection),
   `predicate`, `n_rows` (global head), `batch_size` (currently ignored, `del batch_size`).
 - Schema: key columns are `pl.Enum(uel_table)` over the full file UEL table in
   file order (Arrow dictionary arrays, zero-copy reinterpretation); value column
