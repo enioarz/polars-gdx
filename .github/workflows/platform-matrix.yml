@@ -25,7 +25,10 @@ jobs:
           python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Python deps
-        run: pip install maturin patchelf polars pyarrow pytest
+        run: pip install maturin polars pyarrow pytest
+      - name: Install patchelf (Linux only)
+        if: runner.os == 'Linux'
+        run: pip install patchelf
       - name: Build and install (both backends)
         run: pip install -e .
       - name: Suite (default backend)

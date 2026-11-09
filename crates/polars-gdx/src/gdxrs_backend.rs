@@ -500,6 +500,19 @@ impl GdxrsReader {
         Ok(self.uel_strings()?.iter().cloned().collect())
     }
 
+    /// The core reader's root memory-budget accounting (task 047's
+    /// combined 256 MiB library envelope gate): the core's live and
+    /// peak charged bytes against its configured limit.
+    fn budget_statistics<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let core = self.core()?;
+        let stats = core.budget_statistics();
+        let dict = PyDict::new(py);
+        dict.set_item("current_bytes", stats.current_bytes)?;
+        dict.set_item("peak_bytes", stats.peak_bytes)?;
+        dict.set_item("limit_bytes", stats.limit_bytes)?;
+        Ok(dict)
+    }
+
     /// List all symbols: (name, type, dim, record_count, domains, text).
     fn symbols(&self) -> PyResult<Vec<SymbolTuple>> {
         let core = self.core()?;
