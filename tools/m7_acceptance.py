@@ -40,7 +40,9 @@ RSS_CEILING_BYTES = 512 * 1024 * 1024  # measured peak-RSS ceiling
 TRIALS = 3
 
 RECORD_FIXTURE_RECORDS = 400_000_000
-RECORD_FIXTURE_LABELS = 1_000
+# Record fixtures: 18 key dimensions with mixed radices 2^10 x 5^8 =
+# 400,000,000 unique ascending tuples (generator recipe).
+RECORD_RADICES = [2] * 10 + [5] * 8
 METADATA_FIXTURE_LABELS = 72_000_000
 METADATA_FIXTURE_RECORDS = 10_000_000
 METADATA_STRIDE = 7  # every 7th UEL is used (10M * 7 < 72M)
@@ -306,21 +308,31 @@ def main() -> int:
             expected_ids = [(i * METADATA_STRIDE + 1) for i in range(5)]
             ok = ids == expected_ids and values == expected_values
         else:
-            minor = expected_rows // RECORD_FIXTURE_LABELS
-            ids0 = df["dim_0"].to_list()
-            ids1 = df["dim_1"].to_list()
-            expected_ids0 = [(i // minor) + 1 for i in range(5)]
-            expected_ids1 = [(i % minor) + RECORD_FIXTURE_LABELS + 1 for i in range(5)]
-            ids = list(zip(ids0, ids1))
-            ok = (
-                ids0 == expected_ids0
-                and ids1 == expected_ids1
-                and values == expected_values
-            )
+            # Mixed-radix digits of i (most significant dimension first)
+            # against the generator's registration offsets.
+            offsets = []
+            running = 0
+            for radix in RECORD_RADICES:
+                offsets.append(running)
+                running += radix
+            dims = len(RECORD_RADICES)
+            expected_rows_keys = []
+            for i in range(5):
+                digits = [0] * dims
+                rest = i
+                for d in range(dims - 1, -1, -1):
+                    digits[d] = rest % RECORD_RADICES[d]
+                    rest //= RECORD_RADICES[d]
+                expected_rows_keys.append(
+                    [offsets[d] + digits[d] + 1 for d in range(dims)]
+                )
+            actual = [
+                [df[f"dim_{d}"][i] for d in range(dims)] for i in range(5)
+            ]
+            ids = actual
+            ok = actual == expected_rows_keys and values == expected_values
         return {
-            "ids": [list(pair) for pair in ids]
-            if isinstance(ids[0], tuple)
-            else ids,
+            "ids": ids,
             "values": values,
             "schema": {k: str(v) for k, v in df.schema.items()},
             "ordered_head_ok": ok,
