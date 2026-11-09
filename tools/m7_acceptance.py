@@ -354,16 +354,19 @@ def main() -> int:
             count = batch.height
             if not verify_frame_schema(batch):
                 schema_ok = False
-            key_tuple = (
-                tuple(batch["dim_0"][0]),
-                tuple(batch["dim_0"][-1]),
-            ) if is_metadata else (
-                tuple(batch[f"dim_{d}"][0] for d in range(RECORD_DIMS)),
-                tuple(batch[f"dim_{d}"][-1] for d in range(RECORD_DIMS)),
-            )
-            if last_key is not None and key_tuple[0] <= last_key:
+            if is_metadata:
+                first_key = batch["dim_0"][0]
+                last_key_of_batch = batch["dim_0"][-1]
+            else:
+                first_key = tuple(
+                    batch[f"dim_{d}"][0] for d in range(RECORD_DIMS)
+                )
+                last_key_of_batch = tuple(
+                    batch[f"dim_{d}"][-1] for d in range(RECORD_DIMS)
+                )
+            if last_key is not None and first_key <= last_key:
                 order_ok = False
-            last_key = key_tuple[1]
+            last_key = last_key_of_batch
             if not first_batch_checked:
                 # Full per-row verification of the first batch.
                 keys_ok = keys_ok and verify_keys_batch(batch, 0, count)

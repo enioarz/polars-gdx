@@ -75,11 +75,11 @@ fn main() {
         // tuples (400M = 2^10 x 5^8; smoke sizes factor the same way).
         let mut rest = records;
         let mut radix_list = Vec::new();
-        while rest % 2 == 0 {
+        while rest.is_multiple_of(2) {
             radix_list.push(2);
             rest /= 2;
         }
-        while rest % 5 == 0 {
+        while rest.is_multiple_of(5) {
             radix_list.push(5);
             rest /= 5;
         }
