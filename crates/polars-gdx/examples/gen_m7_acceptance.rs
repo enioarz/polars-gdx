@@ -7,9 +7,11 @@
 //! ```
 //!
 //! Kinds:
-//! - `record-raw`: 80,000,000 two-dim records (1,000 x 80,000 unique
-//!   ascending key pairs; physical raw file > 4 GiB; logical size > 4x
-//!   the 1 GiB process cap).
+//! - `record-raw`: 400,000,000 eighteen-dim records (2^10 x 5^8 unique
+//!   ascending key tuples; the GDX v7 encoding is so compact that the
+//!   contract's 80M-record recipe stores to 0.88 GiB and FAILS the
+//!   physical > 4 GiB gate, so the record fixtures scale to 400M records
+//!   to satisfy it; logical size far exceeds 4x the 1 GiB cap).
 //! - `record-zlib`: the same records, zlib-compressed (logical size
 //!   exceeds 4x the cap; compressed physical bytes may fit RAM).
 //! - `metadata`: 72,000,000 UELs with 63-byte labels (> 4 GiB of label
@@ -40,7 +42,7 @@ fn main() {
     let records: u64 = args
         .next()
         .and_then(|s| s.to_string_lossy().parse().ok())
-        .unwrap_or(80_000_000);
+        .unwrap_or(400_000_000);
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
@@ -61,16 +63,26 @@ fn main() {
     };
     let mut writer = Writer::create(&output, write_options).expect("create writer");
     writer.begin_metadata(&meta_options).unwrap();
-    // Record fixtures use two key dimensions (1,000 x 80,000 unique
-    // ascending pairs); metadata uses the contract's 63-byte labels
-    // plus terminator (64 logical bytes) over a 72M-UEL universe.
-    let (dim0_labels, dim1_labels) = if kind == "metadata" {
-        (0u64, 72_000_000u64)
+    // Record fixtures use seventeen key dimensions with mixed radices
+    // 2^10 x 5^7 = 80,000,000 unique ascending tuples (~120 logical
+    // bytes per row); metadata uses the contract's 63-byte labels plus
+    // terminator (64 logical bytes) over a 72M-UEL universe.
+    let radices: Vec<u64> = if kind == "metadata" {
+        vec![72_000_000]
     } else {
-        (1_000u64, 80_000u64 * (records / 80_000_000).max(1))
+        let mut radix_list = vec![2u64; 10];
+        radix_list.extend(vec![5u64; 8]);
+        radix_list
     };
-    let label_count = dim0_labels + dim1_labels;
+    let label_count: u64 = radices.iter().sum();
     let label_width = if kind == "metadata" { 63 } else { 20 };
+    // Registration offset of each dimension's first label.
+    let mut offsets = Vec::with_capacity(radices.len());
+    let mut running = 0u64;
+    for radix in &radices {
+        offsets.push(running);
+        running += radix;
+    }
     let labels = (0..label_count).map(|i| {
         let mut label = vec![b'u'; label_width];
         let text = format!("{i:020}");
@@ -89,19 +101,28 @@ fn main() {
         .register_symbol(&WriteSymbol::new(
             b"BIG",
             SymbolType::Parameter,
-            if kind == "metadata" { 1 } else { 2 },
+            radices.len() as u8,
         ))
         .unwrap();
     let mut rows = writer.begin_symbol(symbol, None).unwrap();
     match kind.as_str() {
         "record-raw" | "record-zlib" => {
-            // Strictly ascending unique key pairs: record i has
-            // dim0 = i / dim1_labels and dim1 = i % dim1_labels.
-            let minor = dim1_labels;
-            let mut keys = [ids[0], ids[dim0_labels as usize]];
+            // Strictly ascending unique key tuples: record i is the
+            // mixed-radix (2^10 x 5^8) representation of i, most
+            // significant dimension first.
+            assert_eq!(records, 400_000_000, "record fixtures use 400M tuples");
+            let dims = radices.len();
+            let mut keys = vec![ids[0]; dims];
+            let mut digits = vec![0u64; dims];
             for i in 0..records {
-                keys[0] = ids[(i / minor) as usize];
-                keys[1] = ids[(dim0_labels + (i % minor)) as usize];
+                let mut rest = i;
+                for d in (0..dims).rev() {
+                    digits[d] = rest % radices[d];
+                    rest /= radices[d];
+                }
+                for d in 0..dims {
+                    keys[d] = ids[(offsets[d] + digits[d]) as usize];
+                }
                 rows.write(&keys, &[Value::NumberBits(((i % 1000) as f64).to_bits())])
                     .unwrap();
             }
