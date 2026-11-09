@@ -1,0 +1,48 @@
+name: Platform matrix
+
+# M7 task 047: functional verification of the complete Polars suite on
+# all four native platforms (Linux x86_64, macOS ARM64, macOS Intel,
+# Windows x64) for both backends and the gdxrs-only build.
+on:
+  push:
+    branches: [main, develop/m7]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Functional suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is ARM64; macos-13 is the last Intel runner.
+        os: [ubuntu-latest, macos-latest, macos-13, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Python deps
+        run: pip install maturin polars pyarrow pytest
+      - name: Install patchelf (Linux only)
+        if: runner.os == 'Linux'
+        run: pip install patchelf
+      - name: Build and install (both backends)
+        run: pip install -e .
+      - name: Suite (default backend)
+        run: pytest tests/ -q
+      - name: Suite (gdxrs default)
+        run: pytest tests/ -q
+        env:
+          POLARS_GDX_BACKEND: gdxrs
+      - name: gdxrs-only build (no GAMS, C++ or native GDX library)
+        run: cargo check -p polars-gdx --no-default-features --features gdxrs
+      - name: gdxrs-only wheel and suite
+        shell: bash
+        run: |
+          pip uninstall -y polars-gdx || true
+          maturin build --release --no-default-features --features gdxrs --out dist
+          pip install dist/*.whl
+          pytest tests/ -q
